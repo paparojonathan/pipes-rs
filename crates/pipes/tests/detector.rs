@@ -339,8 +339,11 @@ fn fused_by_sweep(
 /// **The stale-camera demonstration, as a test.** Two real runs that differ in
 /// one flag: the control waits for the camera (`--pair-stale-ms 500`), the
 /// treatment does not (`--pair-stale-ms 500 --pair-wait-ms 0`), so the
-/// detector, 70 to 90 ms a frame (uncertified), has not finished the sweep's own frame when the
-/// fusion needs it and the declared window hands it the previous one.
+/// detector has not finished the sweep's own frame when the fusion needs it
+/// and the declared window hands it the previous one. Both runs slow the
+/// detector by 50 ms a frame (`--consumer-delay-ms 50`): a detector faster
+/// than the lidar chain would have the frame ready in time, and the treatment
+/// would never go stale.
 ///
 /// Pinned: the lidar half of every sweep is byte-identical between the runs,
 /// so any difference is the camera's; the treatment's stale sets name an
@@ -358,10 +361,20 @@ fn a_stale_camera_changes_the_camera_lanes_and_nothing_else() {
     std::fs::copy(repo_root().join(MODEL_FILE), &model)
         .unwrap_or_else(|e| panic!("{}: {e}", repo_root().join(MODEL_FILE).display()));
     for (name, extra) in [
-        ("healthy", vec!["--pair-stale-ms", "500"]),
+        (
+            "healthy",
+            vec!["--consumer-delay-ms", "50", "--pair-stale-ms", "500"],
+        ),
         (
             "stale",
-            vec!["--pair-stale-ms", "500", "--pair-wait-ms", "0"],
+            vec![
+                "--consumer-delay-ms",
+                "50",
+                "--pair-stale-ms",
+                "500",
+                "--pair-wait-ms",
+                "0",
+            ],
         ),
     ] {
         let o = Command::new(env!("CARGO_BIN_EXE_pipes"))

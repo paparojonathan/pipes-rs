@@ -1,0 +1,70 @@
+# pipes in Docker, watched in the Rerun viewer on your own machine. Once:
+#
+#   python -m pip install rerun-sdk==0.38.1   # the viewer, on the host
+#   docker compose run --rm fetch             # the four KITTI drives (3.2 GB);
+#                                             # --smaller for drive 0005 alone
+#
+# Then, with `rerun` open on the host:
+#
+#   docker compose run --rm pipes             # replay drive 0005 into it
+#
+# Another drive:
+#   docker compose run --rm pipes run --drive 2011_09_26_drive_0009_sync
+#
+# The tests, on the code in this checkout (after `fetch`, for the ones that
+# need the data):
+#   docker compose run --rm test
+#
+# Results land in runs/<name>/ in this checkout. The KITTI data lives in the
+# `kitti` volume; to use a folder you already have, put KITTI_DATA=<path> in
+# a .env file beside this one (for the README's layout, ../data/kitti).
+services:
+  pipes:
+    build: .
+    image: pipes-rs:sprint-1
+    # A real PID 1, so Ctrl+C stops the run.
+    init: true
+    # Files in runs/ are written as this user. Docker Desktop maps it for
+    # you; on Linux set PIPES_UID and PIPES_GID if your id is not 1000.
+    user: "${PIPES_UID:-1000}:${PIPES_GID:-1000}"
+    environment:
+      # The container has no display, so `--rerun grpc` (the default) joins
+      # the viewer running on the host instead of starting one.
+      PIPES_RERUN_HOST: host.docker.internal
+    extra_hosts:
+      # Docker Desktop defines this name; this makes it resolve on a plain
+      # Linux Docker Engine too.
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./runs:/work/pipes-rs/runs
+      - ${KITTI_DATA:-kitti}:/work/data/kitti:ro
+
+  fetch:
+    build:
+      context: .
+      target: fetch
+    image: pipes-rs:fetch
+    user: "${PIPES_UID:-1000}:${PIPES_GID:-1000}"
+    volumes:
+      - ${KITTI_DATA:-kitti}:/data/kitti
+
+  test:
+    build:
+      context: .
+      target: test
+    image: pipes-rs:test
+    init: true
+    volumes:
+      # The checkout's sources over the image's, so the tests always see the
+      # current code without a rebuild.
+      - ./Cargo.toml:/src/Cargo.toml:ro
+      - ./Cargo.lock:/src/Cargo.lock:ro
+      - ./crates:/src/crates:ro
+      - ${KITTI_DATA:-kitti}:/data/kitti:ro
+      - cargo-registry:/usr/local/cargo/registry
+      - cargo-target:/src/target
+
+volumes:
+  kitti:
+  cargo-registry:
+  cargo-target:

@@ -1,6 +1,8 @@
 /target/
 /data/
-/runs/
+/runs/*
+!/runs/.gitkeep
+.env
 *.rrd
 *.log
 /models/

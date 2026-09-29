@@ -172,6 +172,8 @@ fn the_hidden_knobs_still_parse() {
         "null",
         "--rerun-port",
         "9877",
+        "--rerun-host",
+        "host.docker.internal",
         "--panic-at-frame",
         "3",
         "--viewer-delay-ms",
@@ -190,6 +192,7 @@ fn the_hidden_knobs_still_parse() {
         "--detect",
         "--voxel-size-m",
         "--rerun-port",
+        "--rerun-host",
         "--panic-at-frame",
         "--viewer-delay-ms",
     ] {

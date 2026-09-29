@@ -62,89 +62,97 @@ but neither project depends on the other.
 This branch builds the first working slice of that pipeline. It replays a recorded
 KITTI drive, camera and lidar together, through Pipes in real time, fuses the two
 into an answer about the objects around the car at every lidar sweep, and records
-what happened to every sample on the way.
+what happened to every sample on the way. What we found on drive 0009, sweep by
+sweep, is in the [Sprint 1 findings](https://claude.ai/artifact/3p5HVyjUMuV8PATy3pdqpF).
 
 ## Setup
 
-Everything runs from the `pipes-rs` folder. Commands are for PowerShell on Windows;
-in bash, write paths with `/`.
+`pipes` runs in Docker, so the Rust toolchain, the build and the detector's
+weights all stay inside the container. On your own machine you need only two
+things:
 
-1. Rust 1.96 or newer (the `rust-version` in `Cargo.toml`), from
-   [rustup.rs](https://rustup.rs). On Windows, the rustup installer also offers the
-   Visual Studio C++ build tools that Rust needs for linking.
+1. [Docker](https://docs.docker.com/get-started/get-docker/): Docker Desktop on
+   Windows and macOS, Docker Engine on Linux.
 
-2. The Rerun viewer, which shows the dashboard:
+2. The Rerun viewer, which shows [the dashboard](#the-dashboard). It runs on your
+   machine rather than in the container, because the container has no display:
 
-   ```powershell
+   ```sh
    python -m pip install rerun-sdk==0.38.1
    ```
 
-   This puts `rerun` on your PATH; in a new terminal, `rerun --version` should report
-   0.38.1, matching the Rerun library inside `pipes`.
+   In a new terminal, `rerun --version` should report 0.38.1, matching the Rerun
+   library inside `pipes`.
 
-3. The KITTI data, beside the repository:
+Then, from the `pipes-rs` folder, download the KITTI data once and check that
+`pipes` finds it:
 
-   ```text
-   <any folder>/
-     pipes-rs/
-     data/kitti/2011_09_26/
-       calib_cam_to_cam.txt
-       calib_velo_to_cam.txt
-       2011_09_26_drive_0005_sync/
-         image_02/          timestamps.txt, data/*.png
-         velodyne_points/   timestamps.txt, timestamps_start.txt, timestamps_end.txt, data/*.bin
-   ```
+```sh
+docker compose run --rm fetch          # the four KITTI drives and their calibration (3.2 GB)
+docker compose run --rm pipes drives   # each drive with its frame counts and health
+```
 
-   `pipes` reads only these files: the left colour camera (`image_02`), the lidar
-   (`velodyne_points`) and two calibration files per capture date. Download each drive
-   from [KITTI's raw data page](https://www.cvlibs.net/datasets/kitti/raw_data.php) as
-   `<drive>_sync.zip` (the "synced+rectified data"), with its date's
-   `<date>_calib.zip`. The direct links for drive 0005 are below, and other drives
-   follow the same pattern:
+`fetch --smaller` downloads drive 0005 alone (650 MB), which is all a plain run
+needs, and `fetch` followed by drive names downloads just those. Drives already
+downloaded are skipped, so running it again only fills in what is missing. The
+data lives in a Docker volume named `kitti`.
 
-   ```text
-   https://s3.eu-central-1.amazonaws.com/avg-kitti/raw_data/2011_09_26_drive_0005/2011_09_26_drive_0005_sync.zip
-   https://s3.eu-central-1.amazonaws.com/avg-kitti/raw_data/2011_09_26_calib.zip
-   ```
-
-   Unzip both into `..\data\kitti`; the zips already contain the date and drive
-   folders. Drive 0005, the default, is a 650 MB download. For data kept elsewhere,
-   pass `--kitti-root <path>` or set `PIPES_KITTI_ROOT`.
-
-4. The camera detector's weights, which are not in git:
-
-   ```powershell
-   powershell -ExecutionPolicy Bypass -File scripts\fetch_model.ps1
-   ```
-
-   The script downloads YOLOX-Nano from Megvii's GitHub release into `models\`,
-   deletes it unless its SHA-256 matches the pinned hash, and writes
-   `models\THIRD_PARTY.md` with its source and licence. The YOLOX code is Apache-2.0;
-   the weights have no licence of their own and are taken to fall under the same
-   grant. Without PowerShell, download the URL in the script to
-   `models/yolox_nano.onnx`.
-
-5. A check that `pipes` finds the data. The first `cargo run` compiles the project,
-   which takes a few minutes; then it lists each drive with its frame counts and
-   health.
-
-   ```powershell
-   cargo run --release -- drives
-   ```
+The first use of each `docker compose` command builds its image, which takes a few
+minutes. The detector's weights are downloaded during the build, and the build
+stops if their SHA-256 does not match the pinned hash.
 
 ## First run
 
-```powershell
-cargo run --release -- run
+A run uses two terminals: one for the viewer and one for `pipes`. Start them in
+this order.
+
+**Terminal 1, the viewer.** Start it first and leave it open:
+
+```sh
+rerun
 ```
 
-This replays drive 0005: 154 camera frames and 154 lidar sweeps over 16 seconds. The
-run starts the Rerun viewer, which shows [the dashboard](#the-dashboard), and waits
-for it to be ready before it starts the clock (Windows may ask once to let the viewer
-through the firewall). When the drive ends, the terminal prints a summary and the
-program exits; the window stays open so you can scrub back through the run. Later runs
-stream into the same window. `$LASTEXITCODE` (or `echo $?` in bash) then says whether
-the run passed its checks; [Output](#output) explains the codes.
+**Terminal 2, the runs,** from the `pipes-rs` folder. Each command streams into the
+viewer in terminal 1, one run after another:
+
+```sh
+docker compose run --rm pipes                                          # drive 0005
+docker compose run --rm pipes run --drive 2011_09_26_drive_0009_sync   # then another drive
+```
+
+The first command replays drive 0005: 154 camera frames and 154 lidar sweeps over 16
+seconds. The run streams to the viewer on your machine (`host.docker.internal:9876`
+from inside the container) and waits for it to be ready before it starts the clock;
+if no viewer is open, it waits up to a minute and then stops. Windows may ask once
+to let the viewer through the firewall. When the drive ends, the terminal prints a
+summary and the container exits; the window stays open so you can scrub back through
+the run, and later runs stream into the same window. `echo $?` (or `$LASTEXITCODE`
+in PowerShell) then says whether the run passed its checks; [Output](#output)
+explains the codes. The run's files are in `runs/<name>/` in this checkout.
+
+Any other run, such as the second command above or the
+[experiments](#experiments), is `docker compose run --rm pipes run` followed by its
+flags, in terminal 2 while the viewer stays open.
+
+- `--rerun rrd` writes `runs/<name>/cam0.rrd` instead, to open later with
+  `rerun runs/<name>/cam0.rrd`; no viewer needs to be open during the run.
+- To use KITTI data you already have instead of the `kitti` volume, put
+  `KITTI_DATA=<path>` in a `.env` file beside `compose.yaml`. The folder must have
+  the layout `fetch` produces, for example `KITTI_DATA=../data/kitti` with:
+
+  ```text
+  data/kitti/2011_09_26/
+    calib_cam_to_cam.txt
+    calib_velo_to_cam.txt
+    2011_09_26_drive_0005_sync/
+      image_02/          timestamps.txt, data/*.png
+      velodyne_points/   timestamps.txt, timestamps_start.txt, timestamps_end.txt, data/*.bin
+  ```
+
+- A build killed with exit 137 ran out of memory; fewer parallel jobs use less:
+  `docker compose build --build-arg CARGO_BUILD_JOBS=2`.
+- On Linux the run writes `runs/` as user 1000; if your id differs, set
+  `PIPES_UID` and `PIPES_GID` in `.env`.
 
 ## What we built
 
@@ -194,9 +202,9 @@ must download or link, and it brings its own thread pool.
 
 Fusion pairs the sensors by time. A lidar sweep is a 103 ms rotation with a start and
 an end, and a camera frame is an instant, so each sweep pairs with the frame whose
-instant falls inside its window. The detector finishes each frame after the lidar
-chain finishes its sweep, so the fusion waits for the camera, by default for up to
-one sweep. Each track's 3D box is then projected into the image with KITTI's
+instant falls inside its window. When the detector finishes a frame after the lidar
+chain finishes its sweep, the fusion waits for the camera, by default for up to one
+sweep. Each track's 3D box is then projected into the image with KITTI's
 calibration, and a track and a detection match, one to one, when their image boxes
 overlap by more than half (intersection over union above ½). Above one half a match
 is nearly always unique, and a fixed order settles the rare conflicts the same way on
@@ -241,33 +249,108 @@ from the camera.
 
 ## Experiments
 
-Each row is `cargo run --release -- run` plus the flags shown, on drive 0005 unless
-the row names another.
+Each experiment is one command for terminal 2, with the viewer open in terminal 1
+(see [First run](#first-run)). Each replays drive 0005 unless it names another.
 
-| Flags | What it shows |
-|---|---|
-| (no flags) | The healthy case. The detector sees all 154 frames, every sweep pairs with its own frame, the fusion matches 482 tracks to detections over the run, and all 35 invariants hold. |
-| `--consumer-delay-ms 100 --cap 1 --pair-wait-ms 300` | A slow camera. The detector sleeps an extra 100 ms per frame, so its one-frame queue drops about half the frames (74 of 154 on one run; it varies). The fusion expires exactly those sweeps, as `pair_dropped`, and every invariant holds, because the drops were declared. |
-| `--pair-wait-ms 0 --pair-stale-ms 500` | A stale camera. The fusion stops waiting and takes the previous frame, 93 ms old. Matches fall from 482 to 414, and every answer says `STALE camera 93 ms`. |
-| `--pair-wait-ms 0` | Why the fusion waits. No frame is lost, but each arrives after its sweep has been processed, so all 154 sweeps expire as `pair_late` and there is no answer. |
-| `--drive 2011_09_26_drive_0009_sync` | A gap in the source: no lidar for frames 177–180 of 447. The run records the four as absent, answers the other 443 sweeps and exits 0. It takes 46 seconds. |
-| `--drive <name>` | Any drive that `drives` lists. Drives 0005, 0009, 0013 and 0048 of 2011_09_26 have camera and lidar. A drive without `velodyne_points`, such as a camera-only copy of 2011_09_28_drive_0001, replays the camera alone. |
-| `--detector off` | The chain without the camera model: tracks still get image boxes but no class, and nothing is camera-only. It runs without `models\`. |
-| `--rerun rrd` | Saves the recording as `runs\<name>\cam0.rrd` (about 340 MB for drive 0005) instead of streaming it. `rerun runs\<name>\cam0.rrd` reopens it in the same layout. |
+### The healthy case
 
-The tests prove the rules above:
-
-```powershell
-cargo test --release --workspace -- --include-ignored
+```sh
+docker compose run --rm pipes run
 ```
 
-Most tests run `pipes` on small synthetic drives. The ten that `--include-ignored` adds
-need the data or the model; they check that runs repeat, that a stale camera changes
-only the camera half of each track, that slowing the detector expires exactly the
-frames it lost, that drive 0009 records frames 177–180 as absent, and that the
-reported distances match the raw lidar points on most sweeps. Keep `--release`: a
-debug build is too slow for the real-time tests. Without the data or the model,
-`cargo test --workspace` runs the other 381.
+The detector sees all 154 frames, every sweep pairs with its own frame, the fusion
+matches 482 tracks to detections over the run, and all 35 invariants hold.
+
+### A slow camera
+
+```sh
+docker compose run --rm pipes run --consumer-delay-ms 100 --cap 1 --pair-wait-ms 300
+```
+
+The detector sleeps an extra 100 ms per frame, so its one-frame queue drops frames
+(38 of 154 on one run; it varies). The fusion expires exactly those sweeps, as
+`pair_dropped`, and every invariant holds, because the drops were declared.
+
+### A stale camera
+
+```sh
+docker compose run --rm pipes run --consumer-delay-ms 50 --pair-wait-ms 0 --pair-stale-ms 500
+```
+
+The detector sleeps an extra 50 ms per frame, so each frame is ready only after its
+sweep has been processed, and the fusion, which no longer waits, takes the previous
+frame, 93 ms old. Matches fall from 482 to 414, and every answer says
+`STALE camera 93 ms`.
+
+### Why the fusion waits
+
+```sh
+docker compose run --rm pipes run --consumer-delay-ms 50 --pair-wait-ms 0
+```
+
+The detector sleeps an extra 50 ms per frame. No frame is lost, but each arrives
+after its sweep has been processed, so all 154 sweeps expire as `pair_late` and
+there is no answer.
+
+### A gap in the source
+
+```sh
+docker compose run --rm pipes run --drive 2011_09_26_drive_0009_sync
+```
+
+Drive 0009 has no lidar for frames 177–180 of 447. The run records the four as
+absent, answers the other 443 sweeps and exits 0. It takes 46 seconds.
+
+### Any other drive
+
+```sh
+docker compose run --rm pipes drives
+docker compose run --rm pipes run --drive 2011_09_26_drive_0013_sync
+```
+
+The first command lists the drives; the second replays one of them. Drives 0005,
+0009, 0013 and 0048 of 2011_09_26 have camera and lidar. A drive without
+`velodyne_points`, such as a camera-only copy of 2011_09_28_drive_0001, replays the
+camera alone.
+
+### Without the detector
+
+```sh
+docker compose run --rm pipes run --detector off
+```
+
+The chain without the camera model: tracks still get image boxes but no class, and
+nothing is camera-only.
+
+### A saved recording
+
+```sh
+docker compose run --rm pipes run --rerun rrd --name saved
+rerun runs/saved/cam0.rrd
+```
+
+The first command saves the recording as `runs/saved/cam0.rrd` (about 340 MB for
+drive 0005) instead of streaming it, so no viewer needs to be open. The second, on
+your machine, reopens it in the same layout.
+
+## Tests
+
+The tests prove the rules in [What we built](#what-we-built). They run in Docker on
+the code in this checkout, so an edit needs no rebuild of the image:
+
+```sh
+docker compose run --rm test
+```
+
+The first run compiles the project, which takes a few minutes; later runs reuse the
+build. The tests are built in release mode, because a debug build is too slow for
+the real-time tests. Most run `pipes` on small synthetic drives. Ten need the data
+from `fetch` and the detector, which is in the test image; they check that runs
+repeat, that a stale camera changes only the camera half of each track, that slowing
+the detector expires exactly the frames it lost, that drive 0009 records frames
+177–180 as absent, and that the reported distances match the raw lidar points on most
+sweeps. Before `fetch`, `docker compose run --rm test --` skips those ten and runs
+the other 388.
 
 ## The dashboard
 
@@ -307,7 +390,7 @@ one, expired (split by reason), or never reached the fusion. The exit code is 0 
 every invariant held, 2 when one failed or a flag was mistyped, 3 when a stage
 panicked, and 1 for any other error, such as a missing model.
 
-Each run also writes a folder, `runs\<name>\`, named `run-<unix time>` unless you
+Each run also writes a folder, `runs/<name>/`, named `run-<unix time>` unless you
 pass `--name`.
 
 | File | What it holds |
@@ -330,12 +413,11 @@ This branch only replays recorded data. There are no live sensor drivers, no clo
 synchronization between real sensors, and no ROS 2 output yet. The car's own motion
 is not used, because the GPS/IMU data (OXTS) is not read, so speeds are relative to
 the car: a parked car ahead closes at the car's own speed, and the tracker cannot
-subtract the car's turning. The detector takes about 85–90 ms per frame on a laptop
-CPU, close to the camera's 103 ms period, so on a busy machine it drops frames. The
-distance is to the near face of a track's box, so a wide object that only partly
-overlaps the car's path can read too near. The grayscale `proc` stage runs only with
-`--detector off`, where its bare frame reference, with no detections, is the camera's
-half of each pair.
+subtract the car's turning. The detector runs on one thread, so when it takes longer
+than the camera's 103 ms period it drops frames. The distance is to the near face of
+a track's box, so a wide object that only partly overlaps the car's path can read
+too near. The grayscale `proc` stage runs only with `--detector off`, where its bare
+frame reference, with no detections, is the camera's half of each pair.
 
 ## Layout
 
@@ -345,9 +427,10 @@ crates/pipes-kitti/   KITTI readers (timestamps, camera, lidar, calibration) and
                       voxels, detection, tracking, fusion, the answer, the camera detector
 crates/pipes/         the pipes program: command line, admission, stage threads, recorder, dashboard
 docs/                 Ethan's architecture and literature review
-scripts/              fetch_model.ps1, which downloads the detector's weights
-models/               the weights (downloaded, not in git)
+scripts/              fetch_model.ps1, not needed with Docker: the image downloads the weights itself
 runs/                 one folder per run (not in git)
+Dockerfile            the images: build, the detector's weights, the `fetch` data downloader, the tests
+compose.yaml          `docker compose run` for `pipes`, `fetch` and `test`
 .github/workflows/    CI: formatting, lints and the tests that need no data
 ```
 

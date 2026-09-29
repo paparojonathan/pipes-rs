@@ -291,6 +291,29 @@ fn parse_voxel_size(s: &str) -> Result<VoxelSize, String> {
     VoxelSize::new(m).map_err(|e| e.to_string())
 }
 
+/// `--rerun-host`: a bare host name or IP address. The run builds the URL
+/// itself from it and `--rerun-port`, so a scheme, a port or a path here
+/// would build a wrong one; they are refused with the form that works.
+fn parse_rerun_host(s: &str) -> Result<String, String> {
+    let h = s.trim();
+    if h.is_empty() {
+        return Err("the host is empty".to_string());
+    }
+    if h.contains("://") || h.contains('/') {
+        return Err(format!(
+            "`{h}` is a URL; give the host alone, such as `host.docker.internal`, and the \
+             port with --rerun-port"
+        ));
+    }
+    let bracketed_v6 = h.starts_with('[') && h.ends_with(']');
+    if !bracketed_v6 && h.matches(':').count() == 1 {
+        return Err(format!(
+            "`{h}` carries a port; give the host alone and the port with --rerun-port"
+        ));
+    }
+    Ok(h.to_string())
+}
+
 /// Where the `rerun` consumer sends frames.
 ///
 /// `grpc` by default: the run opens the viewer itself (or joins one already
@@ -517,6 +540,15 @@ pub struct RunArgs {
     /// the SDK's default, which is where a `rerun` started by hand listens.
     #[arg(long, hide = true, default_value_t = DEFAULT_VIEWER_PORT)]
     pub rerun_port: u16,
+    /// The host `--rerun grpc` streams to, for a viewer outside this machine
+    /// or container: the run joins the viewer listening there on
+    /// `--rerun-port` and never starts one, and stops before its clock starts
+    /// if nothing answers. Unset, the viewer is local and started when
+    /// needed. In the Docker setup the viewer runs on the host, which the
+    /// container reaches as `host.docker.internal`. Hidden: compose.yaml sets
+    /// it, through `PIPES_RERUN_HOST`.
+    #[arg(long, hide = true, env = "PIPES_RERUN_HOST", value_parser = parse_rerun_host)]
+    pub rerun_host: Option<String>,
     /// Test hook: panic in the `proc` stage when this frame arrives, to
     /// exercise the shutdown path in the binary that actually ships. Hidden
     /// from `--help`; used only by
@@ -553,6 +585,30 @@ impl RunArgs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_rerun_host_is_a_bare_name_or_address() {
+        for good in [
+            "host.docker.internal",
+            "192.168.1.20",
+            "localhost",
+            "::1",
+            "[::1]",
+        ] {
+            assert_eq!(parse_rerun_host(good).as_deref(), Ok(good), "{good}");
+        }
+        for (bad, says) in [
+            ("", "empty"),
+            ("http://host.docker.internal:9876", "URL"),
+            ("host.docker.internal/proxy", "URL"),
+            ("host.docker.internal:9876", "--rerun-port"),
+        ] {
+            let Err(e) = parse_rerun_host(bad) else {
+                panic!("`{bad}` was taken for a host");
+            };
+            assert!(e.contains(says), "{bad}: {e}");
+        }
+    }
 
     #[test]
     fn a_drive_name_carries_its_date() {

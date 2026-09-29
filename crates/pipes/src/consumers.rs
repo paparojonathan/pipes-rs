@@ -714,6 +714,16 @@ pub enum RerunError {
         /// How long the run waited, seconds.
         waited_s: f64,
     },
+    /// `--rerun grpc --rerun-host` found nothing listening at `host:port`
+    /// before its wait ran out. A viewer on another machine or outside the
+    /// container cannot be started from here, so the run says where to start
+    /// one; like [`RerunError::NotListening`] it is raised before the clock.
+    NoRemoteViewer {
+        host: String,
+        port: u16,
+        /// How long the run waited, seconds.
+        waited_s: f64,
+    },
 }
 
 impl std::fmt::Display for RerunError {
@@ -741,6 +751,18 @@ impl std::fmt::Display for RerunError {
                  `{VIEWER_INSTALL}`), answer the Windows Firewall prompt if one is open, and run \
                  again; or pass `--rerun rrd` to write the recording to a file instead"
             ),
+            RerunError::NoRemoteViewer {
+                host,
+                port,
+                waited_s,
+            } => write!(
+                f,
+                "no Rerun viewer answered at {host}:{port} within {waited_s:.0} s, so the run \
+                 stopped before its clock started. A viewer there is not started from here: \
+                 open one on that machine with `rerun` (version 0.38.1, `{VIEWER_INSTALL}`), \
+                 allow it through the firewall, and run again; or pass `--rerun rrd` to write \
+                 the recording to a file instead"
+            ),
         }
     }
 }
@@ -751,7 +773,8 @@ impl std::error::Error for RerunError {
             RerunError::Stream(e) => Some(e),
             RerunError::Flush(_)
             | RerunError::NoViewer { .. }
-            | RerunError::NotListening { .. } => None,
+            | RerunError::NotListening { .. }
+            | RerunError::NoRemoteViewer { .. } => None,
         }
     }
 }

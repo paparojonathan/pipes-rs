@@ -1225,6 +1225,9 @@ pub enum Viewer {
     Started { port: u16, pid: u32 },
     /// Something was already listening on `port` and the run streamed into it.
     Joined { port: u16 },
+    /// `--rerun-host`: the run streamed to the viewer listening at
+    /// `host:port`, outside this machine or container, and started nothing.
+    Remote { host: String, port: u16 },
 }
 
 /// Where a run's recording went.
@@ -2643,6 +2646,9 @@ pub fn finish(report: &RunReport) -> Result<(RunSummary, bool), RunError> {
             "rerun: streamed to the viewer that was already listening on port {port} \
              (no new window was opened for this run)"
         ),
+        Recording::Viewer(Viewer::Remote { host, port }) => {
+            println!("rerun: streamed to the viewer at {host}:{port} (--rerun-host)")
+        }
         Recording::File(p) => println!("rerun: {}", full(p).display()),
         Recording::Nothing => println!("rerun: nothing recorded (--rerun {})", report.rerun_mode),
     }
@@ -2689,14 +2695,20 @@ fn spawn_viewer(port: u16) -> Result<(RecordingStream, Viewer), RunError> {
     let viewer = match info.child_pid {
         Some(pid) => {
             let port = info.port;
-            let waited = wait_for_listener(port, VIEWER_LISTEN_BUDGET, VIEWER_LISTEN_NOTE, |w| {
-                println!(
-                    "rerun: waiting for the viewer this run started to listen on port {port} \
-                     ({:.0} s so far, up to {:.0} s); the clock has not started",
-                    w.as_secs_f64(),
-                    VIEWER_LISTEN_BUDGET.as_secs_f64()
-                );
-            })
+            let waited = wait_for_listener(
+                LOCAL_VIEWER_HOST,
+                port,
+                VIEWER_LISTEN_BUDGET,
+                VIEWER_LISTEN_NOTE,
+                |w| {
+                    println!(
+                        "rerun: waiting for the viewer this run started to listen on port \
+                         {port} ({:.0} s so far, up to {:.0} s); the clock has not started",
+                        w.as_secs_f64(),
+                        VIEWER_LISTEN_BUDGET.as_secs_f64()
+                    );
+                },
+            )
             .map_err(|waited| {
                 RunError::Rerun(RerunError::NotListening {
                     port,
@@ -2713,9 +2725,59 @@ fn spawn_viewer(port: u16) -> Result<(RecordingStream, Viewer), RunError> {
         }
         None => Viewer::Joined { port: info.port },
     };
-    let stream = RecordingStreamBuilder::new("pipes")
-        .connect_grpc_opts(format!("rerun+http://127.0.0.1:{}/proxy", info.port))?;
+    let stream = RecordingStreamBuilder::new("pipes").connect_grpc_opts(format!(
+        "rerun+http://{LOCAL_VIEWER_HOST}:{}/proxy",
+        info.port
+    ))?;
     Ok((stream, viewer))
+}
+
+/// Where a viewer this run starts, or finds already running, listens.
+const LOCAL_VIEWER_HOST: &str = "127.0.0.1";
+
+/// The stream behind `--rerun grpc --rerun-host HOST`: the viewer listening
+/// at `HOST:port` is joined and nothing is started, because a viewer on
+/// another machine, or on the host of the container this runs in, cannot be
+/// started from here. The run waits for it exactly as [`spawn_viewer`] waits
+/// for its own, so the clock never starts against a viewer that cannot take
+/// the data; the wait gives the reader time to open one.
+fn join_viewer(host: &str, port: u16) -> Result<(RecordingStream, Viewer), RunError> {
+    let waited = wait_for_listener(host, port, VIEWER_LISTEN_BUDGET, VIEWER_LISTEN_NOTE, |w| {
+        println!(
+            "rerun: waiting for a viewer to listen at {host}:{port} ({:.0} s so far, up to \
+                 {:.0} s); open `rerun` there. The clock has not started",
+            w.as_secs_f64(),
+            VIEWER_LISTEN_BUDGET.as_secs_f64()
+        );
+    })
+    .map_err(|waited| {
+        RunError::Rerun(RerunError::NoRemoteViewer {
+            host: host.to_string(),
+            port,
+            waited_s: waited.as_secs_f64(),
+        })
+    })?;
+    println!(
+        "rerun: joining the viewer at {host}:{port}, which answered after {:.1} s; the clock \
+         starts after this",
+        waited.as_secs_f64()
+    );
+    // An IPv6 address goes in brackets in a URL; `--rerun-host` accepts it
+    // either way.
+    let url_host = if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    };
+    let stream = RecordingStreamBuilder::new("pipes")
+        .connect_grpc_opts(format!("rerun+http://{url_host}:{port}/proxy"))?;
+    Ok((
+        stream,
+        Viewer::Remote {
+            host: host.to_string(),
+            port,
+        },
+    ))
 }
 
 /// The window a viewer this run starts opens at, in logical points: the size
@@ -2758,26 +2820,35 @@ const VIEWER_LISTEN_NOTE: Duration = Duration::from_secs(5);
 /// How long one connection attempt may take, and the pause between two.
 const VIEWER_LISTEN_POLL: Duration = Duration::from_millis(100);
 
-/// Polls `127.0.0.1:port` until something accepts a TCP connection, for at
-/// most `budget`: `Ok(waited)` once something does, `Err(waited)` when the
-/// budget runs out first. `note` is called once, the first time the wait
-/// passes `note_after` with nothing listening.
+/// Polls `host:port` until something accepts a TCP connection, for at most
+/// `budget`: `Ok(waited)` once something does, `Err(waited)` when the budget
+/// runs out first. `note` is called once, the first time the wait passes
+/// `note_after` with nothing listening.
 ///
 /// A TCP accept is the readiness the SDK's own `wait_for_bind` tests, and it
 /// is enough: the viewer's gRPC server takes and buffers what the run sends
 /// from the moment it listens, whether or not its window is up yet.
+///
+/// The host is resolved on every attempt, not once: a name such as
+/// `host.docker.internal` can fail to resolve until the network it names is
+/// up, and a failed lookup counts as nothing listening yet.
 fn wait_for_listener(
+    host: &str,
     port: u16,
     budget: Duration,
     note_after: Duration,
     mut note: impl FnMut(Duration),
 ) -> Result<Duration, Duration> {
-    let addr = std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port));
+    use std::net::ToSocketAddrs;
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
     let start = now();
     let waited = || Duration::from_nanos(u64::try_from(now() - start).unwrap_or(0));
     let mut noted = false;
     loop {
-        if std::net::TcpStream::connect_timeout(&addr, VIEWER_LISTEN_POLL).is_ok() {
+        let listening = (bare, port).to_socket_addrs().is_ok_and(|mut addrs| {
+            addrs.any(|a| std::net::TcpStream::connect_timeout(&a, VIEWER_LISTEN_POLL).is_ok())
+        });
+        if listening {
             return Ok(waited());
         }
         let w = waited();
@@ -3094,7 +3165,10 @@ pub fn execute(a: &RunArgs) -> Result<RunReport, RunError> {
     };
     let (recording, stream) = match (&rerun_mode, dashboard_on) {
         (RerunMode::Grpc, _) => {
-            let (stream, viewer) = spawn_viewer(a.rerun_port)?;
+            let (stream, viewer) = match &a.rerun_host {
+                Some(host) => join_viewer(host, a.rerun_port)?,
+                None => spawn_viewer(a.rerun_port)?,
+            };
             (Recording::Viewer(viewer), Some(stream))
         }
         (RerunMode::Rrd(path), _) => save(path.clone())?,
@@ -4767,9 +4841,15 @@ mod tests {
         let l = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
         let port = l.local_addr().unwrap().port();
         let mut notes = 0;
-        let waited = wait_for_listener(port, Duration::from_secs(5), Duration::ZERO, |_| {
-            notes += 1;
-        })
+        let waited = wait_for_listener(
+            LOCAL_VIEWER_HOST,
+            port,
+            Duration::from_secs(5),
+            Duration::ZERO,
+            |_| {
+                notes += 1;
+            },
+        )
         .expect("a listening port was not seen");
         assert!(waited < Duration::from_secs(5), "{waited:?}");
         assert_eq!(
@@ -4787,9 +4867,15 @@ mod tests {
         };
         let budget = Duration::from_millis(400);
         let mut notes = Vec::new();
-        let waited = wait_for_listener(port, budget, Duration::from_millis(150), |w| {
-            notes.push(w);
-        })
+        let waited = wait_for_listener(
+            LOCAL_VIEWER_HOST,
+            port,
+            budget,
+            Duration::from_millis(150),
+            |w| {
+                notes.push(w);
+            },
+        )
         .expect_err("a port nothing listens on was taken for a viewer");
         assert!(
             waited >= budget,
@@ -4812,6 +4898,47 @@ mod tests {
         assert!(e.contains("before its clock started"), "{e}");
         assert!(e.contains("python -m pip install rerun-sdk==0.38.1"), "{e}");
         assert!(e.contains("Windows Firewall"), "{e}");
+        assert!(e.contains("--rerun rrd"), "{e}");
+    }
+
+    #[test]
+    fn the_viewer_wait_resolves_a_host_name() {
+        // `--rerun-host` names hosts, as `host.docker.internal` does, so the
+        // wait must resolve one rather than take only an address.
+        let l = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = l.local_addr().unwrap().port();
+        let waited = wait_for_listener(
+            "localhost",
+            port,
+            Duration::from_secs(5),
+            Duration::ZERO,
+            |_| {},
+        )
+        .expect("a listener behind `localhost` was not seen");
+        assert!(waited < Duration::from_secs(5), "{waited:?}");
+    }
+
+    #[test]
+    fn a_host_that_does_not_resolve_is_nothing_listening() {
+        let port = crate::cli::DEFAULT_VIEWER_PORT;
+        let waited = wait_for_listener(
+            "no-such-host.invalid",
+            port,
+            Duration::from_millis(300),
+            Duration::from_secs(60),
+            |_| {},
+        )
+        .expect_err("a host that does not resolve was taken for a viewer");
+        assert!(waited >= Duration::from_millis(300), "{waited:?}");
+        let e = RerunError::NoRemoteViewer {
+            host: "no-such-host.invalid".to_string(),
+            port,
+            waited_s: waited.as_secs_f64(),
+        }
+        .to_string();
+        assert!(e.contains(&format!("no-such-host.invalid:{port}")), "{e}");
+        assert!(e.contains("before its clock started"), "{e}");
+        assert!(e.contains("python -m pip install rerun-sdk==0.38.1"), "{e}");
         assert!(e.contains("--rerun rrd"), "{e}");
     }
 
