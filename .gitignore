@@ -1,0 +1,12 @@
+/target/
+/data/
+/runs/
+*.rrd
+*.log
+/models/
+
+# Notes for AI-assisted development: kept on disk, not in the repository.
+/.claude/
+/HANDOFF.md
+/PR.md
+/results/

@@ -1,0 +1,15 @@
+# One line-ending policy for the whole repository: LF in the object store and
+# LF in the working tree on every platform.
+#
+# Why this file exists: `crates/pipes-kitti/src/cam0.rs` silently drifted to
+# CRLF. It was the one file restored with `git checkout` during a revert, and on
+# Windows `core.autocrlf` rewrote it on the way out because no policy said
+# otherwise. Every `git add` then warned "LF will be replaced by CRLF" for the
+# whole tree, and a text search with LF anchors stopped matching that one file.
+# Without this, anyone who re-clones or checks out a file gets different bytes
+# than the ones committed.
+* text=auto eol=lf
+
+# Artifacts that must never be line-ending converted.
+*.png binary
+*.rrd binary

@@ -1,0 +1,21 @@
+[package]
+name = "pipes-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Core types for the Pipes sensor pipeline: clocks, samples, bounded queues, evidence rows and the counting allocator."
+publish = false
+repository = "https://github.com/EthanMBoos/pipes-rs"
+
+[dependencies]
+arrow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+# `evidence_csv_header_matches_the_struct` serialises a row and pins the
+# 24-column header here, so a field reorder fails in this crate rather than
+# only in the slow end-to-end test.
+csv.workspace = true
+tempfile.workspace = true
