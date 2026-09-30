@@ -25,17 +25,17 @@ use pipes_core::queue::{BoundedQueue, PushOutcome, QueuePolicy};
 use pipes_core::sample::StreamId;
 use pipes_kitti::layout::ABSENT_IN_SOURCE;
 use rerun::archetypes::{
-    BarChart, Clear, GraphEdges, GraphNodes, Measurements, Scalars, SeriesLines, SeriesPoints,
-    StateChange, StateConfiguration, TextDocument, TextLog,
+    Clear, GraphEdges, GraphNodes, Measurements, Scalars, SeriesLines, SeriesPoints, StateChange,
+    StateConfiguration, TextDocument, TextLog,
 };
 use rerun::components::{Color, InterpolationMode, MarkerShape, MediaType, TextLogLevel};
 use rerun::{AsComponents, RecordingStream};
 
 use crate::consumers::{log_no_frame, log_no_sweep};
 use crate::dashboard::{
-    admission_root, entity, lane_path, queue_lane, queue_root, send_blueprint, Mode, ABSENT_LEAF,
-    ADMISSION_EDGES, ALLOC_RATIO, CHAIN_BYTES, EDGES, GRAPH_EDGES, GRAPH_NODES, HEADROOM_TOP,
-    LANE_CAMERA_NAME, LANE_LIDAR_NAME, LANE_NAMES, LANE_PAIRING_NAME, STAGES,
+    entity, lane_path, queue_lane, send_blueprint, Mode, ReadyDot, StageClock, ADMISSION_EDGES,
+    CHAIN_BYTES, EDGES, GRAPH_EDGES, GRAPH_NODES, LANE_CAMERA_NAME, LANE_LIDAR_NAME, LANE_NAMES,
+    LANE_PAIRING_NAME, PAIRING_DONE_TOP, READY_DOTS, SWEEP_END_LEAF, SWEEP_END_ZOOM,
 };
 use crate::run::RunCtx;
 use crate::viewer::{Canvas, Subject, VIEWER_EDGE};
@@ -153,19 +153,19 @@ impl EvidenceSink {
 // detection purple, the answer's gold -- anything that counts a failure is
 // red, and a reference bound is thin and grey so it reads as a backdrop
 // rather than a measurement.
-/// The detection family, #9B7BD8: the lidar detections and tracks on the
-/// byte and stage bars, and the fusion's wait for the camera's detections.
+/// The detection family, #9B7BD8: the detections, tracks and state on the
+/// pipeline graph.
 const C_DETECTION: [u8; 3] = [155, 123, 216];
 /// A failure that has already happened, #E5484D -- and the time to contact,
 /// the one number on the demo screen that is bad when it is small.
 const C_FAIL: [u8; 3] = [229, 72, 77];
-/// A band a measurement is read inside, and the auditor's reference lines:
-/// mid grey. The viewer draws a band only in an opaque colour at a width of
-/// at least 1.
+/// A band a measurement is read inside, and what belongs to no sensor, the
+/// admission on the pipeline graph: mid grey. The viewer draws a band only
+/// in an opaque colour at a width of at least 1.
 const C_BOUND: [u8; 3] = [150, 150, 150];
-/// A reference line a measurement is read against -- a capacity, a 1.0, the
-/// 3 s warning, a sweep's ends, the period: a bright grey, #D2D2D2, because
-/// a mid-grey line was invisible on the viewer's black.
+/// A reference line a measurement is read against -- the 3 s warning, a
+/// sweep's ends and its trigger: a bright grey, #D2D2D2, because a mid-grey
+/// line was invisible on the viewer's black.
 const C_REFERENCE: [u8; 3] = [210, 210, 210];
 /// Something was missed and the pipeline carried on: a lane's `skipping` or
 /// `stale`, and the answer box on a frame that came from a stale pair. `pub`
@@ -180,22 +180,12 @@ const C_LANE_OK: [u8; 3] = [60, 130, 80];
 /// upstream dropped it -- and a reader must not take the source's gap for a
 /// queue's loss. The WARN log and the headline say why.
 const C_ABSENT: [u8; 3] = [128, 128, 128];
-/// Queue occupancy, measured on the way IN: the depth each push met. Green,
-/// because an occupancy is neither a failure nor a timing.
-const C_DEPTH_PUSH: [u8; 3] = [92, 178, 120];
-/// Queue occupancy measured on the way OUT: the backlog a pop left behind.
-/// A lighter voice of the same green, so the two read as one quantity's two
-/// edges.
-const C_DEPTH_DRAIN: [u8; 3] = [166, 217, 181];
-/// The queues nobody is reading for on the fill plot: a slate that recedes
-/// behind the camera's blue and the lidar's teal.
-const C_NEUTRAL: [u8; 3] = [122, 138, 153];
 /// The ANSWER's own colour, gold, and deliberately a colour nothing else in
 /// this palette uses: the answer's box, its label and its 3D wireframe, and
-/// the two lines that time it, its age in ms and over one period. Every
-/// other colour here marks the rest of the PIPELINE -- how late, how full,
-/// how many bytes -- or a sensor. Its distance and closing speed are words in
-/// its label and the headline rather than lines on a plot.
+/// the ready dot and graph node that time it. Every other colour here marks
+/// the rest of the PIPELINE -- how late, how many bytes -- or a sensor. Its
+/// distance and closing speed are words in its label and the headline
+/// rather than lines on a plot.
 ///
 /// `pub` because `consumers` draws the answer's rectangle over the camera
 /// image in this colour. Exported rather than repeated: two constants that
@@ -210,6 +200,10 @@ pub const C_ANSWER: [u8; 3] = [255, 208, 48];
 pub const C_FUSED: [u8; 3] = [92, 178, 120];
 /// A track only the lidar holds: teal, the lidar's colour everywhere.
 pub const C_LIDAR_ONLY: [u8; 3] = [0, 168, 176];
+/// `reduce`'s ready dot, the lidar's first stage: a lighter voice of the
+/// lidar's teal, #80D2D7, so it reads as the lidar's and apart from
+/// `detect`'s, which is the lidar's half.
+const C_LIDAR_EARLY: [u8; 3] = [128, 210, 215];
 /// A detection only the camera holds: blue, the camera's colour everywhere.
 pub const C_CAMERA_ONLY: [u8; 3] = [64, 140, 214];
 
@@ -280,36 +274,26 @@ impl SeriesStyle {
 /// colour fails the build's tests rather than quietly producing another
 /// anonymous line in the viewer.
 #[cfg(test)]
-const SERIES_LEAVES: [&str; 27] = [
-    "drops",
-    ABSENT_LEAF,
-    "depth_at_push",
-    "depth",
-    "cap",
-    "drop_events",
-    "fill",
-    "run_length",
-    "alternating",
-    "answer",
-    "camera_queue",
-    "camera_wait",
-    "velo_to_reduce",
-    "at_bound",
-    "cam_service",
-    "answer_age_ms",
-    "period_ms",
+const SERIES_LEAVES: [&str; 15] = [
     // Logged by the `track` stage straight onto the recording, for every
     // sweep: the pairing window is in no evidence column.
     "sweep_start",
     "sweep_end",
     "trigger",
     "camera",
+    // On the same plot, and on its zoom onto the sweep's end, by the
+    // evidence mirror ([`Dashboard::log_done`]): when the pairing's two
+    // halves, the lidar's first stage and the answer were ready. The zoom's
+    // line at the sweep's end is the `sweep_end` above.
+    "1_camera_done",
+    "2_reduce_done",
+    "3_detect_done",
+    "4_answer_done",
     // The answer's own series. Logged by `state-sink` straight onto the
     // recording rather than mirrored off an evidence row -- an evidence row
-    // carries how long a sample took and how big it was, never what it SAID --
-    // so they reach this table through `series_archetype` instead of
-    // `Dashboard::scalar`. They are in it for the reason everything else is: an
-    // unstyled series is an anonymous line in somebody's viewer.
+    // carries how long a sample took and how big it was, never what it SAID.
+    // They are in this table for the reason everything else is: an unstyled
+    // series is an anonymous line in somebody's viewer.
     "ttc_s",
     "ttc_warn",
     // The fusion's populations in the camera frame, logged by `state-sink`
@@ -317,8 +301,9 @@ const SERIES_LEAVES: [&str; 27] = [
     "fused",
     "lidar_only",
     "camera_only",
-    // Beside them, the share of the in-frame lidar tracks that are fused.
+    // Beside them, the fused share of each sensor's objects in the frame.
     "fused_fraction",
+    "camera_fused_fraction",
 ];
 
 /// The static style of a grey band -- a `Measurements` series, whose one
@@ -362,48 +347,6 @@ fn series_style(leaf: &str) -> Option<SeriesStyle> {
         })
     };
     match leaf {
-        "drops" => s("drops (cum)", C_FAIL, 2.0, true),
-        // Beside the drops, on a sensor driver's edge: the frames its source
-        // never had, in the grey of a source gap. Not a drop, so not red.
-        ABSENT_LEAF => s("source gap (cum)", C_ABSENT, 2.0, true),
-        // The camera queue's depth, both edges of it: the depth each push
-        // met shows a queue running full, and the backlog each pop LEFT
-        // BEHIND shows it draining -- 0 means that pop emptied the queue. A
-        // queue full only for the instant of each push and one full all the
-        // time look the same on the push side alone.
-        "depth_at_push" => s("depth at push", C_DEPTH_PUSH, 2.0, true),
-        "depth" => s("depth after pop", C_DEPTH_DRAIN, 1.5, true),
-        "cap" => s("capacity", C_REFERENCE, 1.5, true),
-        // A cross at the capacity for every frame the camera queue did not
-        // deliver: the queue was full, and this is what it cost.
-        "drop_events" => points("dropped (at cap)", C_FAIL, 4.0, MarkerShape::Cross),
-        // Depth at push over capacity, per queue, 0 to 1: the one series
-        // that shows a queue running full. Coloured by queue at logging
-        // time (`fill_rgb`); this is the colour of the rest.
-        "fill" => s("fill (share of cap)", C_NEUTRAL, 1.5, true),
-        // The admission's run of same-stream driver admissions, against
-        // the 1.0 of strict alternation.
-        "run_length" => s("run length (count)", C_LIDAR_ONLY, 2.0, true),
-        "alternating" => s("alternating (1)", C_REFERENCE, 1.0, true),
-        // The Latency page's ratios, each a time over the bound it is read
-        // against, so 1 is at the bound on every line: the answer's age in
-        // the answer's gold and heaviest, the camera's in its blue, the
-        // fusion's wait for the camera in the detection purple, the lidar's
-        // in its teal, and the 1.0 they are read against.
-        "answer" => s("answer (age/period)", C_ANSWER, 2.5, false),
-        "camera_queue" => s("camera (age/bound)", C_CAMERA_ONLY, 1.5, false),
-        "camera_wait" => s("cam wait (/period)", C_DETECTION, 1.5, false),
-        "velo_to_reduce" => s("lidar (age/period)", C_LIDAR_ONLY, 1.5, false),
-        "at_bound" => s("at bound (1)", C_REFERENCE, 1.5, true),
-        // The camera stage's service over one period: past 1 it cannot keep
-        // up with the camera, whatever its queue does.
-        "cam_service" => s("service (/period)", C_CAMERA_ONLY, 2.0, false),
-        // The chain's end, on the Latency page, in the answer's gold: how
-        // long after the sweep was due its answer arrived, under the one
-        // bound that matters there -- the sweep period. Under it, the answer
-        // is ready before the next sweep lands.
-        "answer_age_ms" => s("answer age (ms)", C_ANSWER, 2.0, false),
-        "period_ms" => s("period (ms)", C_REFERENCE, 2.0, true),
         // The pairing window, in ms from the sweep's start: its two ends as
         // bright reference lines (the grey band between them alone is faint
         // on black), the trigger as a thinner one, and the paired camera
@@ -413,6 +356,16 @@ fn series_style(leaf: &str) -> Option<SeriesStyle> {
         "sweep_end" => s("sweep end (ms)", C_REFERENCE, 1.5, true),
         "trigger" => s("trigger (ms)", C_REFERENCE, 1.0, true),
         "camera" => points("camera frame (ms)", C_CAMERA_ONLY, 2.5, MarkerShape::Circle),
+        // When the pairing's halves and its answer were ready, on the same
+        // plot and on its zoom, as a DIAMOND each -- a stage finishing, where
+        // the circle is an instant measured -- in the colour of what it is
+        // about: the camera's blue, the lidar's teal (lighter for `reduce`,
+        // its first stage), the answer's gold. A blue diamond above
+        // `detect`'s is a camera frame the lidar's boxes waited for.
+        "1_camera_done" => points("camera done (ms)", C_CAMERA_ONLY, 3.5, MarkerShape::Diamond),
+        "2_reduce_done" => points("reduce done (ms)", C_LIDAR_EARLY, 3.5, MarkerShape::Diamond),
+        "3_detect_done" => points("detect done (ms)", C_LIDAR_ONLY, 3.5, MarkerShape::Diamond),
+        "4_answer_done" => points("answer done (ms)", C_ANSWER, 3.5, MarkerShape::Diamond),
         // Time to contact with the object the answer flags, as POINTS: the
         // flagged object changes from sweep to sweep, and a line joined one
         // object's approach to the next one's with a vertical jump no object
@@ -431,9 +384,12 @@ fn series_style(leaf: &str) -> Option<SeriesStyle> {
         "fused" => s("fused (count)", C_FUSED, 2.0, true),
         "lidar_only" => s("lidar-only (count)", C_LIDAR_ONLY, 2.0, true),
         "camera_only" => s("camera-only (count)", C_CAMERA_ONLY, 2.0, true),
-        // The share of the lidar's in-frame tracks the camera confirmed, in
-        // the fused green, held per answer like the counts it divides.
-        "fused_fraction" => s("fused (share)", C_FUSED, 2.0, true),
+        // The fused share of each sensor's objects in the frame, held per
+        // answer like the counts it divides, in the colour of the sensor
+        // whose objects it is a share of: the lidar's tracks the camera
+        // confirmed, and the camera's detections the lidar confirmed.
+        "fused_fraction" => s("of lidar (share)", C_LIDAR_ONLY, 2.0, true),
+        "camera_fused_fraction" => s("of camera (share)", C_CAMERA_ONLY, 2.0, true),
         _ => None,
     }
 }
@@ -505,22 +461,15 @@ const NO_FRAME: &str = "no frame";
 /// camera stream's `pair_absent`.
 const SOURCE_GAP: &str = "source gap";
 
-/// Whether a consumer read the producer's buffer or a copy of it.
-const LANE_SHARED: Lane = Lane {
-    values: &["same", "copied"],
-    colors: &[C_LANE_OK, C_FAIL],
-};
-
 /// Every lane entity the run can emit, for the test that no lane ships
 /// without its `StateConfiguration`.
 #[cfg(test)]
-const LANE_PATHS: [&str; 6] = [
+const LANE_PATHS: [&str; 5] = [
     "lanes/pairing",
     "lanes/camera_queue",
     "lanes/lidar_queue",
     "lanes/detect_queue",
     "lanes/fusion_queue",
-    entity::STORAGE_SHARED,
 ];
 
 /// How to draw one lane, by its entity path, or `None` for a path with no
@@ -532,8 +481,6 @@ fn lane_style(path: &str) -> Option<&'static Lane> {
         Some(&LANE_LIDAR)
     } else if path == lane_path(LANE_CAMERA_NAME) {
         Some(&LANE_CAMERA)
-    } else if path == entity::STORAGE_SHARED {
-        Some(&LANE_SHARED)
     } else if LANE_NAMES
         .iter()
         .any(|n| *n != LANE_PAIRING_NAME && path == lane_path(n))
@@ -667,99 +614,75 @@ impl Sticky {
     }
 }
 
-/// The admission's run of same-stream sensor-driver admissions.
-#[derive(Default)]
-struct AdmissionRun {
-    last: Option<&'static str>,
-    run: u32,
+/// Where a ready dot is drawn on the pairing plot, in ms from its sweep's
+/// start on the sensor clock: the sweep's own length, `span_ns`, then how
+/// long after the sweep was due its stage finished, `after_due_ns`, which is
+/// on the host clock and which `--rate` stretches onto the sensor's. Held at
+/// [`PAIRING_DONE_TOP`] periods when it is that late or later.
+fn done_ms(span_ns: i64, after_due_ns: i64, rate: f64, period_ms: f64) -> f64 {
+    let ms = (span_ns as f64 + after_due_ns as f64 * rate) * 1e-6;
+    ms.min(PAIRING_DONE_TOP * period_ms)
 }
 
-impl AdmissionRun {
-    /// Records one driver admission and returns how many in a row, this one
-    /// included, came from the same driver.
-    fn observe(&mut self, stream: &'static str) -> u32 {
-        self.run = if self.last == Some(stream) {
-            self.run + 1
-        } else {
-            1
-        };
-        self.last = Some(stream);
-        self.run
-    }
+/// Where a ready dot is drawn on the zoom onto the sweep's end, in ms after
+/// the sweep ended on the sensor clock: `after_due_ns` stretched by
+/// `--rate`, held inside [`SWEEP_END_ZOOM`] periods.
+fn zoom_ms(after_due_ns: i64, rate: f64, period_ms: f64) -> f64 {
+    let (early, late) = SWEEP_END_ZOOM;
+    (after_due_ns as f64 * rate * 1e-6).clamp(early * period_ms, late * period_ms)
 }
 
-/// The colour of one queue's fill line, by the queue it hangs under: the
-/// camera queue that feeds the answer in the camera's blue, the lidar's
-/// queue into `reduce` in its teal, and every other queue in one neutral
-/// slate, so the two a reader came for stand out of twelve.
-fn fill_rgb(root: &str, camera_edge: Option<&str>) -> [u8; 3] {
-    if camera_edge.is_some_and(|e| root == queue_root(e)) {
-        C_CAMERA_ONLY
-    } else if root == queue_root("velo->reduce") {
-        C_LIDAR_ONLY
-    } else {
-        C_NEUTRAL
-    }
-}
-
-/// One period on the host clock, ms, for a row: the sweep's own range on a
-/// sweep-derived row, the camera's median period on a camera row (an
-/// instant has no range), either divided by `--rate`. `None` on an unpaced
-/// run, which has no deadlines to be late against.
-fn host_period_ms(bounds: &Bounds, e: &Evidence) -> Option<f64> {
-    let rate = bounds.rate?;
-    let sensor_ms = if e.tov_end_ns > e.tov_start_ns {
-        (e.tov_end_ns - e.tov_start_ns) as f64 * 1e-6
-    } else {
-        bounds.period_ms?
-    };
-    (rate > 0.0).then(|| sensor_ms / rate)
-}
-
-/// The answer-age plot's band: one period, 0 to P.
-const PERIOD_BAND: &str = "latency/period_band";
-
-/// One stage bar's colour, by its place in the chain: the lidar's teal for
-/// the two stages that read clouds, the detection purple for the two that
-/// read detections and tracks, the answer's gold for the last.
-fn stage_rgb(i: usize) -> [u8; 3] {
-    match i {
-        0 | 1 => C_LIDAR_ONLY,
-        2 | 3 => C_DETECTION,
-        _ => C_ANSWER,
-    }
-}
-
-/// The edges the byte table reads: the chain's five links and the lidar
-/// driver's own row, the one copy.
-const TABLE_EDGES: [&str; 6] = [
+/// The edges the two tables read, every delivered row of each: the byte
+/// chain's links as the next stage read them and as the step before built
+/// them ([`CHAIN_BYTES`]), and every stage's own row and what it handed on
+/// ([`stage_rows`]) -- the camera stage's under either of its names.
+const TABLE_EDGES: [&str; 14] = [
     "velo->reduce",
-    "det->cloud",
-    "obj->sink",
+    "det->detect",
+    "obj->track",
     "track->state",
     "state->sink",
     "velo",
+    "det",
+    "obj",
+    "track",
+    "state",
+    "cam0",
+    "cam_det",
+    "cam0->camdet",
+    "cam0->proc",
 ];
 
-/// Answers after which the byte table is first written, so a live viewer
-/// has one to read long before the run ends.
+/// Answers after which the tables are first written, so a live viewer has
+/// them to read long before the run ends.
 const TABLE_AFTER_ANSWERS: u64 = 10;
 
 /// The pipeline graph's node radius, in the graph's own units.
 const GRAPH_NODE_RADIUS: f32 = 6.0;
 
-/// One row of the byte table: a link's median carried and allocated bytes,
-/// `None` where the run had no such row, and how many rows the medians are
-/// over -- the samples that link delivered, which on a run that evicted is
-/// fewer than the sweeps.
-struct ByteLink<'a> {
-    name: &'a str,
-    carried: Option<u64>,
-    allocated: Option<u64>,
-    rows: usize,
+/// Every delivered row of one of the tables' edges, for their medians: a few
+/// hundred per edge on a run.
+#[derive(Debug, Default)]
+struct EdgeRows {
+    /// `payload_bytes`: what the edge carried.
+    carried: Vec<u64>,
+    /// `bytes_alloc`: what the row's stage allocated.
+    alloc: Vec<u64>,
+    /// The stage's own time on the row, ns: `proc_end - proc_start` on a
+    /// queue's row, `decode_ns` on a sensor driver's.
+    time_ns: Vec<i64>,
+    /// Rows whose consumer named a buffer other than its producer's.
+    copied: u64,
 }
 
-/// A byte count the way the table and the graph print it: `1.97 MB`,
+/// The median of `v`, the upper one of an even count; `None` for no rows.
+fn median<T: Copy + Ord>(v: &[T]) -> Option<T> {
+    let mut v = v.to_vec();
+    v.sort_unstable();
+    v.get(v.len() / 2).copied()
+}
+
+/// A byte count the way the tables and the graph print it: `1.97 MB`,
 /// `518 kB`, `341 B`, in decimal units.
 fn human_bytes(b: u64) -> String {
     let f = b as f64;
@@ -772,25 +695,55 @@ fn human_bytes(b: u64) -> String {
     }
 }
 
-/// The byte chain as a markdown table -- each link, what it carried, the
-/// step from the link before (a shrink as `÷ 3.8`, a growth as `× 1.4`),
-/// and what the link's consumer allocated to read it -- followed by one
-/// sentence about the lidar driver, the chain's one copy: `driver` is its
-/// `(allocated, carried)` medians over `driver_rows` sweeps. The last
-/// sentence says what the medians are over: one number when every link
-/// delivered the same sweeps, each link's own count when they did not, so
-/// a run that evicted does not read as a median of sweeps a link never saw.
-fn byte_table(
-    links: &[ByteLink],
-    driver: (Option<u64>, Option<u64>),
-    driver_rows: usize,
-) -> String {
+/// A time the way the stage table prints it, to about two figures: `36 ms`,
+/// `4.3 ms`, `0.12 ms`, `0.034 ms`.
+fn human_ms(ns: i64) -> String {
+    let ms = ns as f64 * 1e-6;
+    if ms >= 10.0 {
+        format!("{ms:.0} ms")
+    } else if ms >= 1.0 {
+        format!("{ms:.1} ms")
+    } else if ms >= 0.1 {
+        format!("{ms:.2} ms")
+    } else {
+        format!("{ms:.3} ms")
+    }
+}
+
+/// One row of the byte table: a link ([`crate::dashboard::ChainLink`]), and its medians --
+/// what it carried, what its step allocated to build it and what the next
+/// stage allocated to read it -- `None` where the run had no such row; how
+/// many rows they are over, the samples the link delivered, which on a run
+/// that evicted is fewer than the sweeps; and how many of those rows read a
+/// copy of their producer's buffer.
+#[derive(Clone, Copy)]
+struct ByteLink<'a> {
+    name: &'a str,
+    step: &'a str,
+    carried: Option<u64>,
+    built: Option<u64>,
+    read: Option<u64>,
+    rows: usize,
+    copied: u64,
+}
+
+/// The byte chain as a markdown table -- each link, what the step that made
+/// it does, what it carried, the change from the link before (a shrink as
+/// `÷ 3.8`, a growth as `× 1.4`), what the step allocated to build it and
+/// what the next stage allocated to read it -- then what those two columns
+/// mean, whether every link was read in place, and what the medians are
+/// over: one number when every link delivered the lidar driver's `sweeps`,
+/// each link's own count when they did not, so a run that evicted does not
+/// read as a median of sweeps a link never saw.
+fn byte_table(links: &[ByteLink], sweeps: usize) -> String {
     let show = |b: Option<u64>| b.map_or_else(|| "-".to_string(), human_bytes);
-    let mut out =
-        String::from("| link | carried | step | allocated on the edge |\n|---|---:|---:|---:|\n");
+    let mut out = String::from(
+        "| link | what the step does | carried | change | built | read |\n\
+         |---|---|---:|---:|---:|---:|\n",
+    );
     let mut prev: Option<u64> = None;
     for (i, l) in links.iter().enumerate() {
-        let step = match (prev, l.carried) {
+        let change = match (prev, l.carried) {
             (Some(a), Some(b)) if a > 0 && b > 0 && b <= a => {
                 format!("÷ {:.1}", a as f64 / b as f64)
             }
@@ -798,37 +751,43 @@ fn byte_table(
             _ => String::new(),
         };
         out.push_str(&format!(
-            "| {} {} | **{}** | {} | {} |\n",
+            "| {} {} | {} | **{}** | {} | {} | {} |\n",
             i + 1,
             l.name,
+            l.step,
             show(l.carried),
-            step,
-            show(l.allocated)
+            change,
+            show(l.built),
+            show(l.read)
         ));
         prev = l.carried;
     }
-    let in_place = links.iter().all(|l| l.allocated == Some(0));
-    out.push('\n');
-    match driver {
-        (Some(alloc), Some(carried)) if in_place => out.push_str(&format!(
-            "Every link reads its input in place: the lidar driver's {} allocated for {} carried is the chain's one copy.",
-            human_bytes(alloc),
-            human_bytes(carried)
-        )),
-        (Some(alloc), Some(carried)) => out.push_str(&format!(
-            "The lidar driver allocated {} for {} carried.",
-            human_bytes(alloc),
-            human_bytes(carried)
-        )),
-        _ => {}
+    out.push_str(
+        "\n**built** is what the step allocated to write its result: the one buffer that result \
+         lives in, handed on by reference. **read** is what the next stage allocated to read it: \
+         0 B is in place, no copy.\n\n",
+    );
+    let not_in_place: Vec<String> = links
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| l.read != Some(0) || l.copied > 0)
+        .map(|(i, l)| format!("{} {}", i + 1, l.name))
+        .collect();
+    if not_in_place.is_empty() {
+        out.push_str(
+            "Every link was read in place, the same `storage_id` at both ends of every row: \
+             the lidar driver's, from the file into Arrow, is the chain's one copy.",
+        );
+    } else {
+        out.push_str(&format!("Not read in place: {}.", not_in_place.join(", ")));
     }
     let rows: Vec<usize> = links.iter().map(|l| l.rows).collect();
-    if rows.iter().all(|&n| n == driver_rows) {
-        out.push_str(&format!(" Medians of {driver_rows} sweeps."));
+    if rows.iter().all(|&n| n == sweeps) {
+        out.push_str(&format!(" Medians of {sweeps} sweeps."));
     } else {
         let each: Vec<String> = rows.iter().map(usize::to_string).collect();
         out.push_str(&format!(
-            " Medians of each link's own rows: {} for links 1 to {}, of the driver's {driver_rows} sweeps.",
+            " Medians of each link's own rows: {} for links 1 to {}, of the driver's {sweeps} sweeps.",
             each.join(", "),
             rows.len()
         ));
@@ -836,62 +795,151 @@ fn byte_table(
     out
 }
 
-/// Allocated over carried, 0 for an edge that carried nothing.
-fn alloc_ratio(allocated: u64, carried: u64) -> f64 {
-    if carried == 0 {
-        0.0
-    } else {
-        allocated as f64 / carried as f64
-    }
+/// One row of the stage table: a stage, what it does, the edge whose rows
+/// time it, and the producer row whose payload it hands on, with what that
+/// payload is.
+#[derive(Clone, Copy, Debug)]
+struct StageRow {
+    stage: &'static str,
+    what: &'static str,
+    /// The stage's own row: a queue's, whose `proc_end - proc_start` times
+    /// the stage, or a sensor driver's, whose `decode_ns` does.
+    timed_on: &'static str,
+    hands_on: &'static str,
+    noun: &'static str,
 }
 
-/// An edge's colour on the byte charts, by who produced what it carries:
-/// the lidar's teal for the sweep and the voxels, the detection purple for
-/// the detections, the camera's blue for a camera frame.
-fn producer_rgb(edge: &str, camera_edge: Option<&str>) -> [u8; 3] {
-    if edge.starts_with("cam0") || camera_edge == Some(edge) {
-        C_CAMERA_ONLY
-    } else if edge.starts_with("obj") || edge.starts_with("track") {
-        C_DETECTION
-    } else if edge.starts_with("state") {
-        C_ANSWER
-    } else {
-        C_LIDAR_ONLY
-    }
-}
-
-/// `log10` of a byte count, with 0 bytes drawn as 0 rather than as minus
-/// infinity: the bar charts span four orders of magnitude, and the viewer
-/// has no log axis.
-fn log10_bytes(bytes: u64) -> f64 {
-    (bytes.max(1) as f64).log10()
-}
-
-/// Cumulative non-`Delivered` outcomes per edge, so the dashboard can draw a
-/// step function instead of isolated points -- and, apart from them, the
-/// frames a sensor's source never had.
-///
-/// A frame absent in the source is a `Missing` row on its driver's
-/// pseudo-edge, and it is not a drop: nothing in the pipeline lost it. Counted
-/// in the drops, drive 0009's four absent sweeps drew the lidar driver's red
-/// drops line up to 4 on a run that lost nothing.
-#[derive(Default)]
-struct DropCounter(BTreeMap<&'static str, (u64, u64)>);
-
-impl DropCounter {
-    /// Records one row and returns that edge's running `(drops, absent in
-    /// source)`.
-    fn observe(&mut self, edge: &'static str, outcome: Outcome, reason: &str) -> (u64, u64) {
-        let n = self.0.entry(edge).or_insert((0, 0));
-        if outcome != Outcome::Delivered {
-            if reason == ABSENT_IN_SOURCE {
-                n.1 += 1;
-            } else {
-                n.0 += 1;
-            }
+/// Every stage the table can list, the camera's, the lidar's and the
+/// fusion's: the camera stage is the detector with it and `proc` without,
+/// whichever feeds the answer (`camera_edge`), and it is second.
+fn stage_rows(camera_edge: Option<&str>) -> [StageRow; 7] {
+    let camera = if camera_edge == Some("cam0->proc") {
+        StageRow {
+            stage: "proc",
+            what: "grayscale pass, the camera's half of each pair",
+            timed_on: "cam0->proc",
+            hands_on: "cam_det",
+            noun: "frame reference",
         }
-        *n
+    } else {
+        StageRow {
+            stage: "camdet",
+            what: "finds objects with YOLOX-Nano, on one thread",
+            timed_on: "cam0->camdet",
+            hands_on: "cam_det",
+            noun: "of boxes",
+        }
+    };
+    [
+        StageRow {
+            stage: "cam0",
+            what: "decodes each PNG into an Arrow buffer",
+            timed_on: "cam0",
+            hands_on: "cam0",
+            noun: "image",
+        },
+        camera,
+        StageRow {
+            stage: "velo",
+            what: "loads each 360° sweep: x, y, z, reflectance",
+            timed_on: "velo",
+            hands_on: "velo",
+            noun: "sweep",
+        },
+        StageRow {
+            stage: "reduce",
+            what: "averages the points into 20 cm cubes",
+            timed_on: "velo->reduce",
+            hands_on: "det",
+            noun: "of cubes",
+        },
+        StageRow {
+            stage: "detect",
+            what: "removes the ground, boxes each cluster",
+            timed_on: "det->detect",
+            hands_on: "obj",
+            noun: "of boxes",
+        },
+        StageRow {
+            stage: "track",
+            what: "gives boxes ids, fuses them with the camera",
+            timed_on: "obj->track",
+            hands_on: "track",
+            noun: "of tracks",
+        },
+        StageRow {
+            stage: "state",
+            what: "writes the answer, flags the nearest in path",
+            timed_on: "track->state",
+            hands_on: "state",
+            noun: "answer",
+        },
+    ]
+}
+
+/// One stage's line of the stage table: its row, and its medians.
+struct StageLine<'a> {
+    row: &'a StageRow,
+    time_ns: Option<i64>,
+    carried: Option<u64>,
+}
+
+/// The stages as a markdown table -- each stage, what it does, its median
+/// time per sample and what it hands on -- then `notes`, one paragraph each.
+fn stage_table(lines: &[StageLine], notes: &[String]) -> String {
+    let mut out = String::from("| stage | what it does | time | hands on |\n|---|---|---:|---|\n");
+    for l in lines {
+        out.push_str(&format!(
+            "| {} | {} | {} | {} |\n",
+            l.row.stage,
+            l.row.what,
+            l.time_ns.map_or_else(|| "-".to_string(), human_ms),
+            l.carried.map_or_else(
+                || "-".to_string(),
+                |b| format!("{} {}", human_bytes(b), l.row.noun)
+            ),
+        ));
     }
+    for n in notes {
+        out.push('\n');
+        out.push_str(n);
+        out.push('\n');
+    }
+    out
+}
+
+/// What the camera stage's node on the pipeline graph says it does: the
+/// detector's boxes, or `proc`'s grayscale frame reference.
+fn camera_words(stage: &str) -> &'static str {
+    if stage == "proc" {
+        "grayscale, frame ref"
+    } else {
+        "YOLOX-Nano boxes"
+    }
+}
+
+/// How many frames behind the newest a half-joined sweep is kept: one whose
+/// other half has not come in by then never will -- its camera frame was
+/// dropped, or a source had none.
+const HALVES_KEPT: u64 = 32;
+
+/// The two halves of one sweep, by its frame number, until both are in:
+/// when the sweep was due and how long it was (its driver's row), when the
+/// camera stage finished with the frame of the same number, and when
+/// `detect` finished with the sweep. The camera's own row cannot place it
+/// against the sweep -- its `due` is the frame's instant, mid-sweep -- so
+/// the camera's dot waits here for the sweep's due, and whether it came
+/// after the lidar waits for `detect`.
+#[derive(Debug, Default)]
+struct Halves {
+    /// The sweep's due and its length, ns.
+    sweep: Option<(i64, i64)>,
+    camera: Option<i64>,
+    lidar: Option<i64>,
+    /// The camera's dot is drawn.
+    drawn: bool,
+    /// The two finishes are counted.
+    compared: bool,
 }
 
 /// A sensor whose source can lack a frame.
@@ -940,46 +988,14 @@ impl SeqGap {
     }
 }
 
-/// Constant reference lines the dashboard draws beside the measured series, so
-/// a glance answers "is this number good?" instead of only "what is it?".
-/// Computed in `run.rs` from the run's own arguments — the dashboard only
-/// draws them and never measures anything itself.
+/// What the run's arguments and its drive say about how to draw it: the
+/// camera picture's size, the sensor period the pairing plot is scaled by,
+/// which camera queue feeds the answer and what slows it, and which lanes
+/// and pictures the run can mark. Computed in `run.rs` from the run's own
+/// arguments — the dashboard only draws from them and never measures
+/// anything itself.
 #[derive(Clone, Debug, Default)]
 pub struct Bounds {
-    /// The *queueing* half of the measurement-age bound per bounded edge
-    /// (`cam0->proc`, `cam0->rerun`, `cam0->camdet`), in ms: `cap × frame
-    /// period`. The
-    /// frame's own service time is added when the line is drawn, from
-    /// `proc_end - proc_start` on that row.
-    ///
-    /// The pre-registered statement bounds age by `cap × period + service`, and
-    /// service is measured rather than configured. An earlier version used
-    /// `--consumer-delay-ms` in place of it, which was indistinguishable while
-    /// `proc` was a ~0.5 ms grayscale pass. With a heavier ~25 ms workload it
-    /// drew a target that a *healthy* run crossed on roughly a quarter of its
-    /// frames -- the line said the pipeline was late when nothing had been
-    /// missed. The artificial `--consumer-delay-ms` sleep happens between
-    /// `proc_start` and `proc_end` of the stage it slows (`camdet` with the
-    /// detector, `proc` without), so it is already inside the measured
-    /// service and must not be added twice.
-    ///
-    /// Empty for an unpaced run (`--rate inf`), which has no deadlines.
-    pub age_queue_ms: BTreeMap<&'static str, f64>,
-    /// Each real queue's CAPACITY, in items, keyed by edge name.
-    ///
-    /// Drawn as a flat reference line under the same entity as that edge's two
-    /// depth series, because a depth on its own does not answer the question
-    /// anyone actually has. Depth 2 is idle on a 16-deep queue and saturated on
-    /// a 2-deep one, and this pipeline runs both at once: `--cap` sets the
-    /// camera queue that feeds the answer (`cam0->camdet` with the detector,
-    /// `cam0->proc` without), while the lidar edges are fixed at [`crate::run::VELO_CAP`]
-    /// and [`crate::run::DET_CAP`] precisely so the camera experiment's
-    /// independent variable cannot reach them.
-    ///
-    /// An edge with no rows draws no line, so an entry here for a queue this
-    /// run never opened (`cam0->rerun` under `--rerun off`) costs nothing and
-    /// claims nothing.
-    pub queue_cap: BTreeMap<&'static str, f64>,
     /// The camera frame's width and height in pixels, from frame 0's PNG
     /// header: the camera view's bounds, so the picture fills its view edge
     /// to edge from the first frame instead of fitting whatever was drawn
@@ -995,15 +1011,18 @@ pub struct Bounds {
     pub period_ms: Option<f64>,
     /// The camera queue whose output reaches the answer, where the camera
     /// knobs act (`run::camera_queues`): `cam0->camdet` with the detector,
-    /// `cam0->proc` without. The one queue drawn in items, and the one the
-    /// `camera_queue` lane watches.
+    /// `cam0->proc` without. The one the `camera_queue` lane watches, and
+    /// the camera stage the pairing plot's camera dot and the stage table's
+    /// camera row read.
     pub camera_edge: Option<&'static str>,
-    /// Frames the camera driver will replay: the most any queue can drop,
-    /// and so the top of the cumulative-drops plot.
-    pub n_frames: Option<f64>,
-    /// `--rate`, when it is finite: a sensor period divided by it is the
-    /// host period the latencies are read against. `None` on an unpaced
-    /// run, which has no deadlines.
+    /// `--consumer-delay-ms`: the sleep inside that camera stage's measured
+    /// window. The stage table says so beside the stage's time, which it is
+    /// part of.
+    pub camera_delay_ms: u64,
+    /// `--rate`, when it is finite: how many sensor milliseconds one host
+    /// millisecond is, for the ready dots, which are timed on the host clock
+    /// and drawn on the sensor's. `None` on an unpaced run, which has no
+    /// deadlines to time them from.
     pub rate: Option<f64>,
     /// Whether the run has `velo->reduce`, the edge the lidar lane watches.
     /// Only then does a frame absent in the source mark that lane: on a run
@@ -1018,48 +1037,45 @@ pub struct Bounds {
 }
 
 /// The live dashboard (M8): mirrors evidence rows onto the run's Rerun
-/// recording as scalars on the same three timelines the image uses, so a frame
-/// and its timing scrub together. Constructed only with `--dashboard`.
+/// recording on the same three timelines the image uses, so a frame and its
+/// timing scrub together -- the health lanes, the pairing's ready dots, the
+/// pipeline graph and the two tables. Constructed only with `--dashboard`.
 ///
 /// No legend document travels with the recording: the entity names and the
-/// series names have to carry their own meaning, and a reader who needs more
+/// view titles have to carry their own meaning, and a reader who needs more
 /// has the README ("The dashboard") rather than a panel in the viewer.
 pub struct Dashboard {
     rec: Canvas,
     /// The sample of the last row drawn. An event is drawn at that row's
-    /// timelines but `host` ([`Dashboard::log_event`]), and so is the byte
-    /// table at the end, so their drawings are filed under it.
+    /// timelines but `host` ([`Dashboard::log_event`]), and so are the tables
+    /// at the end, so their drawings are filed under it.
     last: Subject,
     /// Whether [`Dashboard::finish`] has run.
     finished: bool,
-    drops: DropCounter,
     gaps: SeqGap,
     bounds: Bounds,
-    /// Entity paths that already carry their static `SeriesLines` styling.
-    /// The set of edges and stages is not known until rows arrive, so styling
-    /// is registered on each path's first scalar rather than up front.
+    /// Entity paths that already carry their static `SeriesPoints` styling,
+    /// registered on each path's first scalar.
     styled: BTreeSet<String>,
     /// Lane entities that already carry their static `StateConfiguration`.
     lanes: BTreeSet<String>,
     /// Each sticky lane's state, by lane name ([`crate::dashboard::LANE_NAMES`]).
     sticky: BTreeMap<&'static str, Sticky>,
-    /// The admission's current run of same-stream driver admissions.
-    run: AdmissionRun,
-    /// The latest delivered `(payload_bytes, bytes_alloc)` per edge and per
-    /// producer, for the byte chain and the graph. A bar chart is one
-    /// picture per sweep, and the rows that feed it arrive one edge at a
-    /// time, so each is redrawn from the latest value on every edge.
-    bytes: BTreeMap<&'static str, (u64, u64)>,
-    /// The latest `proc_end - due` per edge, in ms, for the stage bars.
-    after_due_ms: BTreeMap<&'static str, f64>,
-    /// Every delivered `(payload_bytes, bytes_alloc)` on the byte table's
-    /// edges, for its medians: a few hundred pairs a run.
-    medians: BTreeMap<&'static str, Vec<(u64, u64)>>,
-    /// Answers seen, so the byte table is first written after
+    /// The latest delivered `payload_bytes` per edge and per producer, for
+    /// the graph's labels: the graph is one picture per answer, and the rows
+    /// that feed it arrive one edge at a time.
+    bytes: BTreeMap<&'static str, u64>,
+    /// Every delivered row on the tables' edges ([`TABLE_EDGES`]), for their
+    /// medians.
+    table: BTreeMap<&'static str, EdgeRows>,
+    /// Each sweep's two halves until both are in, by frame number.
+    halves: BTreeMap<u64, Halves>,
+    /// Sweeps whose camera and lidar finishes were both seen, and of them
+    /// those whose camera finished after the lidar's.
+    camera_later: (u64, u64),
+    /// Answers seen, so the tables are first written after
     /// [`TABLE_AFTER_ANSWERS`].
     answers: u64,
-    /// The storage lane's last word, so it is logged only when it changes.
-    shared: Option<&'static str>,
     /// Whether the pipeline graph's edges are logged yet.
     graphed: bool,
     /// Each producer row's `storage_id`, by `(stream, seq)`, so a consumer's
@@ -1090,18 +1106,16 @@ impl Dashboard {
             rec: canvas,
             last: Subject::default(),
             finished: false,
-            drops: DropCounter::default(),
             gaps: SeqGap::default(),
             bounds,
             styled: BTreeSet::new(),
             lanes: BTreeSet::new(),
             sticky: BTreeMap::new(),
-            run: AdmissionRun::default(),
             bytes: BTreeMap::new(),
-            after_due_ms: BTreeMap::new(),
-            medians: BTreeMap::new(),
+            table: BTreeMap::new(),
+            halves: BTreeMap::new(),
+            camera_later: (0, 0),
             answers: 0,
-            shared: None,
             graphed: false,
             produced: BTreeMap::new(),
             absent: BTreeSet::new(),
@@ -1174,24 +1188,6 @@ impl Dashboard {
         frames.len() as f64
     }
 
-    /// Logs one scalar at `<root>/<leaf>`, naming and colouring that entity
-    /// the first time it is seen.
-    fn scalar(&mut self, root: &str, leaf: &str, v: f64) -> Result<(), RecError> {
-        let path = format!("{root}/{leaf}");
-        if !self.styled.contains(&path) {
-            if let Some(mut style) = series_style(leaf) {
-                if leaf == "fill" {
-                    style.rgb = fill_rgb(root, self.bounds.camera_edge);
-                }
-                self.rec
-                    .log_static(path.clone(), style.archetype().as_ref())?;
-            }
-            self.styled.insert(path.clone());
-        }
-        self.rec.log(path, &Scalars::single(v))?;
-        Ok(())
-    }
-
     /// Logs one state onto a lane, configuring the lane's states and colours
     /// the first time it is seen.
     fn lane(&mut self, path: &str, state: &str) -> Result<(), RecError> {
@@ -1203,81 +1199,6 @@ impl Dashboard {
         }
         self.rec
             .log(path.to_string(), &StateChange::single(state))?;
-        Ok(())
-    }
-
-    /// Logs one grey band at `path` spanning 0 to `full`: a `Measurements`
-    /// of half of it whose standard deviation is that half. Styled on first
-    /// sight like every series.
-    fn band(&mut self, path: &str, name: &str, full: f64) -> Result<(), RecError> {
-        if !self.styled.contains(path) {
-            self.rec
-                .log_static(path.to_string(), &band_archetype(name))?;
-            self.styled.insert(path.to_string());
-        }
-        let half = 0.5 * full;
-        self.rec.log(
-            path.to_string(),
-            &Measurements::new([half]).with_variances([half * half]),
-        )?;
-        Ok(())
-    }
-
-    /// The Latency page's ratios for one delivered queue row, each a
-    /// measured time over the bound it is read against, so 1 is AT the
-    /// bound on every line and they share one axis. Drawn at
-    /// [`HEADROOM_TOP`] when they are that or more, so an overloaded run
-    /// pins the top edge instead of leaving the plot.
-    ///
-    /// - the camera queue that feeds the answer: its frame's age over the
-    ///   pre-registered bound, `cap x period + service`, the service being
-    ///   this frame's own `proc_end - proc_start`, so a stage that does real
-    ///   work is bounded by what it actually cost (and the bound is not
-    ///   drawn without both timestamps -- a wrong line is worse than none);
-    ///   and the service alone over one period, the detector's leading
-    ///   indicator: past 1 it cannot keep up with the camera;
-    /// - the lidar's queue into `reduce`: age over one period;
-    /// - the fusion's camera input, `cam_det->track`: how long the camera's
-    ///   half waited in its queue for the fusion, over one period.
-    fn log_headroom(&mut self, e: &Evidence) -> Result<(), RecError> {
-        let Some(p) = host_period_ms(&self.bounds, e) else {
-            return Ok(());
-        };
-        let ratio = |v: f64, bound: f64| (v / bound).min(HEADROOM_TOP);
-        let age_ms = e.measurement_age_ns.map(|a| a as f64 * 1e-6);
-        let service_ms = e
-            .proc_start_ns
-            .zip(e.proc_end_ns)
-            .map(|(ps, pe)| (pe - ps) as f64 * 1e-6);
-        if self.bounds.camera_edge == Some(e.edge) {
-            if let (Some(age), Some(svc), Some(queue_ms)) = (
-                age_ms,
-                service_ms,
-                self.bounds.age_queue_ms.get(e.edge).copied(),
-            ) {
-                self.scalar(entity::HEADROOM, "camera_queue", ratio(age, queue_ms + svc))?;
-            }
-            if let Some(svc) = service_ms {
-                self.scalar(entity::LATENCY, "cam_service", ratio(svc, p))?;
-            }
-        }
-        match (e.edge, age_ms, e.queue_wait_ns) {
-            ("velo->reduce", Some(age), _) => {
-                self.scalar(entity::HEADROOM, "velo_to_reduce", ratio(age, p))?;
-            }
-            ("cam_det->track", _, Some(wait)) => {
-                self.scalar(
-                    entity::HEADROOM,
-                    "camera_wait",
-                    ratio(wait as f64 * 1e-6, p),
-                )?;
-            }
-            ("state->sink", Some(age), _) => {
-                self.scalar(entity::HEADROOM, "answer", ratio(age, p))?;
-                self.scalar(entity::HEADROOM, "at_bound", 1.0)?;
-            }
-            _ => {}
-        }
         Ok(())
     }
 
@@ -1296,49 +1217,143 @@ impl Dashboard {
         Ok(())
     }
 
-    /// Logs one entity of a bar chart: `values` at `abscissa`, in one colour.
-    ///
-    /// A chart is several such entities under one root, one per bar,
-    /// because a bar carries no label of its own and an entity has one
-    /// colour. The viewer names a hovered bar by its entity path, and two
-    /// series in one chart can alternate.
-    fn bars(
-        &self,
-        path: String,
-        abscissa: Vec<f64>,
-        values: Vec<f64>,
-        rgb: [u8; 3],
-    ) -> Result<(), RecError> {
-        self.rec.log(
-            path,
-            &BarChart::new(values)
-                .with_abscissa(abscissa)
-                .with_color(Color::from_rgb(rgb[0], rgb[1], rgb[2])),
-        )?;
+    /// Logs one scalar at `<root>/<leaf>`, naming, colouring and marking that
+    /// entity the first time it is seen.
+    fn scalar(&mut self, root: &str, leaf: &str, v: f64) -> Result<(), RecError> {
+        let path = format!("{root}/{leaf}");
+        if !self.styled.contains(&path) {
+            if let Some(style) = series_style(leaf) {
+                self.rec
+                    .log_static(path.clone(), style.archetype().as_ref())?;
+            }
+            self.styled.insert(path.clone());
+        }
+        self.rec.log(path, &Scalars::single(v))?;
         Ok(())
     }
 
-    /// The allocation chart's bar for one edge, from the delivered row that
-    /// just arrived: what the edge's consumer allocated over what the edge
-    /// carried. Each bar is its own entity at its own place, so only the bar
-    /// whose row arrived is logged; the others keep their latest.
-    fn log_alloc_ratio(&self, e: &Evidence) -> Result<(), RecError> {
-        if let Some(i) = ALLOC_RATIO.iter().position(|(_, edge)| *edge == e.edge) {
-            let (name, edge) = ALLOC_RATIO[i];
-            self.bars(
-                format!("{}/{name}", entity::BYTES_ALLOC_RATIO),
-                vec![i as f64],
-                vec![alloc_ratio(e.bytes_alloc, e.payload_bytes)],
-                producer_rgb(edge, self.bounds.camera_edge),
+    /// One ready dot: on the zoom onto the sweep's end ([`zoom_ms`]), and,
+    /// unless it is the zoom's alone, on the pairing plot ([`done_ms`]).
+    /// None on an unpaced run, which has no deadline to time it from.
+    fn done_dot(
+        &mut self,
+        dot: &ReadyDot,
+        span_ns: i64,
+        after_due_ns: i64,
+    ) -> Result<(), RecError> {
+        let (Some(rate), Some(period)) = (self.bounds.rate, self.bounds.period_ms) else {
+            return Ok(());
+        };
+        if dot.overview {
+            self.scalar(
+                entity::PAIRING,
+                dot.leaf,
+                done_ms(span_ns, after_due_ns, rate, period),
             )?;
         }
+        self.scalar(
+            entity::AFTER_SWEEP,
+            dot.leaf,
+            zoom_ms(after_due_ns, rate, period),
+        )
+    }
+
+    /// A delivered row's ready dot ([`READY_DOTS`]): a lidar stage's and the
+    /// answer's from their own rows, which carry their sweep's due and range,
+    /// the moment the row arrives; the camera stage's once its sweep's due
+    /// is in ([`Halves`]) -- which also counts, once `detect`'s finish is in
+    /// too, whether the camera finished after the lidar. The sweep's own row
+    /// draws the zoom's line at the sweep's end.
+    fn log_done(&mut self, e: &Evidence) -> Result<(), RecError> {
+        let span = e.tov_end_ns - e.tov_start_ns;
+        if let (Some(due), Some(end)) = (e.due_ns, e.proc_end_ns) {
+            if let Some(dot) = READY_DOTS
+                .iter()
+                .find(|d| d.clock == StageClock::Edge(e.edge))
+            {
+                self.done_dot(dot, span, end - due)?;
+            }
+        }
+        if e.edge == "velo" && e.due_ns.is_some() && self.bounds.rate.is_some() {
+            self.scalar(entity::AFTER_SWEEP, SWEEP_END_LEAF, 0.0)?;
+        }
+        let (sweep, lidar, camera) = match e.edge {
+            "velo" => (e.due_ns.map(|d| (d, span)), None, None),
+            "det->detect" => (None, e.proc_end_ns, None),
+            edge if self.bounds.camera_edge == Some(edge) => (None, None, e.proc_end_ns),
+            _ => return Ok(()),
+        };
+        let h = self.halves.entry(e.seq).or_default();
+        h.sweep = h.sweep.or(sweep);
+        h.lidar = h.lidar.or(lidar);
+        h.camera = h.camera.or(camera);
+        let dot = match (h.sweep, h.camera) {
+            (Some((due, span)), Some(c)) if !h.drawn => {
+                h.drawn = true;
+                Some((span, c - due))
+            }
+            _ => None,
+        };
+        let later = match (h.camera, h.lidar) {
+            (Some(c), Some(l)) if !h.compared => {
+                h.compared = true;
+                Some(c > l)
+            }
+            _ => None,
+        };
+        if h.drawn && h.compared {
+            self.halves.remove(&e.seq);
+        }
+        let newest = e.seq;
+        self.halves.retain(|&seq, _| seq + HALVES_KEPT >= newest);
+        if let Some(later) = later {
+            self.camera_later.0 += 1;
+            self.camera_later.1 += u64::from(later);
+        }
+        if let (Some((span, after_due)), Some(camera_dot)) = (
+            dot,
+            READY_DOTS.iter().find(|d| d.clock == StageClock::Camera),
+        ) {
+            self.done_dot(camera_dot, span, after_due)?;
+        }
         Ok(())
+    }
+
+    /// Files a delivered row on one of the tables' edges into their
+    /// medians, and, on a queue's row, whether its consumer read the buffer
+    /// its producer handed on. The producer's row precedes the consumer's on
+    /// the evidence channel in practice (it is sent at admission, the
+    /// consumer's after `proc_end`); when it does not, that row is counted
+    /// neither way.
+    fn observe_tables(&mut self, e: &Evidence) {
+        if !TABLE_EDGES.contains(&e.edge) {
+            return;
+        }
+        let rows = self.table.entry(e.edge).or_default();
+        rows.carried.push(e.payload_bytes);
+        rows.alloc.push(e.bytes_alloc);
+        if e.edge.contains("->") {
+            if let Some(t) = e.proc_start_ns.zip(e.proc_end_ns).map(|(s, t)| t - s) {
+                rows.time_ns.push(t);
+            }
+            if self
+                .produced
+                .get(&(e.stream, e.seq))
+                .is_some_and(|&p| p != e.storage_id)
+            {
+                rows.copied += 1;
+            }
+        } else if ADMISSION_EDGES.contains(&e.edge) {
+            rows.time_ns.push(e.decode_ns);
+        }
     }
 
     /// The pipeline graph for the answer that just arrived: its edges once,
     /// statically, then its nodes at this answer's timelines, each labelled
     /// with what its stage handed on for the latest sweep and coloured by
-    /// the sensor or family it belongs to.
+    /// the sensor or family it belongs to. The three nodes the byte chain
+    /// does not describe -- the camera, the admission and the camera stage --
+    /// carry a second line saying what they do.
     fn log_graph(&mut self, e: &Evidence) -> Result<(), RecError> {
         if !self.graphed {
             self.rec.log_static(
@@ -1347,7 +1362,7 @@ impl Dashboard {
             )?;
             self.graphed = true;
         }
-        let carried = |edge: &str| self.bytes.get(edge).map(|b| human_bytes(b.0));
+        let carried = |edge: &str| self.bytes.get(edge).map(|b| human_bytes(*b));
         let camera_stage = self
             .bounds
             .camera_edge
@@ -1359,10 +1374,14 @@ impl Dashboard {
                 None => what.to_string(),
             };
             match id {
-                "cam0" => with("camera", "cam0"),
+                "cam0" => format!("{}\ndecoded from PNG", with("camera", "cam0")),
                 "velo" => with("lidar", "velo"),
-                "admit" => "admission".to_string(),
-                "camera" => with(camera_stage, "cam_det"),
+                "admit" => "admission\none arrival order".to_string(),
+                "camera" => format!(
+                    "{}\n{}",
+                    with(camera_stage, "cam_det"),
+                    camera_words(camera_stage)
+                ),
                 "reduce" => with("voxels", "det"),
                 "detect" => with("dets", "obj"),
                 "track" => with("tracks", "track"),
@@ -1393,49 +1412,131 @@ impl Dashboard {
         Ok(())
     }
 
-    /// The byte table, from the medians of every delivered row so far,
-    /// logged statically so the last write is the one a reader sees.
+    /// The two tables, from the medians of every delivered row so far,
+    /// logged statically so the last write is the one a reader sees: the
+    /// byte chain once the run has answered, since it ends at the answer,
+    /// and the stages whenever a stage has run.
+    fn log_tables(&self) -> Result<(), RecError> {
+        if self.answers > 0 {
+            self.log_byte_table()?;
+        }
+        self.log_stage_table()
+    }
+
+    /// The byte table ([`byte_table`]), a line per link of [`CHAIN_BYTES`].
     fn log_byte_table(&self) -> Result<(), RecError> {
-        let median = |edge: &str, pick: fn(&(u64, u64)) -> u64| {
-            self.medians.get(edge).and_then(|rows| {
-                let mut v: Vec<u64> = rows.iter().map(pick).collect();
-                v.sort_unstable();
-                v.get(v.len() / 2).copied()
-            })
-        };
+        let rows = |edge: &str| self.table.get(edge);
         let links: Vec<ByteLink> = CHAIN_BYTES
             .iter()
-            .map(|(name, edge)| ByteLink {
-                name: &name[2..],
-                carried: median(edge, |r| r.0),
-                allocated: median(edge, |r| r.1),
-                rows: self.medians.get(edge).map_or(0, Vec::len),
+            .map(|l| ByteLink {
+                name: l.name,
+                step: l.step,
+                carried: rows(l.edge).and_then(|r| median(&r.carried)),
+                built: rows(l.built_by).and_then(|r| median(&r.alloc)),
+                read: rows(l.edge).and_then(|r| median(&r.alloc)),
+                rows: rows(l.edge).map_or(0, |r| r.carried.len()),
+                copied: rows(l.edge).map_or(0, |r| r.copied),
             })
             .collect();
-        let driver = (median("velo", |r| r.1), median("velo", |r| r.0));
-        let driver_rows = self.medians.get("velo").map_or(0, Vec::len);
+        let sweeps = rows("velo").map_or(0, |r| r.carried.len());
         self.rec.log_static(
             entity::BYTES_TABLE,
-            &TextDocument::new(byte_table(&links, driver, driver_rows))
-                .with_media_type(MediaType::markdown()),
+            &TextDocument::new(byte_table(&links, sweeps)).with_media_type(MediaType::markdown()),
         )?;
         Ok(())
     }
 
-    /// At the end of the run, once every stage has stopped: the byte table
-    /// from the whole run's medians. The dashboard draws last, so it then
-    /// closes the viewer's queue, and the viewer thread drains it and stops.
-    /// Runs once.
+    /// The stage table ([`stage_table`]): every stage the run has rows for,
+    /// and what their times are and are not.
+    fn log_stage_table(&self) -> Result<(), RecError> {
+        let rows = |edge: &str| self.table.get(edge);
+        let stages = stage_rows(self.bounds.camera_edge);
+        let lines: Vec<StageLine> = stages
+            .iter()
+            .filter(|s| rows(s.timed_on).is_some() || rows(s.hands_on).is_some())
+            .map(|s| StageLine {
+                row: s,
+                time_ns: rows(s.timed_on).and_then(|r| median(&r.time_ns)),
+                carried: rows(s.hands_on).and_then(|r| median(&r.carried)),
+            })
+            .collect();
+        if lines.is_empty() {
+            return Ok(());
+        }
+        // The camera stage is the second row, whichever it is.
+        let notes = self.stage_notes(&stages[1]);
+        self.rec.log_static(
+            entity::STAGE_TABLE,
+            &TextDocument::new(stage_table(&lines, &notes)).with_media_type(MediaType::markdown()),
+        )?;
+        Ok(())
+    }
+
+    /// What the stage table's times are, and what they are not: the times
+    /// themselves; the camera stage's sleep, its working memory and the
+    /// frames it did not run on; and how often its result came after the
+    /// lidar's.
+    fn stage_notes(&self, camera: &StageRow) -> Vec<String> {
+        let rows = |edge: &str| self.table.get(edge);
+        let stage = camera.stage;
+        let mut notes = vec![
+            "A time is the stage's median per sample: its own work, from `proc_start` to \
+             `proc_end`, or a sensor driver's decode. track's includes any wait for the camera."
+                .to_string(),
+        ];
+        if self.bounds.camera_delay_ms > 0 {
+            notes.push(format!(
+                "{stage}'s includes the {} ms sleep of `--consumer-delay-ms`.",
+                self.bounds.camera_delay_ms
+            ));
+        }
+        if let Some(r) = rows(camera.timed_on) {
+            let out = rows(camera.hands_on).and_then(|h| median(&h.carried));
+            if let (Some(alloc), Some(out)) = (median(&r.alloc), out) {
+                if alloc > 0 {
+                    let why = if stage == "camdet" {
+                        ", the network's working memory"
+                    } else {
+                        ""
+                    };
+                    notes.push(format!(
+                        "{stage} allocates {} while it works on each frame{why}, and hands on {}.",
+                        human_bytes(alloc),
+                        human_bytes(out)
+                    ));
+                }
+            }
+            let frames = rows("cam0").map_or(0, |c| c.carried.len());
+            if r.carried.len() < frames {
+                notes.push(format!(
+                    "{stage} ran on {} of the {frames} frames the camera delivered.",
+                    r.carried.len()
+                ));
+            }
+        }
+        match self.camera_later {
+            (0, _) => {}
+            (n, 0) => notes.push(format!(
+                "The camera's result was ready before the lidar's boxes on all {n} sweeps."
+            )),
+            (n, later) => notes.push(format!(
+                "The camera's result was ready after the lidar's boxes on {later} of {n} sweeps: \
+                 on the Demo page, the blue diamond above `detect`'s teal one."
+            )),
+        }
+        notes
+    }
+
+    /// At the end of the run, once every stage has stopped: the tables from
+    /// the whole run's medians. The dashboard draws last, so it then closes
+    /// the viewer's queue, and the viewer thread drains it and stops. Runs
+    /// once.
     fn finish(&mut self) -> Result<(), RecError> {
         if self.finished {
             return Ok(());
         }
         self.finished = true;
-        let drawn = if self.answers > 0 {
-            self.log_byte_table()
-        } else {
-            Ok(())
-        };
+        let drawn = self.log_tables();
         self.rec.send(self.last.clone());
         self.rec.close();
         drawn
@@ -1455,10 +1556,12 @@ impl Dashboard {
         drawn
     }
 
-    /// Stamps the three timelines from the row itself, then logs whichever
-    /// series that row carries. Everything a queue did is keyed by EDGE
-    /// (`queues/<edge>/`); the lanes, the ratios and the bars each read the
-    /// edges they are about.
+    /// Stamps the three timelines from the row itself, then draws what the
+    /// row says: a queue's row on its lane and the fusion's on the pairing
+    /// lane, a frame the source never had on its sensor's lane, a half's or
+    /// the answer's finish as a ready dot on the pairing plot, every row on
+    /// the tables' edges into their medians, the answer on the graph, and
+    /// every loss as a WARN row.
     fn draw_row(&mut self, e: &Evidence) -> Result<(), RecError> {
         // A row with no time of validity -- a frame absent in the source,
         // whose `tov_*_ns` are 0 because the source measured nothing -- has
@@ -1477,53 +1580,8 @@ impl Dashboard {
 
         let real_queue = e.edge.contains("->");
         let delivered = e.outcome == Outcome::Delivered;
-        let queues = queue_root(e.edge);
-
-        // Logged on every row so the series is a step function, not a scatter.
-        // Only for the edges that can actually drop something: the real
-        // queues, and the two sensor drivers' pseudo-edges, whose `Missing`
-        // rows are frames the driver never produced. A derived stream's
-        // producer row (`det`, `obj`, `track`, `state`, `cam_det`) is
-        // structurally always Delivered, and drawing a flat zero for each of
-        // them said nothing. A frame the source never had is not a drop: it
-        // is counted apart, in the grey of a source gap, on its driver's edge
-        // and only from the first one, so a drive with none draws nothing.
-        let (drops, absent) = self.drops.observe(e.edge, e.outcome, e.reason);
-        if real_queue || ADMISSION_EDGES.contains(&e.edge) {
-            self.scalar(&queues, "drops", drops as f64)?;
-            if absent > 0 {
-                self.scalar(&queues, ABSENT_LEAF, absent as f64)?;
-            }
-        }
 
         if real_queue {
-            let cap = self.bounds.queue_cap.get(e.edge).copied();
-            // How full each push found the queue, as a share of its
-            // capacity, on every queue: 1 is a push that met a full queue.
-            if let (Some(depth), Some(cap)) = (e.depth_at_push, cap) {
-                if cap > 0.0 {
-                    self.scalar(&queues, "fill", f64::from(depth) / cap)?;
-                }
-            }
-            // The camera queue that feeds the answer, in items: the depth
-            // each push met, the backlog each pop LEFT BEHIND (`Some(0)` is
-            // a pop that emptied it), the capacity line, on every row of the
-            // edge so it spans exactly as long as the edge was alive, and a
-            // cross at the capacity for every frame it did not deliver.
-            if self.bounds.camera_edge == Some(e.edge) {
-                if let Some(depth) = e.depth_at_push {
-                    self.scalar(&queues, "depth_at_push", f64::from(depth))?;
-                }
-                if let Some(depth) = e.depth_after_pop {
-                    self.scalar(&queues, "depth", f64::from(depth))?;
-                }
-                if let Some(cap) = cap {
-                    self.scalar(&queues, "cap", cap)?;
-                    if !delivered {
-                        self.scalar(&queues, "drop_events", cap)?;
-                    }
-                }
-            }
             // What the queue did with this sample, on its sticky lane: the
             // gap is measured only between deliveries on a real queue -- the
             // driver's `cam0` pseudo-edge has no consumer behind it to fall
@@ -1538,19 +1596,8 @@ impl Dashboard {
             }
         } else if delivered {
             // A producer's row: remember which buffer it handed on, so each
-            // consumer's row below can say whether it read that one.
+            // consumer's row can say whether it read that one.
             self.produced.insert((e.stream, e.seq), e.storage_id);
-            // A sensor driver's admission: how many in a row came from the
-            // same driver. A flat 1 is strict alternation, the proof that
-            // two producers contend for one admission. The two drivers admit
-            // tens of milliseconds apart, so the rows reach this thread in
-            // admission order.
-            if ADMISSION_EDGES.contains(&e.edge) && e.arrival_seq.is_some() {
-                let run = self.run.observe(e.edge);
-                let root = admission_root();
-                self.scalar(&root, "run_length", f64::from(run))?;
-                self.scalar(&root, "alternating", 1.0)?;
-            }
         }
         // The fusion's own row (`track`, the produced or the missing one),
         // on the pairing lane: `reason` is blank on a clean pair and names
@@ -1564,89 +1611,25 @@ impl Dashboard {
             self.log_absent(e)?;
         }
 
-        if delivered && real_queue {
-            self.log_headroom(e)?;
-            if let (Some(due), Some(pe)) = (e.due_ns, e.proc_end_ns) {
-                self.after_due_ms.insert(e.edge, (pe - due) as f64 * 1e-6);
-            }
-            // Did this consumer read the buffer its producer handed on? The
-            // producer's row precedes this one on the evidence channel in
-            // practice (it is sent at admission, this one after `proc_end`);
-            // when it does not, the lane has a gap rather than a guess.
-            // Logged only when it changes, like the health lanes: a lane of
-            // one word repeated per sample said nothing more.
-            if let Some(&producer) = self.produced.get(&(e.stream, e.seq)) {
-                let shared = if producer == e.storage_id {
-                    "same"
-                } else {
-                    "copied"
-                };
-                if self.shared != Some(shared) {
-                    self.shared = Some(shared);
-                    self.lane(entity::STORAGE_SHARED, shared)?;
-                }
-            }
-        }
-
-        // Bytes are not time series -- a value that is the same on every
-        // sample is a line with no information on the time axis -- so they
-        // are bar charts, a table and a graph, redrawn from the latest row on
-        // each of their edges.
         if delivered {
-            self.bytes.insert(e.edge, (e.payload_bytes, e.bytes_alloc));
-            self.log_alloc_ratio(e)?;
-            if TABLE_EDGES.contains(&e.edge) {
-                self.medians
-                    .entry(e.edge)
-                    .or_default()
-                    .push((e.payload_bytes, e.bytes_alloc));
-            }
+            self.log_done(e)?;
+            self.observe_tables(e);
+            self.bytes.insert(e.edge, e.payload_bytes);
         }
         if delivered && e.edge == "state->sink" {
-            // The answer arrived: the chain's end, drawn four ways. The
-            // byte chain and the stages, one bar per link or stage, each
-            // bar its own entity at its position in the chain; the pipeline
-            // graph, labelled with this sweep's bytes; and the answer's age
-            // against one period.
-            for (i, (name, edge)) in CHAIN_BYTES.iter().enumerate() {
-                let bytes = self.bytes.get(edge).map_or(0, |b| b.0);
-                self.bars(
-                    format!("{}/{name}", entity::BYTES_CHAIN),
-                    vec![i as f64],
-                    vec![log10_bytes(bytes)],
-                    stage_rgb(i),
-                )?;
-            }
+            // The answer arrived: the pipeline graph, labelled with this
+            // sweep's bytes, and, after the first ten answers, the tables.
             self.log_graph(e)?;
             self.answers += 1;
             if self.answers == TABLE_AFTER_ANSWERS {
-                self.log_byte_table()?;
-            }
-            for (i, (stage, edge)) in STAGES.iter().enumerate() {
-                let ms = self.after_due_ms.get(edge).copied().unwrap_or(0.0);
-                self.bars(
-                    format!("{}/{stage}", entity::LATENCY_STAGES),
-                    vec![i as f64],
-                    vec![ms],
-                    stage_rgb(i),
-                )?;
-            }
-            // The chain's end in ms, against one period drawn as a band.
-            // The period is the sweep's own, on the host clock the answer's
-            // age is measured on (so halved at `--rate 2`).
-            if let (Some(age_ns), Some(p)) = (e.measurement_age_ns, host_period_ms(&self.bounds, e))
-            {
-                self.scalar(entity::CHAIN_END, "answer_age_ms", age_ns as f64 * 1e-6)?;
-                self.scalar(entity::CHAIN_END, "period_ms", p)?;
-                self.band(PERIOD_BAND, "one period", p)?;
+                self.log_tables()?;
             }
         }
 
         if !delivered {
             // One entity for every edge, and the only place a drop's REASON
-            // appears: the cumulative count is what you scan, this is what
-            // tells you why. The edge is in the text because the entity no
-            // longer says it.
+            // appears. The edge is in the text because the entity does not
+            // say it.
             self.rec.log(
                 entity::LOG_DROPS,
                 &TextLog::new(format!(
@@ -1875,81 +1858,19 @@ mod tests {
     #[test]
     fn name_fits_a_legend_and_carries_its_unit() {
         // A legend entry is read at a glance beside the plot, so it is short,
-        // and it says what the number IS, so a measurement ends in its unit
-        // in parentheses. The three queue counts are the exception: "depth
-        // at push", "depth after pop" and "capacity" are items, and the view
-        // title names the capacity they are read against.
+        // and it says what the number IS, so it ends in its unit in
+        // parentheses.
         for leaf in SERIES_LEAVES {
             let label = series_style(leaf).unwrap().label;
             assert!(
                 label.chars().count() <= LABEL_MAX,
                 "{leaf}: {label:?} is longer than {LABEL_MAX} characters"
             );
-            if !matches!(leaf, "depth_at_push" | "depth" | "cap") {
-                assert!(
-                    label.ends_with(')') && label.contains(" ("),
-                    "{leaf}: {label:?} does not end in a unit"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn the_queue_depth_is_read_against_a_capacity_line_behind_it() {
-        // Both edges of the camera queue's occupancy are drawn: the depth
-        // each push met (the one series that shows a queue running full) and
-        // the backlog each pop left (the one that shows it draining). Both
-        // are the green occupancy family, the push the louder voice.
-        let push = series_style("depth_at_push").unwrap();
-        let pop = series_style("depth").unwrap();
-        for d in [&push, &pop] {
             assert!(
-                d.rgb[1] > d.rgb[0] && d.rgb[1] > d.rgb[2],
-                "{:?} is not in the green occupancy family",
-                d.rgb
+                label.ends_with(')') && label.contains(" ("),
+                "{leaf}: {label:?} does not end in a unit"
             );
-            // A count holds its value until the next sample.
-            assert!(d.step());
         }
-        assert_ne!(push.rgb, pop.rgb);
-        assert!(push.width > pop.width);
-        // The line they are read against is a reference, not a third
-        // measurement: bright grey, and no heavier than the drain.
-        let cap = series_style("cap").unwrap();
-        assert_eq!(cap.rgb, C_REFERENCE);
-        assert!(cap.width <= pop.width && cap.step());
-        // A dropped frame is a red cross ON that line: points, not a line.
-        let dropped = series_style("drop_events").unwrap();
-        assert_eq!(dropped.rgb, C_FAIL);
-        assert_eq!(dropped.mark, Mark::Points(MarkerShape::Cross));
-        // And the cumulative drops are the failure colour, as a step.
-        let drops = series_style("drops").unwrap();
-        assert_eq!(drops.rgb, C_FAIL);
-        assert!(drops.step());
-    }
-
-    #[test]
-    fn the_fill_plot_picks_out_the_camera_and_the_lidar_queue() {
-        let cam = Some("cam0->camdet");
-        assert_eq!(fill_rgb(&queue_root("cam0->camdet"), cam), C_CAMERA_ONLY);
-        assert_eq!(fill_rgb(&queue_root("velo->reduce"), cam), C_LIDAR_ONLY);
-        // The same queue is slate when it is not the one feeding the answer.
-        assert_eq!(fill_rgb(&queue_root("cam0->proc"), cam), C_NEUTRAL);
-        assert_eq!(
-            fill_rgb(&queue_root("cam0->proc"), Some("cam0->proc")),
-            C_CAMERA_ONLY
-        );
-        assert_eq!(fill_rgb(&queue_root("obj->track"), cam), C_NEUTRAL);
-    }
-
-    #[test]
-    fn the_admission_run_is_one_while_the_drivers_alternate() {
-        let mut r = AdmissionRun::default();
-        let runs: Vec<u32> = ["cam0", "velo", "cam0", "velo", "velo", "velo", "cam0"]
-            .iter()
-            .map(|s| r.observe(s))
-            .collect();
-        assert_eq!(runs, [1, 1, 1, 1, 2, 3, 1]);
     }
 
     #[test]
@@ -1986,10 +1907,11 @@ mod tests {
 
     #[test]
     fn a_stage_that_logs_its_own_series_gets_the_same_styling_table() {
-        // `series_archetype` is the door `state-sink` comes through, because
-        // an evidence row carries how long a sample took and never what it
-        // SAID. It must answer for exactly the leaves `series_style` does, or
-        // the test above is checking a table nothing reads.
+        // `series_archetype` is the door every stage that logs a series comes
+        // through, because an evidence row carries how long a sample took and
+        // never what it SAID. It must answer for exactly the leaves
+        // `series_style` does, or the test above is checking a table nothing
+        // reads.
         for leaf in SERIES_LEAVES {
             assert!(
                 series_archetype(leaf).is_some(),
@@ -2004,16 +1926,10 @@ mod tests {
         // A reference line sits behind the measurement it bounds rather than
         // competing with it: the one bright grey, a step, and no heavier.
         for (reference, measured) in [
-            ("cap", "depth_at_push"),
-            ("at_bound", "answer"),
-            ("at_bound", "camera_queue"),
-            ("at_bound", "cam_service"),
-            ("alternating", "run_length"),
             ("ttc_warn", "ttc_s"),
             ("sweep_start", "camera"),
             ("sweep_end", "camera"),
             ("trigger", "camera"),
-            ("period_ms", "answer_age_ms"),
         ] {
             let r = series_style(reference).unwrap();
             let m = series_style(measured).unwrap();
@@ -2021,64 +1937,65 @@ mod tests {
             assert!(r.step(), "{reference} is not flat");
             assert!(r.width <= m.width, "{reference} is heavier than {measured}");
         }
-        // The answer's own ratio is the loudest line on its plot, and it and
-        // the answer's age in ms are the answer's gold, as its box is.
-        let answer = series_style("answer").unwrap();
-        assert_eq!(answer.rgb, C_ANSWER);
-        assert_eq!(series_style("answer_age_ms").unwrap().rgb, C_ANSWER);
-        for other in ["camera_queue", "camera_wait", "velo_to_reduce"] {
-            assert!(series_style(other).unwrap().width < answer.width);
-        }
     }
 
     #[test]
-    fn a_period_is_the_sweep_s_own_or_the_camera_s_on_the_host_clock() {
-        use pipes_core::clock::{SensorTime, Tov};
-        use pipes_core::sample::StreamId;
-        let ctx = RowCtx {
-            run_id: "t".to_string(),
-            t0_host: HostTime(0),
-            epoch: 0,
-        };
-        let mut b = Bounds {
-            period_ms: Some(103.6),
-            rate: Some(1.0),
-            ..Bounds::default()
-        };
-        let mut sweep = Evidence::driver_missing(
-            &ctx,
-            StreamId::LIDAR,
-            "velo",
-            "driver",
-            3,
-            Tov::Range {
-                start: SensorTime(1_000_000_000),
-                end: SensorTime(1_103_300_000),
-            },
-            Some(HostTime(0)),
-            HostTime(0),
-            "",
+    fn the_ready_dots_are_diamonds_in_the_colour_of_their_half() {
+        // A diamond is a stage finishing, beside the circle of the camera
+        // frame's instant, in the colour of what it is about.
+        let marks: Vec<(&str, [u8; 3], Mark)> = READY_DOTS
+            .iter()
+            .map(|d| {
+                let s = series_style(d.leaf).unwrap();
+                (d.leaf, s.rgb, s.mark)
+            })
+            .collect();
+        let diamond = Mark::Points(MarkerShape::Diamond);
+        assert_eq!(
+            marks,
+            [
+                ("1_camera_done", C_CAMERA_ONLY, diamond),
+                ("2_reduce_done", C_LIDAR_EARLY, diamond),
+                ("3_detect_done", C_LIDAR_ONLY, diamond),
+                ("4_answer_done", C_ANSWER, diamond),
+            ]
         );
-        let p = host_period_ms(&b, &sweep).unwrap();
-        assert!((p - 103.3).abs() < 1e-9, "{p}");
-        // A camera row is an instant: the camera's median period stands in.
-        sweep.tov_end_ns = sweep.tov_start_ns;
-        assert_eq!(host_period_ms(&b, &sweep), Some(103.6));
-        // Twice real time halves it; an unpaced run has none.
-        b.rate = Some(2.0);
-        assert_eq!(host_period_ms(&b, &sweep), Some(51.8));
-        b.rate = None;
-        assert_eq!(host_period_ms(&b, &sweep), None);
+        // `reduce`'s is the lidar's teal, lighter: brighter on every channel.
+        assert!(C_LIDAR_EARLY.iter().zip(C_LIDAR_ONLY).all(|(a, b)| *a > b));
+        assert_eq!(
+            series_style("camera").unwrap().mark,
+            Mark::Points(MarkerShape::Circle)
+        );
+        // The two shares are the colours of the sensors whose objects they
+        // are shares of.
+        assert_eq!(series_style("fused_fraction").unwrap().rgb, C_LIDAR_ONLY);
+        assert_eq!(
+            series_style("camera_fused_fraction").unwrap().rgb,
+            C_CAMERA_ONLY
+        );
     }
 
     #[test]
-    fn the_stage_bars_are_coloured_by_what_they_read() {
-        assert_eq!(STAGES.len(), 5);
-        assert_eq!(stage_rgb(0), C_LIDAR_ONLY);
-        assert_eq!(stage_rgb(1), C_LIDAR_ONLY);
-        assert_eq!(stage_rgb(2), C_DETECTION);
-        assert_eq!(stage_rgb(3), C_DETECTION);
-        assert_eq!(stage_rgb(4), C_ANSWER);
+    fn a_ready_dot_is_drawn_in_ms_from_its_sweep_s_start() {
+        const MS: i64 = 1_000_000;
+        let p = 103.3;
+        let sweep = 103_300_000;
+        // The lidar's boxes 9.1 ms after the sweep ended; the camera's
+        // result 4.6 ms before it.
+        assert!((done_ms(sweep, 9_100_000, 1.0, p) - 112.4).abs() < 1e-9);
+        assert!((done_ms(sweep, -4_600_000, 1.0, p) - 98.7).abs() < 1e-9);
+        // At twice real time a host millisecond is two of the sensor's.
+        assert!((done_ms(sweep, 10 * MS, 2.0, p) - 123.3).abs() < 1e-9);
+        // Later than 1.5 periods after the sweep ended is held at the top.
+        assert_eq!(done_ms(sweep, 300 * MS, 1.0, p), PAIRING_DONE_TOP * p);
+        // On the zoom the same finishes are ms after the sweep ended, held
+        // inside its window either side.
+        assert!((zoom_ms(9_100_000, 1.0, p) - 9.1).abs() < 1e-9);
+        assert!((zoom_ms(-4_600_000, 1.0, p) + 4.6).abs() < 1e-9);
+        assert!((zoom_ms(10 * MS, 2.0, p) - 20.0).abs() < 1e-9);
+        let (early, late) = SWEEP_END_ZOOM;
+        assert_eq!(zoom_ms(150 * MS, 1.0, p), late * p);
+        assert_eq!(zoom_ms(-40 * MS, 1.0, p), early * p);
     }
 
     #[test]
@@ -2099,17 +2016,12 @@ mod tests {
         for name in LANE_NAMES {
             assert!(LANE_PATHS.contains(&lane_path(name).as_str()), "{name}");
         }
-        assert!(lane_style("queues/cam0_to_proc/depth").is_none());
+        assert_eq!(LANE_PATHS.len(), LANE_NAMES.len());
+        assert!(lane_style("latency/stages/1_reduce").is_none());
         assert!(lane_style("answer/line").is_none());
         assert!(lane_style("lanes/not_a_lane").is_none());
         // Health is the dark green on every lane, and a loss is red.
-        for lane in [
-            &LANE_QUEUE,
-            &LANE_LIDAR,
-            &LANE_CAMERA,
-            &LANE_PAIRING,
-            &LANE_SHARED,
-        ] {
+        for lane in [&LANE_QUEUE, &LANE_LIDAR, &LANE_CAMERA, &LANE_PAIRING] {
             assert_eq!(lane.colors[0], C_LANE_OK);
             assert_eq!(lane.colors[lane.colors.len() - 1], C_FAIL);
         }
@@ -2272,53 +2184,84 @@ mod tests {
     }
 
     #[test]
-    fn the_byte_table_steps_down_the_chain_and_names_the_one_copy() {
-        let link = |name, carried, allocated| ByteLink {
-            name,
+    fn the_byte_table_says_what_each_step_does_and_where_its_result_lives() {
+        let link = |i: usize, carried, built| ByteLink {
+            name: CHAIN_BYTES[i].name,
+            step: CHAIN_BYTES[i].step,
             carried: Some(carried),
-            allocated: Some(allocated),
+            built: Some(built),
+            read: Some(0),
             rows: 154,
+            copied: 0,
         };
         let links = [
-            link("sweep", 1_958_000, 0),
-            link("voxels", 518_000, 0),
-            link("dets", 7_980, 0),
-            link("tracks", 19_522, 0),
-            link("answer", 12_916, 0),
+            link(0, 1_958_000, 1_964_652),
+            link(1, 518_000, 519_840),
+            link(2, 7_980, 11_334),
+            link(3, 19_522, 27_194),
+            link(4, 12_916, 16_602),
         ];
-        let t = byte_table(&links, (Some(1_974_352), Some(1_958_000)), 154);
+        let t = byte_table(&links, 154);
         let lines: Vec<&str> = t.lines().collect();
         assert_eq!(
             lines[0],
-            "| link | carried | step | allocated on the edge |"
+            "| link | what the step does | carried | change | built | read |"
         );
-        assert_eq!(lines[2], "| 1 sweep | **1.96 MB** |  | 0 B |");
-        assert_eq!(lines[3], "| 2 voxels | **518 kB** | ÷ 3.8 | 0 B |");
-        assert_eq!(lines[4], "| 3 dets | **8 kB** | ÷ 64.9 | 0 B |");
+        assert_eq!(
+            lines[2],
+            "| 1 sweep | lidar driver: file into Arrow, the one copy | **1.96 MB** |  | 1.96 MB | 0 B |"
+        );
+        assert_eq!(
+            lines[3],
+            "| 2 voxels | reduce: points into 20 cm cubes | **518 kB** | ÷ 3.8 | 520 kB | 0 B |"
+        );
+        assert_eq!(
+            lines[4],
+            "| 3 dets | detect: cubes into boxes, ground removed | **8 kB** | ÷ 64.9 | 11 kB | 0 B |"
+        );
         // A link that grows says so, as a product.
-        assert_eq!(lines[5], "| 4 tracks | **20 kB** | × 2.4 | 0 B |");
-        assert_eq!(lines[6], "| 5 answer | **13 kB** | ÷ 1.5 | 0 B |");
+        assert_eq!(
+            lines[5],
+            "| 4 tracks | track: boxes into tracks, camera fused | **20 kB** | × 2.4 | 27 kB | 0 B |"
+        );
+        assert_eq!(
+            lines[6],
+            "| 5 answer | state: one 68-byte record per track | **13 kB** | ÷ 1.5 | 17 kB | 0 B |"
+        );
+        // What built and read mean: where each result lives.
+        assert!(t.contains("**built** is what the step allocated"), "{t}");
         assert!(
-            t.ends_with("Every link reads its input in place: the lidar driver's 1.97 MB allocated for 1.96 MB carried is the chain's one copy. Medians of 154 sweeps."),
+            t.contains("**read** is what the next stage allocated"),
             "{t}"
         );
-        // A link that allocated is not called in place.
-        let mut copied = links;
-        copied[1].allocated = Some(518_000);
-        let t = byte_table(&copied, (Some(1_974_352), Some(1_958_000)), 154);
-        assert!(!t.contains("in place"), "{t}");
         assert!(
-            t.contains("| 2 voxels | **518 kB** | ÷ 3.8 | 518 kB |"),
+            t.ends_with(
+                "Every link was read in place, the same `storage_id` at both ends of every row: \
+                 the lidar driver's, from the file into Arrow, is the chain's one copy. \
+                 Medians of 154 sweeps."
+            ),
+            "{t}"
+        );
+        // A link that allocated to read, or read a copy, is not in place, and
+        // is named.
+        let mut copied = links;
+        copied[1].read = Some(518_000);
+        copied[3].copied = 2;
+        let t = byte_table(&copied, 154);
+        assert!(!t.contains("Every link was read in place"), "{t}");
+        assert!(t.contains("Not read in place: 2 voxels, 4 tracks."), "{t}");
+        assert!(
+            t.contains("| 2 voxels | reduce: points into 20 cm cubes | **518 kB** | ÷ 3.8 | 520 kB | 518 kB |"),
             "{t}"
         );
         // A run whose chain lost sweeps says what each median is over,
         // rather than calling them all medians of the driver's sweeps.
-        let mut evicted = copied;
+        let mut evicted = links;
         for l in &mut evicted[2..] {
             l.rows = 67;
         }
         evicted[4].rows = 63;
-        let t = byte_table(&evicted, (Some(1_974_352), Some(1_958_000)), 154);
+        let t = byte_table(&evicted, 154);
         assert!(
             t.ends_with(
                 "Medians of each link's own rows: 154, 154, 67, 67, 63 for links 1 to 5, of the driver's 154 sweeps."
@@ -2326,35 +2269,93 @@ mod tests {
             "{t}"
         );
         assert!(!t.contains("Medians of 154 sweeps"), "{t}");
-        // Every link of the chain is one the table has rows for.
-        for (_, edge) in CHAIN_BYTES {
-            assert!(TABLE_EDGES.contains(&edge), "{edge}");
+    }
+
+    #[test]
+    fn every_table_edge_is_one_the_tables_read() {
+        // The rows the recorder keeps are exactly the ones the two tables
+        // read: every link's edge and builder, and every stage's own row and
+        // what it hands on, for either camera stage -- and nothing else.
+        let mut read: Vec<&str> = CHAIN_BYTES
+            .iter()
+            .flat_map(|l| [l.edge, l.built_by])
+            .chain(
+                [Some("cam0->camdet"), Some("cam0->proc")]
+                    .into_iter()
+                    .flat_map(|c| stage_rows(c).map(|s| [s.timed_on, s.hands_on]))
+                    .flatten(),
+            )
+            .collect();
+        read.sort_unstable();
+        read.dedup();
+        let mut kept = TABLE_EDGES.to_vec();
+        kept.sort_unstable();
+        assert_eq!(read, kept);
+        // The camera stage is second, and is the one that feeds the answer.
+        assert_eq!(stage_rows(Some("cam0->camdet"))[1].stage, "camdet");
+        assert_eq!(stage_rows(Some("cam0->proc"))[1].stage, "proc");
+        for c in ["cam0->camdet", "cam0->proc"] {
+            assert_eq!(stage_rows(Some(c))[1].timed_on, c);
         }
     }
 
     #[test]
-    fn bytes_read_the_way_the_table_prints_them() {
-        assert_eq!(human_bytes(341), "341 B");
-        assert_eq!(human_bytes(12_916), "13 kB");
-        assert_eq!(human_bytes(1_974_352), "1.97 MB");
-        // Allocated over carried: 0 is zero-copy, and an edge that carried
-        // nothing is 0, not a division by zero.
-        assert_eq!(alloc_ratio(0, 1_958_000), 0.0);
-        assert_eq!(alloc_ratio(465_750, 1_397_250), 465_750.0 / 1_397_250.0);
-        assert_eq!(alloc_ratio(10, 0), 0.0);
-        // Coloured by producer.
-        assert_eq!(producer_rgb("velo", None), C_LIDAR_ONLY);
-        assert_eq!(producer_rgb("det->cloud", None), C_LIDAR_ONLY);
-        assert_eq!(producer_rgb("obj->sink", None), C_DETECTION);
-        assert_eq!(producer_rgb("cam0->proc", None), C_CAMERA_ONLY);
+    fn the_stage_table_says_what_each_stage_does_and_how_long_it_took() {
+        let rows = stage_rows(Some("cam0->camdet"));
+        let line = |i: usize, time_ns, carried| StageLine {
+            row: &rows[i],
+            time_ns,
+            carried,
+        };
+        let lines = [
+            line(0, Some(3_120_000), Some(1_397_406)),
+            line(1, Some(37_590_000), Some(486)),
+            line(3, Some(4_390_000), Some(517_940)),
+            line(5, Some(120_000), None),
+            line(6, Some(34_000), Some(12_973)),
+        ];
+        let t = stage_table(&lines, &["A note.".to_string(), "Another.".to_string()]);
+        let got: Vec<&str> = t.lines().collect();
+        assert_eq!(got[0], "| stage | what it does | time | hands on |");
+        assert_eq!(
+            got[2],
+            "| cam0 | decodes each PNG into an Arrow buffer | 3.1 ms | 1.40 MB image |"
+        );
+        assert_eq!(
+            got[3],
+            "| camdet | finds objects with YOLOX-Nano, on one thread | 38 ms | 486 B of boxes |"
+        );
+        assert_eq!(
+            got[4],
+            "| reduce | averages the points into 20 cm cubes | 4.4 ms | 518 kB of cubes |"
+        );
+        // A stage with no output row yet says so rather than inventing one.
+        assert_eq!(
+            got[5],
+            "| track | gives boxes ids, fuses them with the camera | 0.12 ms | - |"
+        );
+        assert_eq!(
+            got[6],
+            "| state | writes the answer, flags the nearest in path | 0.034 ms | 13 kB answer |"
+        );
+        // Each note its own paragraph, after the table.
+        assert!(t.ends_with("\nA note.\n\nAnother.\n"), "{t:?}");
     }
 
     #[test]
-    fn bytes_are_drawn_on_a_log_scale_that_survives_zero() {
-        assert_eq!(log10_bytes(0), 0.0);
-        assert_eq!(log10_bytes(1), 0.0);
-        assert_eq!(log10_bytes(1_000), 3.0);
-        assert!((log10_bytes(1_974_352) - 6.295).abs() < 0.001);
+    fn times_read_the_way_the_table_prints_them() {
+        assert_eq!(human_ms(137_406_000), "137 ms");
+        assert_eq!(human_ms(37_590_000), "38 ms");
+        assert_eq!(human_ms(4_390_000), "4.4 ms");
+        assert_eq!(human_ms(120_000), "0.12 ms");
+        assert_eq!(human_ms(34_000), "0.034 ms");
+        assert_eq!(human_bytes(341), "341 B");
+        assert_eq!(human_bytes(12_916), "13 kB");
+        assert_eq!(human_bytes(1_974_352), "1.97 MB");
+        // The median of an even count is the upper one; none of nothing.
+        assert_eq!(median(&[4, 1, 3, 2]), Some(3));
+        assert_eq!(median(&[5]), Some(5));
+        assert_eq!(median::<u64>(&[]), None);
     }
 
     #[test]
@@ -2370,6 +2371,135 @@ mod tests {
         assert_eq!(g.observe("cam0->rerun", 4), None);
         assert_eq!(g.observe("cam0->rerun", 5), Some(1.0));
         assert_eq!(g.observe("cam0->proc", 5), Some(1.0));
+    }
+
+    /// A dashboard for the tests that feed it rows by hand, and the viewer
+    /// queue its drawings wait on: nothing draws them, so the recording is
+    /// needed only for the layout the dashboard sends first.
+    fn dashboard(bounds: Bounds) -> (Dashboard, Arc<ViewerQueue>) {
+        let (rec, _storage) = rerun::RecordingStreamBuilder::new("pipes-test")
+            .memory()
+            .unwrap();
+        let viewer = ViewerQueue::new(1 << 12);
+        let d = Dashboard::new(&rec, viewer.canvas("rec"), bounds, Mode::File).unwrap();
+        (d, viewer)
+    }
+
+    /// A delivered row on `edge` for frame `seq`, due at `due_ms` and done at
+    /// `end_ms` on the host clock.
+    fn timed(edge: &'static str, seq: u64, due_ms: i64, end_ms: i64) -> Evidence {
+        use pipes_core::clock::{SensorTime, Tov};
+        use pipes_core::sample::StreamId;
+        const MS: i64 = 1_000_000;
+        let mut e = Evidence::driver_missing(
+            &RowCtx {
+                run_id: "t".to_string(),
+                t0_host: HostTime(0),
+                epoch: 0,
+            },
+            StreamId::LIDAR,
+            edge,
+            "stage",
+            seq,
+            Tov::Time(SensorTime(due_ms * MS)),
+            Some(HostTime(due_ms * MS)),
+            HostTime(end_ms * MS),
+            "",
+        );
+        e.outcome = Outcome::Delivered;
+        e.proc_start_ns = Some((end_ms - 1) * MS);
+        e.proc_end_ns = Some(end_ms * MS);
+        e
+    }
+
+    #[test]
+    fn the_camera_dot_waits_for_its_sweep_and_counts_a_late_camera() {
+        let (mut d, _viewer) = dashboard(Bounds {
+            camera_edge: Some("cam0->camdet"),
+            period_ms: Some(100.0),
+            rate: Some(1.0),
+            ..Bounds::default()
+        });
+        // Frame 1, healthy: the camera done at 97 ms, 3 ms before its sweep
+        // is due at 100, and before `detect` is done at 109. The camera's
+        // row comes first; its dot waits for the sweep's.
+        d.log_row(&timed("cam0->camdet", 1, 59, 97)).unwrap();
+        assert_eq!(d.halves.get(&1).map(|h| h.drawn), Some(false));
+        d.log_row(&timed("velo", 1, 100, 100)).unwrap();
+        assert_eq!(d.halves.get(&1).map(|h| h.drawn), Some(true));
+        assert_eq!(d.camera_later, (0, 0));
+        d.log_row(&timed("det->detect", 1, 100, 109)).unwrap();
+        assert_eq!(d.camera_later, (1, 0));
+        assert!(!d.halves.contains_key(&1), "a joined sweep is kept");
+        // Frame 2, a slow camera: done at 246, after the sweep (200) and
+        // after `detect` (209). Counted late.
+        d.log_row(&timed("velo", 2, 200, 200)).unwrap();
+        d.log_row(&timed("det->detect", 2, 200, 209)).unwrap();
+        d.log_row(&timed("cam0->camdet", 2, 159, 246)).unwrap();
+        assert_eq!(d.camera_later, (2, 1));
+        assert!(d.halves.is_empty(), "{:?}", d.halves);
+        // Frame 3's camera frame was dropped: its half waits, and is let go
+        // once the run is `HALVES_KEPT` frames past it.
+        d.log_row(&timed("velo", 3, 300, 300)).unwrap();
+        d.log_row(&timed("det->detect", 3, 300, 309)).unwrap();
+        assert!(d.halves.contains_key(&3));
+        for seq in 4..=(3 + HALVES_KEPT + 1) {
+            let due = seq as i64 * 100;
+            d.log_row(&timed("velo", seq, due, due)).unwrap();
+        }
+        assert!(!d.halves.contains_key(&3), "a sweep with no camera is kept");
+        assert!(d.halves.len() <= HALVES_KEPT as usize + 1);
+        assert_eq!(d.camera_later, (2, 1));
+        // A row no half is timed on leaves no entry behind.
+        let before = d.halves.len();
+        d.log_row(&timed("obj->track", 900, 90_000, 90_010))
+            .unwrap();
+        assert_eq!(d.halves.len(), before);
+    }
+
+    #[test]
+    fn the_stage_notes_say_what_the_camera_s_time_holds() {
+        // The slow camera: 100 ms of sleep inside camdet's window, 80 MB of
+        // working memory, 116 of 154 frames, and late on every sweep.
+        let (mut d, _viewer) = dashboard(Bounds {
+            camera_edge: Some("cam0->camdet"),
+            camera_delay_ms: 100,
+            ..Bounds::default()
+        });
+        let rows = |n: usize, carried: u64, alloc: u64| EdgeRows {
+            carried: vec![carried; n],
+            alloc: vec![alloc; n],
+            time_ns: vec![1; n],
+            copied: 0,
+        };
+        d.table.insert("cam0", rows(154, 1_397_406, 1_690_042));
+        d.table
+            .insert("cam0->camdet", rows(116, 1_397_406, 80_243_692));
+        d.table.insert("cam_det", rows(116, 486, 6_900));
+        d.camera_later = (116, 116);
+        let notes = d.stage_notes(&stage_rows(Some("cam0->camdet"))[1]);
+        assert_eq!(
+            notes[1..],
+            [
+                "camdet's includes the 100 ms sleep of `--consumer-delay-ms`.",
+                "camdet allocates 80.24 MB while it works on each frame, the network's working memory, and hands on 486 B.",
+                "camdet ran on 116 of the 154 frames the camera delivered.",
+                "The camera's result was ready after the lidar's boxes on 116 of 116 sweeps: on the Demo page, the blue diamond above `detect`'s teal one.",
+            ]
+        );
+        assert!(notes[0].contains("track's includes any wait for the camera"));
+        // The healthy run says the camera was always first, and nothing of
+        // a sleep or of frames it missed.
+        d.bounds.camera_delay_ms = 0;
+        d.table
+            .insert("cam0->camdet", rows(154, 1_397_406, 80_243_692));
+        d.camera_later = (154, 0);
+        let notes = d.stage_notes(&stage_rows(Some("cam0->camdet"))[1]);
+        assert_eq!(notes.len(), 3, "{notes:?}");
+        assert_eq!(
+            notes[2],
+            "The camera's result was ready before the lidar's boxes on all 154 sweeps."
+        );
     }
 
     /// Every shape of row the recorder mirrors, three sweeps' worth: each
@@ -2485,23 +2615,14 @@ mod tests {
         // Read back from what the dashboard LOGGED, not from a list kept by
         // hand beside it: a leaf added to `log_row` without a style, or
         // without a view to show it, fails here the first time it is logged.
-        use crate::dashboard::{logged, send_blueprint, EDGES};
+        use crate::dashboard::{logged, send_blueprint};
         use rerun::{RecordingStreamBuilder, StoreKind};
         for camera_edge in ["cam0->camdet", "cam0->proc"] {
             let bounds = Bounds {
-                age_queue_ms: BTreeMap::from([
-                    ("cam0->proc", 413.2),
-                    ("cam0->rerun", 103.3),
-                    ("cam0->camdet", 103.3),
-                ]),
-                queue_cap: EDGES
-                    .iter()
-                    .map(|e| (*e, if e.starts_with("cam0") { 1.0 } else { 4.0 }))
-                    .collect(),
                 image_wh: Some((1242.0, 375.0)),
                 period_ms: Some(103.3),
                 camera_edge: Some(camera_edge),
-                n_frames: Some(4.0),
+                camera_delay_ms: 50,
                 rate: Some(1.0),
                 lidar_lane: true,
                 answer: true,
@@ -2533,12 +2654,16 @@ mod tests {
 
             // The run under test drew every family the dashboard has.
             for want in [
-                "queues/cam0_to_proc/fill",
-                "queues/velo_to_reduce/drops",
                 "lanes/pairing",
-                "latency/headroom/answer",
-                "latency/stages/5_answer",
-                "bytes/chain/1_sweep",
+                "pairing/1_camera_done",
+                "pairing/3_detect_done",
+                "pairing/4_answer_done",
+                "after_sweep/sweep_end",
+                "after_sweep/1_camera_done",
+                "after_sweep/2_reduce_done",
+                "after_sweep/3_detect_done",
+                "after_sweep/4_answer_done",
+                "latency/table",
                 "bytes/table",
                 "graph/pipeline",
                 "log/drops",
@@ -2547,8 +2672,6 @@ mod tests {
                 // stamped for the frame that is not there.
                 "lanes/lidar_queue",
                 "lanes/camera_queue",
-                "queues/admission/velo/absent_in_source",
-                "queues/admission/cam0/absent_in_source",
                 "camera/status",
                 "answer/headline",
                 "lidar/sweep",
@@ -2557,6 +2680,18 @@ mod tests {
                     logged.contains_key(want),
                     "{camera_edge}: nothing at {want}"
                 );
+            }
+            // And nothing of the pages that were cut.
+            for path in logged.keys() {
+                for gone in [
+                    "queues/",
+                    "latency/headroom",
+                    "latency/stages",
+                    "bytes/chain",
+                    "bytes/alloc",
+                ] {
+                    assert!(!path.starts_with(gone), "{camera_edge}: {path} is logged");
+                }
             }
             let has = |comps: &BTreeSet<String>, archetype: &str| {
                 comps
@@ -2599,43 +2734,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn drop_counter_counts_only_non_delivered() {
-        let mut c = DropCounter::default();
-        let mut drops = |edge, outcome, reason| c.observe(edge, outcome, reason).0;
-        assert_eq!(drops("cam0->proc", Outcome::Delivered, ""), 0);
-        assert_eq!(drops("cam0->proc", Outcome::DroppedOldest, "evicted"), 1);
-        assert_eq!(drops("cam0->proc", Outcome::Delivered, ""), 1);
-        assert_eq!(drops("cam0->proc", Outcome::DroppedNewest, "full"), 2);
-        assert_eq!(drops("cam0->proc", Outcome::Timeout, "max_wait"), 3);
-        assert_eq!(drops("cam0->proc", Outcome::Missing, "deadline_skipped"), 4);
-        // Edges count separately.
-        assert_eq!(drops("cam0->rerun", Outcome::Delivered, ""), 0);
-        assert_eq!(drops("cam0->rerun", Outcome::DroppedOldest, "evicted"), 1);
-        assert_eq!(drops("cam0->proc", Outcome::Delivered, ""), 4);
-    }
-
-    /// A frame the source never had is not a drop: it is counted apart, and
-    /// the drops stay where the pipeline's own losses put them.
-    #[test]
-    fn a_frame_absent_in_the_source_is_not_a_drop() {
-        let mut c = DropCounter::default();
-        assert_eq!(c.observe("velo", Outcome::Delivered, ""), (0, 0));
-        assert_eq!(
-            c.observe("velo", Outcome::Missing, ABSENT_IN_SOURCE),
-            (0, 1)
-        );
-        assert_eq!(
-            c.observe("velo", Outcome::Missing, ABSENT_IN_SOURCE),
-            (0, 2)
-        );
-        assert_eq!(
-            c.observe("velo", Outcome::Missing, "deadline_skipped"),
-            (1, 2)
-        );
-        assert_eq!(c.observe("velo", Outcome::Delivered, ""), (1, 2));
-    }
-
     /// The seqs a stream carries are the frames of the sensors it counts,
     /// so a frame absent in a sensor's source is absent on every edge of
     /// every such stream -- the camera's on `cam_det->track` as on
@@ -2643,12 +2741,7 @@ mod tests {
     #[test]
     fn a_source_gap_is_stepped_over_on_every_stream_that_counts_its_frames() {
         use pipes_core::sample::StreamId;
-        let (rec, _storage) = rerun::RecordingStreamBuilder::new("pipes-test")
-            .memory()
-            .unwrap();
-        let viewer = ViewerQueue::new(16);
-        let mut d =
-            Dashboard::new(&rec, viewer.canvas("rec"), Bounds::default(), Mode::File).unwrap();
+        let (mut d, _viewer) = dashboard(Bounds::default());
         d.absent.insert((Sensor::Camera, 8));
         d.absent.insert((Sensor::Lidar, 3));
         d.absent.insert((Sensor::Lidar, 4));

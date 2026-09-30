@@ -15,7 +15,7 @@ use std::path::Path;
 
 use pipes_kitti::camdet::MODEL_FILE;
 use pipes_kitti::testing::FixtureDrive;
-use rerun::archetypes::{Points2D, Scalars, StateChange, TextDocument, TextLog};
+use rerun::archetypes::{Points2D, StateChange, TextDocument, TextLog};
 use rerun::external::re_log_encoding::DecoderApp;
 use rerun::external::re_sdk_types::blueprint::archetypes::ViewContents;
 use rerun::log::{Chunk, LogMsg};
@@ -49,8 +49,6 @@ struct Rrd {
     /// Every string the recording logged, by entity: lane states, log lines,
     /// documents and point labels -- what a reader of the viewer reads.
     texts: BTreeMap<String, Vec<String>>,
-    /// Every scalar the recording logged, by entity.
-    values: BTreeMap<String, Vec<f64>>,
 }
 
 fn read_rrd(path: &Path) -> Rrd {
@@ -66,8 +64,6 @@ fn read_rrd(path: &Path) -> Rrd {
     let mut entities: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut shown = Vec::new();
     let mut texts: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    let mut values: BTreeMap<String, Vec<f64>> = BTreeMap::new();
-    let scalar = Scalars::descriptor_scalars().component;
     for msg in msgs {
         let LogMsg::ArrowMsg(store, arrow) = msg.expect("a message") else {
             continue;
@@ -84,12 +80,6 @@ fn read_rrd(path: &Path) -> Rrd {
                             .or_default()
                             .extend(batch.iter().map(|s| s.to_string()));
                     }
-                }
-                for batch in chunk.iter_slices::<f64>(scalar) {
-                    values
-                        .entry(path.clone())
-                        .or_default()
-                        .extend(batch.iter().copied());
                 }
                 let comps = entities.entry(path).or_default();
                 for d in chunk.component_descriptors() {
@@ -109,7 +99,6 @@ fn read_rrd(path: &Path) -> Rrd {
         entities,
         shown,
         texts,
-        values,
     }
 }
 
@@ -209,7 +198,7 @@ fn assert_shown_and_styled(rrd: &Rrd, want: &[&str]) {
 
 /// Every family the dashboard draws, the stages' own pictures and the
 /// recorder's mirror alike.
-const EVERY_FAMILY: [&str; 16] = [
+const EVERY_FAMILY: [&str; 19] = [
     "camera/image",
     "camera/status",
     "answer/headline",
@@ -221,10 +210,13 @@ const EVERY_FAMILY: [&str; 16] = [
     "lidar/voxels",
     "lidar/tracks",
     "lidar/answer",
-    "queues/cam0_to_proc/fill",
     "lanes/pairing",
-    "latency/headroom/answer",
-    "bytes/chain/1_sweep",
+    "pairing/1_camera_done",
+    "pairing/3_detect_done",
+    "after_sweep/sweep_end",
+    "after_sweep/2_reduce_done",
+    "latency/table",
+    "bytes/table",
     "graph/pipeline",
 ];
 
@@ -233,29 +225,41 @@ fn every_entity_a_run_logs_is_shown_and_every_series_is_styled() {
     assert_shown_and_styled(&fixture_run(false), &EVERY_FAMILY);
 }
 
-/// The same with the camera detector, whose stage draws its own boxes and
-/// moves the camera queue's series to `cam0->camdet` -- and runs in `proc`'s
-/// place, so nothing is logged for `cam0->proc`.
+/// The same with the camera detector, whose stage draws its own boxes -- and
+/// runs in `proc`'s place, so the stage table names it and never `proc`.
 #[test]
 #[ignore = "needs models/yolox_nano.onnx (scripts/fetch_model.ps1)"]
 fn with_the_detector_every_entity_is_shown_and_styled_too() {
-    let mut want: Vec<&str> = EVERY_FAMILY
-        .into_iter()
-        .filter(|e| *e != "queues/cam0_to_proc/fill")
-        .collect();
-    want.extend([
-        "camera/cam_det",
-        "queues/cam0_to_camdet/fill",
-        "queues/cam0_to_camdet/depth_at_push",
-    ]);
+    let mut want: Vec<&str> = EVERY_FAMILY.to_vec();
+    want.push("camera/cam_det");
     let rrd = fixture_run(true);
     assert_shown_and_styled(&rrd, &want);
-    let proc: Vec<&String> = rrd
-        .entities
-        .keys()
-        .filter(|p| p.contains("cam0_to_proc"))
-        .collect();
-    assert!(proc.is_empty(), "proc ran beside the detector: {proc:?}");
+    let table = rrd.texts.get("latency/table").cloned().unwrap_or_default();
+    let last = table.last().map(String::as_str).unwrap_or_default();
+    assert!(last.contains("| camdet |"), "{last}");
+    assert!(
+        !last.contains("| proc |"),
+        "proc ran beside the detector: {last}"
+    );
+}
+
+/// Without it, the camera's half of each pair is `proc`'s, and the stage
+/// table and the camera bar say so: `proc` is the camera stage, and the
+/// table's every line is a stage the run had.
+#[test]
+fn without_the_detector_the_camera_stage_is_proc() {
+    let rrd = fixture_run(false);
+    let table = rrd.texts.get("latency/table").cloned().unwrap_or_default();
+    let last = table.last().map(String::as_str).unwrap_or_default();
+    assert!(last.contains("| proc |"), "{last}");
+    assert!(!last.contains("| camdet |"), "{last}");
+    for stage in ["cam0", "velo", "reduce", "detect", "track", "state"] {
+        assert!(last.contains(&format!("| {stage} |")), "{stage}: {last}");
+    }
+    let bytes = rrd.texts.get("bytes/table").cloned().unwrap_or_default();
+    let last = bytes.last().map(String::as_str).unwrap_or_default();
+    assert!(last.contains("| 1 sweep |"), "{last}");
+    assert!(last.contains("**built**"), "{last}");
 }
 
 /// A gap in either sensor's source is SHOWN, not only counted: the sensor's
@@ -269,8 +273,7 @@ fn with_the_detector_every_entity_is_shown_and_styled_too() {
 /// sweep` (a lane clears after [`LANE_CLEAR_AFTER`] quiet rows), so what it
 /// steps down TO is on the recording: `ok`, not the queue's own `skipping`.
 /// And no lane downstream of either gap -- the camera's queue, the lidar's,
-/// the detector's, the fusion's two inputs -- ever reads `skipping` for it,
-/// and neither driver's drops count the frames its source never had.
+/// the detector's, the fusion's two inputs -- ever reads `skipping` for it.
 #[test]
 fn a_gap_in_either_source_is_shown_on_the_dashboard() {
     let fx = FixtureDrive::with_gaps(GAP_FRAMES, &[9], &[3, 4], PERIOD_NS).unwrap();
@@ -390,30 +393,5 @@ fn a_gap_in_either_source_is_shown_on_the_dashboard() {
         );
     } else {
         eprintln!("the pipeline lost samples, so the lanes may skip: {losses:?}");
-    }
-    // The drops count the pipeline's losses and nothing else; the frames the
-    // source never had are their own grey series.
-    let most = |entity: &str| {
-        rrd.values
-            .get(entity)
-            .and_then(|v| v.iter().copied().reduce(f64::max))
-    };
-    let driver_losses = |edge: &str| {
-        losses
-            .iter()
-            .filter(|l| l.starts_with(&format!("{edge} seq ")))
-            .count() as f64
-    };
-    for (edge, absent) in [("velo", 2.0), ("cam0", 1.0)] {
-        assert_eq!(
-            most(&format!("queues/admission/{edge}/drops")),
-            Some(driver_losses(edge)),
-            "{edge}'s drops counted a frame its source never had"
-        );
-        assert_eq!(
-            most(&format!("queues/admission/{edge}/absent_in_source")),
-            Some(absent),
-            "{edge}'s source gap"
-        );
     }
 }

@@ -130,8 +130,8 @@ use serde::Serialize;
 
 use crate::admission::Admission;
 use crate::dashboard::{
-    entity, ANSWER_LEAVES, FUSED_FRACTION_LEAF, PAIRING_BAND, PAIRING_LEAVES, TRACK_COUNT_LEAVES,
-    TTC_TOP_S, TTC_WARN_S,
+    entity, ANSWER_LEAVES, CAMERA_FUSED_FRACTION_LEAF, FUSED_FRACTION_LEAF, PAIRING_BAND,
+    PAIRING_LEAVES, TRACK_COUNT_LEAVES, TTC_TOP_S, TTC_WARN_S,
 };
 use crate::record::{
     band_archetype, series_archetype, EvRow, EvidenceSink, C_ANSWER, C_ATTENTION, C_CAMERA_ONLY,
@@ -4917,11 +4917,13 @@ impl StateSinkReport {
     }
 }
 
-/// The share of the in-frame lidar tracks the camera confirmed, `fused /
-/// (fused + lidar_only)`, or `None` -- a gap -- for a frame with no lidar
-/// track in it, where a share of nothing is not 0.
-fn fused_fraction(fused: u32, lidar_only: u32) -> Option<f64> {
-    let n = fused + lidar_only;
+/// The fused share of one sensor's objects in the frame, `fused / (fused +
+/// unconfirmed)`: of the lidar's tracks, with `lidar_only`, the ones the
+/// camera confirmed; of the camera's detections, with `camera_only`, the ones
+/// the lidar did. `None` -- a gap -- for a frame with none of that sensor's
+/// objects in it, where a share of nothing is not 0.
+fn fused_fraction(fused: u32, unconfirmed: u32) -> Option<f64> {
+    let n = fused + unconfirmed;
     (n > 0).then(|| f64::from(fused) / f64::from(n))
 }
 
@@ -5117,12 +5119,17 @@ pub fn state_sink_thread(
             // Styled once, on the first answer, for the reason the dashboard
             // styles on first sight: an unstyled series is an anonymous line.
             if !styled {
-                if let Some(style) = series_archetype(FUSED_FRACTION_LEAF) {
-                    if rec
-                        .log_static(entity::TRACKS_FUSED_FRACTION, style.as_ref())
-                        .is_err()
-                    {
-                        report.viz_log_errors += 1;
+                for (path, leaf) in [
+                    (entity::TRACKS_FUSED_FRACTION, FUSED_FRACTION_LEAF),
+                    (
+                        entity::TRACKS_CAMERA_FUSED_FRACTION,
+                        CAMERA_FUSED_FRACTION_LEAF,
+                    ),
+                ] {
+                    if let Some(style) = series_archetype(leaf) {
+                        if rec.log_static(path, style.as_ref()).is_err() {
+                            report.viz_log_errors += 1;
+                        }
                     }
                 }
                 for leaf in ANSWER_LEAVES {
@@ -5189,15 +5196,19 @@ pub fn state_sink_thread(
                 }
             }
             // The share of the lidar's tracks in the frame the camera
-            // confirmed: 0 to 1, and a gap on a frame with none in it. A
-            // stale camera moves it down, which the Fusion tab shows beside
-            // its cause.
-            if let Some(share) = fused_fraction(fused, lidar_only) {
-                if rec
-                    .log(entity::TRACKS_FUSED_FRACTION, &Scalars::single(share))
-                    .is_err()
-                {
-                    report.viz_log_errors += 1;
+            // confirmed, and of the camera's detections the lidar did: 0 to
+            // 1 each, and a gap on a frame with none of that sensor's in it.
+            // Every detection is fused or camera-only, so those two are all
+            // of the camera's. A stale camera moves both down, which the
+            // Fusion tab shows under the pairing lane that says why.
+            for (path, unconfirmed) in [
+                (entity::TRACKS_FUSED_FRACTION, lidar_only),
+                (entity::TRACKS_CAMERA_FUSED_FRACTION, camera_only as u32),
+            ] {
+                if let Some(share) = fused_fraction(fused, unconfirmed) {
+                    if rec.log(path, &Scalars::single(share)).is_err() {
+                        report.viz_log_errors += 1;
+                    }
                 }
             }
             // The answer as the demo screen's headline, in large type: what

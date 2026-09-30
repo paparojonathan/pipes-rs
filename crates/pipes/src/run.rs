@@ -2863,18 +2863,14 @@ fn wait_for_listener(
     }
 }
 
-/// The dashboard's reference lines, derived from this run's own arguments.
-///
-/// The measurement-age bound is the pre-registered `cap × frame period +
-/// consumer delay` (spec §I.2), in host ms: the drive's own median sensor
-/// period replayed at `--rate`, so a drive captured at a different cadence
-/// gets the right line rather than a hard-coded 103.3 ms. An unpaced run has
-/// no deadlines, so `due_ns` and `measurement_age_ns` are both empty and there
-/// is nothing to bound.
-///
-/// `cam0->rerun` is always cap 1 with no artificial delay, so its bound is one
-/// frame period, and `cam0->camdet` is its cap in periods plus the detector's
-/// own service, which is most of one.
+/// What the dashboard needs to know about this run to draw it, from the
+/// drive and the run's own arguments: the camera picture's size, the drive's
+/// median sensor period (the pairing plot's scale), the camera queue that
+/// feeds the answer and the `--consumer-delay-ms` sleep inside its stage's
+/// measured time, which the stage table names beside that time, and
+/// `--rate`, which puts the host clock's stage times on the sensor clock the
+/// pairing plot is drawn in. An unpaced run has no rate, and no deadlines to
+/// time a stage from.
 ///
 /// `reduce` and `answer` say which of the dashboard's lanes and pictures this
 /// run draws at all -- `velo->reduce`, which the lidar lane watches, and the
@@ -2888,53 +2884,11 @@ fn dashboard_bounds(
     reduce: bool,
     answer: bool,
 ) -> Bounds {
-    let mut age_queue_ms = BTreeMap::new();
-    if a.rate.is_finite() && a.rate > 0.0 {
-        let period_ms = median_period_ns(&driver.timestamps) as f64 * 1e-6 / a.rate;
-        // Queueing term only. `--consumer-delay-ms` is deliberately absent: the
-        // sleep it causes sits between `proc_start` and `proc_end` of whichever
-        // stage it slows, so it is already inside the service time the
-        // dashboard adds per frame, and counting it here too would double it.
-        let camera = cams.knobs();
-        age_queue_ms.insert(camera.edge, camera.cap as f64 * period_ms);
-        age_queue_ms.insert("cam0->rerun", period_ms);
-    }
-    // Every queue this binary can open, with the capacity it opens it at. The
-    // dashboard draws a line only where rows exist, so naming an edge this run
-    // never opened (`cam0->rerun` under `--rerun off`, the lidar edges on a
-    // camera-only drive) costs nothing and asserts nothing.
-    //
-    // Listed here rather than measured from the queues because this is the one
-    // place that already knows all of them, and because the numbers are the
-    // point: `--cap` is the camera experiment's independent variable, on
-    // whichever camera queue feeds the answer, while the lidar edges are pinned
-    // at `VELO_CAP` and `DET_CAP` precisely so it cannot reach them. A viewer
-    // that draws one capacity line for all five would say the opposite.
-    let mut queue_cap = BTreeMap::from([
-        // Fixed at 1 where it is built; not `--cap`.
-        ("cam0->rerun", 1.0),
-        ("velo->cloud", VELO_CAP as f64),
-        ("velo->reduce", VELO_CAP as f64),
-        ("det->cloud", DET_CAP as f64),
-        ("det->detect", DET_CAP as f64),
-        ("obj->sink", OBJ_CAP as f64),
-        // The chain's last links are bounded too, at the same cap, and the
-        // camera-reference edge at its own: a depth read without its cap
-        // answers nothing, on these four as on the others.
-        ("obj->track", CHAIN_CAP as f64),
-        ("cam_det->track", CAM_REF_CAP as f64),
-        ("track->state", CHAIN_CAP as f64),
-        ("state->sink", CHAIN_CAP as f64),
-    ]);
-    // The one camera consumer's queue, `cam0->camdet` or `cam0->proc`.
-    queue_cap.insert(cams.knobs().edge, cams.knobs().cap as f64);
     Bounds {
-        age_queue_ms,
-        queue_cap,
         image_wh: image_wh.map(|(w, h)| (w as f32, h as f32)),
         period_ms: Some(median_period_ns(&driver.timestamps) as f64 * 1e-6),
         camera_edge: Some(cams.knobs().edge),
-        n_frames: Some(driver.frame_slots() as f64),
+        camera_delay_ms: cams.knobs().delay_ms,
         rate: (a.rate.is_finite() && a.rate > 0.0).then_some(a.rate),
         lidar_lane: reduce,
         answer,

@@ -11,30 +11,28 @@
 //! Naming: `camera/` and `lidar/` are the two sensors' pictures (the frame,
 //! and what the chain drew on it or found in it); `answer/` is the end of the
 //! chain, as a headline, a time to collision and a sentence; `pairing/` is the
-//! sweep's window and the camera frame paired inside it; `tracks/` the
-//! fusion's populations in the frame; `queues/<edge>/` is the evidence rows
-//! mirrored per EDGE -- one entity per edge, never per stage, because a stage
-//! like `reduce` writes rows for two edges and one series for both
-//! interleaved them; `lanes/` the five sticky health lanes; `latency/` each
-//! measured time over its bound, the chain's end and the stages; `bytes/` the
-//! byte chain as bars and a table, allocated over carried, and the
-//! shared-buffer lane; `graph/` the pipeline; `log/` the WARN rows and the
-//! run's events. Every entity is shown by some view and every view shows an
-//! entity, and a test holds both. Nothing hangs under `pipes/` any more: that
-//! prefix grouped 147 entities by which thread wrote them, which is not what a
+//! sweep's window, the camera frame paired inside it, and when the camera's
+//! half, the lidar's half and the answer were ready; `after_sweep/` the same
+//! finishes and `reduce`'s, zoomed onto the sweep's end; `tracks/` the
+//! fusion's populations in the frame and the share of each sensor's it fused;
+//! `lanes/` the five sticky health lanes, the pairing's and the queues';
+//! `latency/` each stage's time as a table; `bytes/` the byte chain as a
+//! table; `graph/` the pipeline; `log/` the WARN rows and the run's events. Every entity is shown by some view and every view shows an entity,
+//! and a test holds both. Nothing hangs under `pipes/` any more: that prefix
+//! grouped 147 entities by which thread wrote them, which is not what a
 //! reader asks.
 //!
 //! The layout ([`send_blueprint`]) is built by hand as a blueprint store and
 //! sent in-band on the run's own stream before the first data row, so a
 //! viewer the run spawns opens straight into it and an `.rrd` file carries it
 //! at its head. The typed `rerun::blueprint` API cannot attach the properties
-//! that carry the design -- the locked y-axes, the legend corners, the visible
+//! that carry the design -- the locked y-axes, the hidden legends, the visible
 //! time window, the 3D eye -- and an `.rbl` file passed on the command line
 //! does not apply. So each view is logged as the SDK's own `Blueprint::send`
 //! logs it, plus one archetype per property at `view/<id>/<Archetype>`.
 
 use rerun::blueprint::components::{
-    ActiveTab, AutoLayout, AutoViews, BackgroundKind, ContainerKind, Corner2D, Enabled, Eye3DKind,
+    ActiveTab, AutoLayout, AutoViews, BackgroundKind, ContainerKind, Enabled, Eye3DKind,
     IncludedContent, LinkAxis, LoopMode, PanelState, PlayState, QueryExpression, RootContainer,
     TextLogColumn, TimelineColumn, ViewClass, VisibleTimeRange,
 };
@@ -126,49 +124,27 @@ pub mod entity {
     /// Root of the pairing's own numbers ([`super::PAIRING_LEAVES`] and
     /// [`super::PAIRING_BAND`]): the sweep's range as a band with its two
     /// ends, its trigger, and the instant of the camera frame paired with it,
-    /// in ms from the sweep's start.
+    /// in ms from the sweep's start -- and, on the same axis, when the
+    /// pairing's two halves and its answer were ready
+    /// ([`super::READY_DOTS`]).
     pub const PAIRING: &str = "pairing";
-    /// Root of the per-edge queue series: `queues/<edge>/{fill,drops}` on
-    /// every real queue, `depth_at_push`, `depth`, `cap` and `drop_events`
-    /// on the camera queue that feeds the answer, and, under
-    /// `queues/admission/`, the two sensor drivers' `drops` and the
-    /// admission's run length ([`super::ADMISSION_RUN`]).
-    pub const QUEUES: &str = "queues";
+    /// The zoom on the sweep's end, in ms after the sweep ended: the end
+    /// itself as a line at 0, and every ready dot, `reduce`'s among them
+    /// ([`super::READY_DOTS`]).
+    pub const AFTER_SWEEP: &str = "after_sweep";
     /// Root of the five sticky health lanes, `lanes/<name>`
     /// ([`super::LANE_NAMES`]): one state each, logged only when it changes.
     pub const LANES: &str = "lanes";
-    /// Root of the Latency page's series: the ratios under
-    /// [`HEADROOM`], `latency/cam_service` (the camera stage's service over
-    /// one period), `latency/period_band`, the chain's end and the stages.
-    pub const LATENCY: &str = "latency";
-    /// Each measured time over the bound it is read against, so 1 is at the
-    /// bound on every line ([`super::HEADROOM_LEAVES`]).
-    pub const HEADROOM: &str = "latency/headroom";
-    /// The chain's end: `latency/chain_end/answer_age_ms`, how long after
-    /// the sweep was due its answer arrived, against `period_ms`.
-    pub const CHAIN_END: &str = "latency/chain_end";
-    /// Where the time goes: one bar per chain stage, ms after the sweep was
-    /// due when that stage finished with it. Each bar is its own entity,
-    /// `latency/stages/<n>_<stage>` ([`super::STAGES`]), placed on the x
-    /// axis by its position in the chain, so the viewer names the stage
-    /// when the bar is hovered: a bar chart's bars carry no label of their
-    /// own.
-    pub const LATENCY_STAGES: &str = "latency/stages";
-    /// Bytes per sweep down the chain, one bar per link, log10, at
-    /// `bytes/chain/<n>_<link>` ([`super::CHAIN_BYTES`]) for the same reason.
-    pub const BYTES_CHAIN: &str = "bytes/chain";
-    /// Bytes ALLOCATED over bytes CARRIED, per edge: 0 is a zero-copy
-    /// hand-off, 1 a full copy. One bar each, `bytes/alloc_ratio/<n>_<edge>`
-    /// ([`super::ALLOC_RATIO`]).
-    pub const BYTES_ALLOC_RATIO: &str = "bytes/alloc_ratio";
-    /// The byte chain as a table -- each link's carried bytes, the step from
-    /// the link before, and what its consumer allocated -- from the medians
-    /// of the run so far: written once after the first ten answers and again
-    /// at the end.
+    /// Every stage as a table -- what it does, its median time per sample and
+    /// what it hands on -- from the medians of the run so far: written once
+    /// after the first ten answers and again at the end.
+    pub const STAGE_TABLE: &str = "latency/table";
+    /// The byte chain as a table -- each link, what the step that made it
+    /// does, its carried bytes, the change from the link before, what the
+    /// step allocated to build it and what the next stage allocated to read
+    /// it -- from the medians of the run so far, written when the stage
+    /// table is.
     pub const BYTES_TABLE: &str = "bytes/table";
-    /// One lane: `same` while every consumer names the producer's buffer,
-    /// logged only when it changes.
-    pub const STORAGE_SHARED: &str = "bytes/storage_shared";
     /// The pipeline as a graph, each node labelled with the bytes its stage
     /// hands on for the latest sweep: the edges once, statically, and the
     /// nodes per answer ([`super::GRAPH_NODES`]).
@@ -184,12 +160,15 @@ pub mod entity {
     /// The share of the in-frame lidar tracks the camera confirmed, 0 to 1,
     /// logged by `state-sink` on every answer with a lidar track in frame.
     pub const TRACKS_FUSED_FRACTION: &str = "tracks/fused_fraction";
+    /// The same from the camera's side: the share of the camera's detections
+    /// in the frame the lidar confirmed, logged on every answer with a
+    /// detection in it.
+    pub const TRACKS_CAMERA_FUSED_FRACTION: &str = "tracks/camera_fused_fraction";
 }
 
 /// Every real queue this binary can open, in chain order, as the edge name
-/// the evidence rows carry. A `->` becomes `_to_` on the recording
-/// ([`edge_path`]). The test's table: the run mirrors whatever edges its rows
-/// name, and the layout names its edges one by one.
+/// the evidence rows carry: what the health lanes are fed from
+/// ([`queue_lane`]), and the table the chart tests check their edges against.
 pub const EDGES: [&str; 12] = [
     "cam0->proc",
     "cam0->rerun",
@@ -205,56 +184,78 @@ pub const EDGES: [&str; 12] = [
     "state->sink",
 ];
 
-/// The leaf, beside `drops` under a sensor driver's `queues/admission/<edge>/`,
-/// of the frames that driver's source never had (`absent_in_source`),
-/// cumulative: drawn on the drops plot in grey, and never counted in the
-/// drops -- a gap in the source is not a loss in the pipeline.
-pub const ABSENT_LEAF: &str = "absent_in_source";
-
 /// The two sensor drivers' pseudo-edges: rows for frames and sweeps that were
 /// admitted, or never produced at all. The only producer rows that can be
-/// `Missing`: a derived stream's producer row (`det`, `obj`, `track`,
-/// `state`, `cam_det`) is structurally always Delivered, so those are not
-/// admission edges and draw no drops.
+/// `Missing` -- a derived stream's producer row (`det`, `obj`, `track`,
+/// `state`, `cam_det`) is structurally always Delivered -- and so the only
+/// rows that can say a frame is absent in the source.
 pub const ADMISSION_EDGES: [&str; 2] = ["cam0", "velo"];
 
-/// The byte chain's bars, in chain order, as `(bar, edge)`: the bar is the
-/// delivered `payload_bytes` on that edge, logged at `bytes/chain/<bar>`.
-/// The sweep, the voxels, the detections, the tracks, the answer, numbered
-/// because a chart orders its entities by name.
-pub const CHAIN_BYTES: [(&str, &str); 5] = [
-    ("1_sweep", "velo->reduce"),
-    ("2_voxels", "det->cloud"),
-    ("3_dets", "obj->sink"),
-    ("4_tracks", "track->state"),
-    ("5_answer", "state->sink"),
-];
+/// One link of the byte chain, a row of [`entity::BYTES_TABLE`].
+#[derive(Clone, Copy, Debug)]
+pub struct ChainLink {
+    /// What the link carries: `sweep`, `voxels`, ...
+    pub name: &'static str,
+    /// The edge into the next stage of the chain: its delivered
+    /// `payload_bytes` are what the link carried, and its `bytes_alloc`
+    /// what that stage allocated to read it.
+    pub edge: &'static str,
+    /// The producer row of the step that made it: its `bytes_alloc` is what
+    /// the step allocated to build it.
+    pub built_by: &'static str,
+    /// What that step does, for a reader who has not met the pipeline.
+    pub step: &'static str,
+}
 
-/// The allocated-over-carried chart's bars, as `(bar, edge)`, logged at
-/// `bytes/alloc_ratio/<bar>`. `velo` is the driver's own produced row: the
-/// one copy, where allocated equals carried. Every edge after it reads the
-/// driver's buffer in place, and `cam0->proc` allocates its grayscale
-/// output, a third of the frame.
-pub const ALLOC_RATIO: [(&str, &str); 6] = [
-    ("1_velo_driver", "velo"),
-    ("2_velo_to_cloud", "velo->cloud"),
-    ("3_velo_to_reduce", "velo->reduce"),
-    ("4_det_to_cloud", "det->cloud"),
-    ("5_obj_to_sink", "obj->sink"),
-    ("6_cam0_to_proc", "cam0->proc"),
+/// The byte chain, in chain order: the sweep, the voxels, the detections,
+/// the tracks, the answer, each as the next stage of the chain read it.
+pub const CHAIN_BYTES: [ChainLink; 5] = [
+    ChainLink {
+        name: "sweep",
+        edge: "velo->reduce",
+        built_by: "velo",
+        step: "lidar driver: file into Arrow, the one copy",
+    },
+    ChainLink {
+        name: "voxels",
+        edge: "det->detect",
+        built_by: "det",
+        step: "reduce: points into 20 cm cubes",
+    },
+    ChainLink {
+        name: "dets",
+        edge: "obj->track",
+        built_by: "obj",
+        step: "detect: cubes into boxes, ground removed",
+    },
+    ChainLink {
+        name: "tracks",
+        edge: "track->state",
+        built_by: "track",
+        step: "track: boxes into tracks, camera fused",
+    },
+    ChainLink {
+        name: "answer",
+        edge: "state->sink",
+        built_by: "state",
+        step: "state: one 68-byte record per track",
+    },
 ];
 
 /// The pipeline graph's nodes, as `(id, x, y)` in the graph's own units:
 /// the two sensors on the left, the admission, the camera stage above the
 /// lidar's two, the fusion, the answer's state, and the answer on the right.
 /// Fixed positions, every force off, so the picture is the same every sweep.
+/// The rows are 70 apart, not 40: the camera, the admission and the camera
+/// stage carry a second line saying what they do, and at 40 a two-line
+/// label met its diagonal neighbour's.
 pub const GRAPH_NODES: [(&str, f32, f32); 9] = [
-    ("cam0", 0.0, -40.0),
-    ("velo", 0.0, 40.0),
+    ("cam0", 0.0, -70.0),
+    ("velo", 0.0, 70.0),
     ("admit", 120.0, 0.0),
-    ("camera", 240.0, -40.0),
-    ("reduce", 240.0, 40.0),
-    ("detect", 360.0, 40.0),
+    ("camera", 240.0, -70.0),
+    ("reduce", 240.0, 70.0),
+    ("detect", 360.0, 70.0),
     ("track", 480.0, 0.0),
     ("state", 600.0, 0.0),
     ("answer", 720.0, 0.0),
@@ -273,29 +274,82 @@ pub const GRAPH_EDGES: [(&str, &str); 9] = [
     ("state", "answer"),
 ];
 
-/// The chain's stages in order, as `(bar, edge)`: a stage's bar is
-/// `proc_end - due` on the edge that stage reads, logged at
-/// `latency/stages/<bar>`. Numbered, because a chart orders its entities by
-/// name and the numbers are the chain's order.
-pub const STAGES: [(&str, &str); 5] = [
-    ("1_reduce", "velo->reduce"),
-    ("2_detect", "det->detect"),
-    ("3_track", "obj->track"),
-    ("4_state", "track->state"),
-    ("5_answer", "state->sink"),
+/// What times one of the pairing plot's ready dots.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StageClock {
+    /// `proc_end - due` on this edge's delivered row: the stage that reads
+    /// the edge finished with the sweep that long after the sweep was due.
+    Edge(&'static str),
+    /// The camera queue that feeds the answer ([`crate::record::Bounds`]'s
+    /// `camera_edge`): when its stage finished with the camera frame of the
+    /// sweep's number, against the SWEEP's due. The camera row's own `due`
+    /// is its frame's instant, mid-sweep, so that row alone cannot say it.
+    Camera,
+}
+
+/// One ready dot: when a stage finished with a sweep.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReadyDot {
+    /// Its leaf, under `pairing/` and under `after_sweep/`, and so its style.
+    pub leaf: &'static str,
+    pub clock: StageClock,
+    /// Whether the pairing plot draws it, or only the zoom on the sweep's
+    /// end.
+    pub overview: bool,
+}
+
+/// When the stages the pairing waits on finished with a sweep: the camera's
+/// half (its stage done with the frame of the sweep's number), the lidar's
+/// two stages, `reduce` and `detect`, and the answer (`state-sink` done).
+/// The pairing plot draws them in ms from the sweep's start, beside the
+/// camera frame's instant, and leaves out `reduce`, which is inside the
+/// lidar's half there; the zoom on the sweep's end draws all four in ms after
+/// the sweep ended. A camera dot above `detect`'s is a camera frame that was
+/// not ready when the lidar's boxes were, so the fusion waited for it or did
+/// without it. `track` and `state` finish within a millisecond of the
+/// answer, and are left out of both. Numbered in the order they are drawn,
+/// last on top, so the answer's gold sits over `detect`'s teal when the two
+/// coincide.
+pub const READY_DOTS: [ReadyDot; 4] = [
+    ReadyDot {
+        leaf: "1_camera_done",
+        clock: StageClock::Camera,
+        overview: true,
+    },
+    ReadyDot {
+        leaf: "2_reduce_done",
+        clock: StageClock::Edge("velo->reduce"),
+        overview: false,
+    },
+    ReadyDot {
+        leaf: "3_detect_done",
+        clock: StageClock::Edge("det->detect"),
+        overview: true,
+    },
+    ReadyDot {
+        leaf: "4_answer_done",
+        clock: StageClock::Edge("state->sink"),
+        overview: true,
+    },
 ];
 
-/// The Latency page's ratios, under `latency/headroom/`: the answer's age,
-/// the camera queue's frame age over its `cap x period + service` bound,
-/// the fusion's wait for the camera, and the lidar queue's age, each over
-/// its bound, and `at_bound`, the 1.0 they are read against.
-pub const HEADROOM_LEAVES: [&str; 5] = [
-    "answer",
-    "camera_queue",
-    "camera_wait",
-    "velo_to_reduce",
-    "at_bound",
-];
+/// The highest a ready dot is drawn on the pairing plot, in sweep periods
+/// from the sweep's start: a half or an answer later than that -- 1.5
+/// periods after the sweep ended -- is drawn here, on the plot's top edge,
+/// as "this late or later".
+pub const PAIRING_DONE_TOP: f64 = 2.5;
+
+/// The zoom on the sweep's end, in sweep periods after the sweep ended: the
+/// edges a ready dot is held at, from 0.15 of a period before the end -- a
+/// camera frame ready that early was ready in time -- to 0.25 after it,
+/// past the healthy run's answer at about a tenth. A dot outside is drawn at
+/// the edge, as "this early or earlier" or "this late or later"; the pairing
+/// plot above says how late.
+pub const SWEEP_END_ZOOM: (f64, f64) = (-0.15, 0.25);
+
+/// The zoom's reference line, `after_sweep/sweep_end`: the sweep's end, at
+/// 0. The pairing plot's own `sweep_end` leaf, and so its style.
+pub const SWEEP_END_LEAF: &str = "sweep_end";
 
 /// The answer's scalar leaves under `answer/`, as `state-sink` draws them:
 /// `ttc_s`, the flagged object's time to contact, logged only while it
@@ -331,40 +385,19 @@ pub const PAIRING_LEAVES: [&str; 4] = ["sweep_start", "sweep_end", "trigger", "c
 /// The leaf, and so the style, of [`entity::TRACKS_FUSED_FRACTION`].
 pub const FUSED_FRACTION_LEAF: &str = "fused_fraction";
 
+/// The leaf, and so the style, of [`entity::TRACKS_CAMERA_FUSED_FRACTION`].
+pub const CAMERA_FUSED_FRACTION_LEAF: &str = "camera_fused_fraction";
+
 /// The pairing's band, `pairing/window`: a grey `Measurements` of half the
 /// sweep's period with that half as its standard deviation, so it spans the
 /// range the camera frame should sit in.
 pub const PAIRING_BAND: &str = "window";
 
-/// Rerun entity paths use `/` as their separator, so an edge name like
-/// `cam0->proc` becomes `cam0_to_proc`.
-pub fn edge_path(edge: &str) -> String {
-    edge.replace("->", "_to_")
-}
-
-/// Where one edge's queue series hang: `queues/<edge>` for a real queue, and
-/// `queues/admission/<stream>` for a sensor driver's pseudo-edge, whose
-/// drops are frames the admission never saw.
-pub fn queue_root(edge: &str) -> String {
-    if edge.contains("->") {
-        format!("{}/{}", entity::QUEUES, edge_path(edge))
-    } else {
-        format!("{}/admission/{}", entity::QUEUES, edge_path(edge))
-    }
-}
-
-/// The camera queue's own series, under `queues/<camera edge>/`: the depth
-/// each push met and each pop left, the capacity they are read against, and
-/// a cross at the capacity for every frame the queue dropped. The camera
-/// queue is the experiment's independent variable, so it is the one queue
-/// drawn in items rather than as a fill.
-pub const CAMERA_QUEUE_LEAVES: [&str; 4] = ["depth_at_push", "depth", "cap", "drop_events"];
-
-/// The five sticky health lanes, as `lanes/<name>`: the pairing, then the
-/// queues in chain order -- the camera queue that feeds the answer
-/// (`cam0->camdet` with the detector, `cam0->proc` without), the lidar's
-/// (`velo->reduce`), the detector's (`det->detect`) and the fusion's two
-/// inputs (`cam_det->track` and `obj->track`) as one.
+/// The five sticky health lanes, as `lanes/<name>`, on the Fusion page: the
+/// pairing, then the queues in chain order -- the camera queue that feeds
+/// the answer (`cam0->camdet` with the detector, `cam0->proc` without), the
+/// lidar's (`velo->reduce`), the detector's (`det->detect`) and the fusion's
+/// two inputs (`cam_det->track` and `obj->track`) as one.
 pub const LANE_NAMES: [&str; 5] = [
     LANE_PAIRING_NAME,
     LANE_CAMERA_NAME,
@@ -406,23 +439,11 @@ pub fn queue_lane(edge: &str, camera_edge: Option<&str>) -> Option<&'static str>
     }
 }
 
-/// The admission's own two series, under `queues/admission/`: `run_length`,
-/// how many admissions in a row came from the same sensor driver -- a flat 1
-/// is strict alternation, the proof that two producers contend for one
-/// admission -- and `alternating`, the 1.0 line it is read against.
-pub const ADMISSION_RUN: [&str; 2] = ["run_length", "alternating"];
-
-/// Where the admission's own series hang.
-pub fn admission_root() -> String {
-    format!("{}/admission", entity::QUEUES)
-}
-
-/// Every entity a run whose answer is fed by `camera_edge` can log, as the
-/// tree the layout is checked against. The per-edge groups are generated
-/// from [`EDGES`], so a new edge is in the table the moment it is in the
-/// list.
+/// Every entity a run can log, as the tree the layout is checked against.
+/// The per-bar and per-leaf groups are generated from the lists the stages
+/// log by, so a new bar or leaf is in the table the moment it is in its list.
 #[cfg(test)]
-pub fn entities(camera_edge: &str) -> Vec<String> {
+pub fn entities() -> Vec<String> {
     let mut all: Vec<String> = [
         entity::CAMERA_ROOT,
         entity::LIDAR_ROOT,
@@ -434,38 +455,22 @@ pub fn entities(camera_edge: &str) -> Vec<String> {
         entity::CAMERA_DET,
         entity::ANSWER_HEADLINE,
         entity::TRACKS_FUSED_FRACTION,
+        entity::TRACKS_CAMERA_FUSED_FRACTION,
         entity::LIDAR_SWEEP,
         entity::LIDAR_VOXELS,
         entity::LIDAR_DETECTIONS,
         entity::LIDAR_TRACKS,
         entity::LIDAR_ANSWER,
-        entity::STORAGE_SHARED,
         entity::LOG_DROPS,
         entity::LOG_EVENTS,
+        entity::BYTES_TABLE,
+        entity::STAGE_TABLE,
+        entity::GRAPH_PIPELINE,
     ]
     .iter()
     .map(|s| s.to_string())
     .collect();
     all.push(format!("{}/line", entity::ANSWER));
-    // The bar charts: one entity per bar or series, from the lists the
-    // stages log by.
-    for (name, _) in CHAIN_BYTES {
-        all.push(format!("{}/{name}", entity::BYTES_CHAIN));
-    }
-    for (name, _) in ALLOC_RATIO {
-        all.push(format!("{}/{name}", entity::BYTES_ALLOC_RATIO));
-    }
-    all.push(entity::BYTES_TABLE.to_string());
-    all.push(entity::GRAPH_PIPELINE.to_string());
-    for (stage, _) in STAGES {
-        all.push(format!("{}/{stage}", entity::LATENCY_STAGES));
-    }
-    for leaf in HEADROOM_LEAVES {
-        all.push(format!("{}/{leaf}", entity::HEADROOM));
-    }
-    for leaf in ["cam_service", "period_band"] {
-        all.push(format!("{}/{leaf}", entity::LATENCY));
-    }
     // From the lists the stages log by, so the table cannot name a leaf the
     // stage does not log.
     for leaf in ANSWER_LEAVES {
@@ -474,29 +479,21 @@ pub fn entities(camera_edge: &str) -> Vec<String> {
     for leaf in TRACK_COUNT_LEAVES {
         all.push(format!("{}/{leaf}", entity::TRACKS_COUNT));
     }
-    for leaf in PAIRING_LEAVES.iter().chain([PAIRING_BAND].iter()) {
+    for leaf in PAIRING_LEAVES
+        .iter()
+        .chain([PAIRING_BAND].iter())
+        .chain(READY_DOTS.iter().filter(|d| d.overview).map(|d| &d.leaf))
+    {
         all.push(format!("{}/{leaf}", entity::PAIRING));
     }
-    for leaf in ["answer_age_ms", "period_ms"] {
-        all.push(format!("{}/{leaf}", entity::CHAIN_END));
+    for leaf in [SWEEP_END_LEAF]
+        .iter()
+        .chain(READY_DOTS.iter().map(|d| &d.leaf))
+    {
+        all.push(format!("{}/{leaf}", entity::AFTER_SWEEP));
     }
     for name in LANE_NAMES {
         all.push(lane_path(name));
-    }
-    for leaf in ADMISSION_RUN {
-        all.push(format!("{}/{leaf}", admission_root()));
-    }
-    for leaf in CAMERA_QUEUE_LEAVES {
-        all.push(format!("{}/{leaf}", queue_root(camera_edge)));
-    }
-    for edge in EDGES {
-        for leaf in ["fill", "drops"] {
-            all.push(format!("{}/{leaf}", queue_root(edge)));
-        }
-    }
-    for edge in ADMISSION_EDGES {
-        all.push(format!("{}/drops", queue_root(edge)));
-        all.push(format!("{}/{ABSENT_LEAF}", queue_root(edge)));
     }
     all
 }
@@ -624,12 +621,24 @@ fn solid_background() -> Background {
 }
 
 /// The pairing plot's y range, ms from the sweep's start: from 0.6 of a
-/// period below the band to 0.6 above it, so a stale frame a whole period
-/// early still lands inside the plot. From the run's own period, never from
-/// the healthy data; about one 10 Hz period when the run has none.
+/// period below the band, so a stale frame a whole period early still lands
+/// inside the plot, to a little over [`PAIRING_DONE_TOP`] periods above the
+/// sweep's start, so a ready dot held there is inside the plot and not on
+/// its border. From the run's own period, never from the healthy data;
+/// about one 10 Hz period when the run has none.
 fn pairing_range(bounds: &Bounds) -> (f64, f64) {
     let p = bounds.period_ms.unwrap_or(FALLBACK_PERIOD_MS);
-    (-0.6 * p, 1.6 * p)
+    (-0.6 * p, (PAIRING_DONE_TOP + 0.1) * p)
+}
+
+/// The zoom's y range, ms after the sweep ended: [`SWEEP_END_ZOOM`] and a
+/// hundredth of a period more at either end, so a dot held at an edge is
+/// inside the plot and not on its border. From the run's own period, like
+/// the pairing plot's.
+fn sweep_end_range(bounds: &Bounds) -> (f64, f64) {
+    let p = bounds.period_ms.unwrap_or(FALLBACK_PERIOD_MS);
+    let (lo, hi) = SWEEP_END_ZOOM;
+    ((lo - 0.01) * p, (hi + 0.01) * p)
 }
 
 /// The period an axis is scaled by when the run could not measure one: the
@@ -680,8 +689,6 @@ struct Frame<'a> {
     row_shares: &'a [f32],
     /// The child shown first, for tabs.
     active: Option<&'a str>,
-    /// Columns, for a grid.
-    grid_columns: Option<u32>,
 }
 
 impl<'a> Frame<'a> {
@@ -692,7 +699,6 @@ impl<'a> Frame<'a> {
             col_shares,
             row_shares: &[],
             active: None,
-            grid_columns: None,
         }
     }
 
@@ -703,7 +709,6 @@ impl<'a> Frame<'a> {
             col_shares: &[],
             row_shares,
             active: None,
-            grid_columns: None,
         }
     }
 
@@ -714,19 +719,6 @@ impl<'a> Frame<'a> {
             col_shares: &[],
             row_shares: &[],
             active: Some(active),
-            grid_columns: None,
-        }
-    }
-
-    /// A grid, filled row by row, `columns` wide.
-    fn grid(name: Option<&'a str>, columns: u32) -> Self {
-        Frame {
-            kind: ContainerKind::Grid,
-            name,
-            col_shares: &[],
-            row_shares: &[],
-            active: None,
-            grid_columns: Some(columns),
         }
     }
 }
@@ -800,9 +792,6 @@ impl Builder<'_> {
         if let Some(active) = frame.active {
             arch = arch.with_active_tab(ActiveTab::from(active));
         }
-        if let Some(columns) = frame.grid_columns {
-            arch = arch.with_grid_columns(columns);
-        }
         self.bp.log(path.clone(), &arch)?;
         self.layout.containers.push(path.clone());
         Ok(path)
@@ -820,14 +809,14 @@ impl Builder<'_> {
     /// A time-series plot: a y range, locked, from the run's own bounds --
     /// never from the healthy data, which would hide exactly the excursion
     /// an overloaded run makes -- or `None` to fit the data; the global time
-    /// axis; a legend in `legend` or none; and the window.
+    /// axis; no legend, because every plot names its colours in its title;
+    /// and the window.
     fn plot(
         &mut self,
         seed: &str,
         name: &str,
         contents: &[String],
         y: Option<(f64, f64)>,
-        legend: Option<Corner2D>,
     ) -> Result<String, RecordingStreamError> {
         let v = self.view(seed, "TimeSeries", name, "/", contents)?;
         if let Some((lo, hi)) = y {
@@ -842,13 +831,7 @@ impl Builder<'_> {
             "TimeAxis",
             &TimeAxis::new().with_link(LinkAxis::LinkToGlobal),
         )?;
-        self.prop(
-            &v,
-            "PlotLegend",
-            &PlotLegend::new()
-                .with_corner(legend.unwrap_or(Corner2D::RightTop))
-                .with_visible(legend.is_some()),
-        )?;
+        self.prop(&v, "PlotLegend", &PlotLegend::new().with_visible(false))?;
         self.prop(&v, "VisibleTimeRanges", &self.window())?;
         Ok(v)
     }
@@ -858,7 +841,7 @@ impl Builder<'_> {
     /// changes, so an eight-second window that began after the last change
     /// would show nothing at all. From a file, where the plots show the
     /// whole run too, its time axis is the plots' own, so the Fusion page's
-    /// lane between two plots stays under them when one is zoomed.
+    /// lanes stay over its plot when either is zoomed.
     fn lanes(
         &mut self,
         seed: &str,
@@ -915,15 +898,6 @@ impl Builder<'_> {
         Ok(v)
     }
 
-    /// A bar chart of every entity under `root`: one per bar or series, so
-    /// a hovered bar is named by its path. No legend: it would list those
-    /// paths over the tallest bars, and the title says what the bars are.
-    fn bars(&mut self, seed: &str, name: &str, root: &str) -> Result<String, RecordingStreamError> {
-        let v = self.view(seed, "BarChart", name, "/", &[q(&format!("{root}/**"))])?;
-        self.prop(&v, "PlotLegend", &PlotLegend::new().with_visible(false))?;
-        Ok(v)
-    }
-
     /// A 3D view of the lidar on the pictures' solid #101010, from the eye
     /// that fills the view with the scene: 7 m behind the sensor and 15 m
     /// up, looking at a point 22 m down the road and 4 m below it, so the
@@ -960,169 +934,19 @@ impl Builder<'_> {
     }
 }
 
-/// The Queues page: what every queue did, read against the bounds the run
-/// set.
-///
-/// On top, the five sticky health lanes over the whole run. Under them a
-/// 2x2 grid: every queue's fill (depth at push over capacity, 0 to 1 --
-/// the camera queue blue, the lidar's teal, the rest slate); the camera
-/// queue that feeds the answer in items, the depth each push met and each
-/// pop left against its capacity, a red cross at the capacity for every
-/// frame it dropped; every edge's cumulative drops, up to the run's frame
-/// count; and the admission's run length, a flat 1 when the two sensor
-/// drivers alternate. At the bottom, the WARN rows that name each drop's
-/// reason.
-fn queues_page(b: &mut Builder, bounds: &Bounds) -> Result<String, RecordingStreamError> {
-    // Five lanes are 40 px each (a 14 px label, a 22 px band, a gap) under
-    // a 20 px time axis and the title bar: 244 px, which 2.7 of 8.7 gives
-    // at 1600x900. At the spec's 1.8 the fourth lane was cut.
-    let health = b.lanes(
-        "queues-health",
-        "Health (sticky: ok / skipping or stale / dropping or expired)",
-        &LANE_NAMES.map(|n| q(&lane_path(n))),
-    )?;
-    let fill = b.plot(
-        "queues-fill",
-        "Fill: depth at push / cap",
-        &EDGES.map(|e| q(&format!("{}/fill", queue_root(e)))),
-        Some((-0.05, 1.1)),
-        None,
-    )?;
-    let camera_edge = bounds.camera_edge.unwrap_or("cam0->proc");
-    let cap = bounds.queue_cap.get(camera_edge).copied().unwrap_or(1.0);
-    let camera = b.plot(
-        "queues-camera",
-        &format!("{}, cap {cap:.0}", camera_edge.replace("->", " -> ")),
-        &CAMERA_QUEUE_LEAVES.map(|l| q(&format!("{}/{l}", queue_root(camera_edge)))),
-        Some(camera_queue_axis(cap)),
-        Some(Corner2D::LeftTop),
-    )?;
-    let drops: Vec<String> = EDGES
-        .iter()
-        .chain(ADMISSION_EDGES.iter())
-        .map(|e| q(&format!("{}/drops", queue_root(e))))
-        .chain(
-            ADMISSION_EDGES
-                .iter()
-                .map(|e| q(&format!("{}/{ABSENT_LEAF}", queue_root(e)))),
-        )
-        .collect();
-    let drops = b.plot(
-        "queues-drops",
-        "Drops, cumulative (grey: source gap, not a drop)",
-        &drops,
-        bounds.n_frames.map(|n| (0.0, n)),
-        None,
-    )?;
-    let run = b.plot(
-        "queues-admission",
-        "Admission run (1 = alternating)",
-        &ADMISSION_RUN.map(|l| q(&format!("{}/{l}", admission_root()))),
-        Some((0.0, 4.0)),
-        None,
-    )?;
-    let grid = b.container(
-        "queues-grid",
-        Frame::grid(None, 2),
-        &[fill, camera, drops, run],
-    )?;
-    let reasons = b.warnings("queues-log", "Drop reasons (WARN+)", &[q("log/**")])?;
-    b.container(
-        "queues",
-        Frame::vertical(Some("Queues"), &[2.7, 5.0, 1.0]),
-        &[health, grid, reasons],
-    )
-}
-
-/// Where the ratios of a time to its bound are drawn when they are this or
-/// more: an overloaded run's line sits flat at 2 ("twice the bound or
-/// more") instead of leaving the plot blank.
-pub const HEADROOM_TOP: f64 = 2.0;
-
-/// The ratio plots' y axis: 0 to a little past [`HEADROOM_TOP`], so a line
-/// held there is inside the plot and not on its border.
-const RATIO_AXIS: (f64, f64) = (0.0, 1.1 * HEADROOM_TOP);
-
-/// The y axis of the one ratio plot with a legend, Age / bound: high enough
-/// that the legend, in its top-left corner, sits over nothing. Its five rows
-/// cover the top 115 of the plot's 369 px at 1600x900, and at the spec's
-/// 0-to-2 they covered the overload run's answer, held at 2, for its first
-/// five seconds. At 3.1 the legend ends above 2.1.
-const RATIO_AXIS_UNDER_LEGEND: (f64, f64) = (0.0, 1.55 * HEADROOM_TOP);
-
-/// The camera queue plot's y axis for a queue of capacity `cap`: high enough
-/// that the legend, in its top-left corner, sits over nothing a queue can
-/// reach. Its four rows cover the top half of the plot at 1600x900 (95 of
-/// 190 px), and at `cap + 1` they hid the fill run's climb to its cap of 4.
-/// At `2.2 x cap + 1` the legend ends above the capacity line.
-fn camera_queue_axis(cap: f64) -> (f64, f64) {
-    (0.0, 2.2 * cap + 1.0)
-}
-
-/// The Latency page: a 2x2 grid of where the time goes, every measured time
-/// read against its bound.
-///
-/// Top left, every ratio of a time to its bound on one axis, held at 2 when
-/// it is 2 or more, so 1 is AT the bound on every line and the legend sits
-/// above them all: the answer's age over one period, the
-/// camera queue's frame age over `cap x period + service`, the fusion's
-/// wait for the camera and the lidar queue's age over one period. Top
-/// right, the answer's age in ms against one period drawn as a band, fitted
-/// to the data: an overloaded run's answer is several periods old, and a
-/// locked axis left that plot blank. Bottom left, the camera stage's
-/// service over one period, the detector's leading indicator: past 1 it
-/// cannot keep up with the camera. Bottom right, one bar per chain stage,
-/// ms after the sweep was due when that stage finished with it.
-fn latency_page(b: &mut Builder) -> Result<String, RecordingStreamError> {
-    let headroom = b.plot(
-        "latency-headroom",
-        "Age / bound (1 = at bound)",
-        &HEADROOM_LEAVES.map(|l| q(&format!("{}/{l}", entity::HEADROOM))),
-        Some(RATIO_AXIS_UNDER_LEGEND),
-        Some(Corner2D::LeftTop),
-    )?;
-    let age = b.plot(
-        "latency-answer",
-        "Answer age, ms (band = period)",
-        &[
-            q(&format!("{}/period_band", entity::LATENCY)),
-            q(&format!("{}/**", entity::CHAIN_END)),
-        ],
-        None,
-        None,
-    )?;
-    let service = b.plot(
-        "latency-service",
-        "Camera service / period",
-        &[
-            q(&format!("{}/cam_service", entity::LATENCY)),
-            q(&format!("{}/at_bound", entity::HEADROOM)),
-        ],
-        Some(RATIO_AXIS),
-        None,
-    )?;
-    let stages = b.bars(
-        "latency-stages",
-        "ms after sweep due, per stage",
-        entity::LATENCY_STAGES,
-    )?;
-    b.container(
-        "latency",
-        Frame::grid(Some("Latency"), 2),
-        &[headroom, age, service, stages],
-    )
-}
-
-/// The Bytes page: what each hop carries and what it cost.
+/// The Pipeline page: what each stage does, how long it took and what it
+/// hands on, under the pipeline's shape.
 ///
 /// On top, the pipeline as a graph, each node labelled with the bytes its
-/// stage hands on for the latest sweep. Under it the byte chain as a table,
-/// the medians of the run with the step between links and what each
-/// consumer allocated. Then two bar charts side by side: the chain in log10
-/// bytes (6 is a megabyte, 3 a kilobyte), coloured by producer, and
-/// allocated over carried per edge, where 0 is zero-copy. At the bottom, the
-/// lane that says whether every consumer read its producer's buffer.
-fn bytes_page(b: &mut Builder) -> Result<String, RecordingStreamError> {
+/// stage hands on for the latest sweep, and the three nodes the byte chain
+/// does not reach -- the camera, the admission and the camera stage -- with
+/// a second line saying what they do. Under it the byte chain, the lidar's
+/// data per sweep from the sweep to the answer: what each step does, what
+/// the link carried, what the step allocated to build it and what the next
+/// stage allocated to read it, 0 where it read in place. At the bottom every
+/// stage, the camera's and the lidar's, as a table: what it does, its median
+/// time per sample and what it hands on.
+fn pipeline_page(b: &mut Builder) -> Result<String, RecordingStreamError> {
     let graph = b.view(
         "bytes-graph",
         "Graph",
@@ -1130,12 +954,15 @@ fn bytes_page(b: &mut Builder) -> Result<String, RecordingStreamError> {
         &format!("/{}", entity::GRAPH_PIPELINE),
         &[q(entity::GRAPH_PIPELINE)],
     )?;
+    // Wide enough for the two-line labels at the left edge, whose second
+    // line runs about 80 units either side of a node at x = 0, and tall
+    // enough for the rows at +-70.
     b.prop(
         &graph,
         "VisualBounds2D",
         &VisualBounds2D::new(Range2D {
-            x_range: Range1D([-55.0, 780.0]),
-            y_range: Range1D([-58.0, 58.0]),
+            x_range: Range1D([-100.0, 820.0]),
+            y_range: Range1D([-95.0, 95.0]),
         }),
     )?;
     // Every force off: the nodes stay where they are put, the same every
@@ -1162,38 +989,24 @@ fn bytes_page(b: &mut Builder) -> Result<String, RecordingStreamError> {
         "ForceCenter",
         &ForceCenter::new().with_enabled(off()),
     )?;
-    let table = b.view(
+    let chain = b.view(
         "bytes-table",
         "TextDocument",
-        "Byte chain",
+        "Byte chain - the lidar's data per sweep, medians",
         "/",
         &[q(entity::BYTES_TABLE)],
     )?;
-    let chain = b.bars(
-        "bytes-chain",
-        "log10 bytes (6 = MB, 3 = kB)",
-        entity::BYTES_CHAIN,
-    )?;
-    let ratio = b.bars(
-        "bytes-alloc-ratio",
-        // "Allocated" was cut at "(0 = zero-" at 1600x900.
-        "Alloc / carried (0 = zero-copy)",
-        entity::BYTES_ALLOC_RATIO,
-    )?;
-    let charts = b.container(
-        "bytes-charts",
-        Frame::horizontal(&[1.0, 1.0]),
-        &[chain, ratio],
-    )?;
-    let shared = b.lanes(
-        "bytes-shared",
-        "Storage shared",
-        &[q(entity::STORAGE_SHARED)],
+    let stages = b.view(
+        "stage-table",
+        "TextDocument",
+        "Stages - what each does and how long it took, medians",
+        "/",
+        &[q(entity::STAGE_TABLE)],
     )?;
     b.container(
         "bytes",
-        Frame::vertical(Some("Bytes"), &[2.4, 2.8, 3.2, 0.9]),
-        &[graph, table, charts, shared],
+        Frame::vertical(Some("Pipeline"), &[2.2, 2.7, 3.1]),
+        &[graph, chain, stages],
     )
 }
 
@@ -1240,8 +1053,12 @@ fn camera_view(b: &mut Builder, bounds: &Bounds) -> Result<String, RecordingStre
 /// The Demo page: the three plots a first-time reader needs beside the
 /// pictures. The time to collision as points against the 3 s line; the
 /// pairing, the camera frame's instant as a point inside the sweep's window
-/// drawn as a grey band; and the tracks in the camera frame by population.
-/// No legends: the colours are named in the titles.
+/// drawn as a grey band, and on the same axis when the camera's half, the
+/// lidar's half and the answer were ready, which says whether the camera
+/// frame was ready when the lidar's boxes were; and those finishes zoomed
+/// onto the sweep's end, where the healthy run's all fall within a few
+/// milliseconds, with `reduce`'s among them. No legends: the titles say what
+/// the marks are, and the colours are the sensors' own.
 fn demo_page(b: &mut Builder, bounds: &Bounds) -> Result<String, RecordingStreamError> {
     let answer = |leaf: &str| q(&format!("{}/{leaf}", entity::ANSWER));
     let ttc = b.plot(
@@ -1249,72 +1066,65 @@ fn demo_page(b: &mut Builder, bounds: &Bounds) -> Result<String, RecordingStream
         "Time to collision (s) - grey: 3 s",
         &[answer("ttc_s"), answer("ttc_warn")],
         Some((0.0, TTC_TOP_S)),
-        None,
     )?;
     let pairing = b.plot(
         "demo-pairing",
-        "Pairing - camera instant (blue) inside the sweep window (grey band), ms",
+        "Pairing (ms from sweep start) - photo (dot); done: camera, detect, answer (diamonds)",
         &[q(&format!("{}/**", entity::PAIRING))],
         Some(pairing_range(bounds)),
-        None,
+    )?;
+    let zoom = b.plot(
+        "demo-sweep-end",
+        "Sweep's end, zoomed (ms after it) - done: camera, reduce, detect, answer",
+        &[q(&format!("{}/**", entity::AFTER_SWEEP))],
+        Some(sweep_end_range(bounds)),
+    )?;
+    b.container(
+        "demo",
+        Frame::vertical(Some("Demo"), &[2.6, 3.2, 2.6]),
+        &[ttc, pairing, zoom],
+    )
+}
+
+/// The Fusion page: whether the pipeline kept up, and what the fusion made
+/// of it, on one time axis. On top the five sticky health lanes over the
+/// whole run -- the pairing (stale or expired, the consequence at the
+/// fusion; grey where a sensor's source had no frame) over the queues in
+/// front of it (dropping or skipping) -- so a pairing that failed sits over
+/// the queue that failed it. Under them the tracks in the camera frame by
+/// population, and the fused share of each sensor's objects in the frame:
+/// of the lidar's tracks, the ones the camera confirmed, and of the
+/// camera's detections, the ones the lidar did -- what the answer lost.
+fn fusion_page(b: &mut Builder) -> Result<String, RecordingStreamError> {
+    // Five lanes are 40 px each (a 14 px label, a 22 px band, a gap) under
+    // a 20 px time axis and the title bar: 244 px, which 2.7 of 7.1 more
+    // than gives at 1600x900.
+    let health = b.lanes(
+        "fusion-outcome",
+        "Health - green ok, amber stale or skipping, red expired or dropping, grey gap",
+        &LANE_NAMES.map(|n| q(&lane_path(n))),
     )?;
     // Fitted to the data: the populations' sizes differ by a factor of ten,
     // and no bound the run sets says how many objects a street holds.
     let counts = b.plot(
-        "demo-counts",
+        "fusion-counts",
         "Tracks in frame by source - fused (green), lidar-only (teal), camera-only (blue)",
         &[q(&format!("{}/**", entity::TRACKS_COUNT))],
-        None,
-        None,
-    )?;
-    b.container(
-        "demo",
-        Frame::vertical(Some("Demo"), &[3.0, 3.0, 2.0]),
-        &[ttc, pairing, counts],
-    )
-}
-
-/// The Fusion page: the stale-camera run's causal chain, top to bottom on
-/// one time axis. The camera stage's service over one period (a detector
-/// slower than the camera is the cause); the pairing lane (stale or
-/// expired, the consequence at the fusion); the camera frame's instant
-/// against the sweep's window (a stale frame falls below the band); and the
-/// share of the lidar's in-frame tracks the camera confirmed (what the
-/// answer lost).
-fn fusion_page(b: &mut Builder, bounds: &Bounds) -> Result<String, RecordingStreamError> {
-    let service = b.plot(
-        "fusion-service",
-        "1  camera service / period",
-        &[
-            q(&format!("{}/cam_service", entity::LATENCY)),
-            q(&format!("{}/at_bound", entity::HEADROOM)),
-        ],
-        Some(RATIO_AXIS),
-        None,
-    )?;
-    let outcome = b.lanes(
-        "fusion-outcome",
-        "2  pairing outcome",
-        &[q(&lane_path(LANE_PAIRING_NAME))],
-    )?;
-    let window = b.plot(
-        "fusion-window",
-        "3  camera instant vs sweep window (ms)",
-        &[q(&format!("{}/**", entity::PAIRING))],
-        Some(pairing_range(bounds)),
         None,
     )?;
     let share = b.plot(
         "fusion-share",
-        "4  fused share of the lidar tracks in frame",
-        &[q(entity::TRACKS_FUSED_FRACTION)],
+        "Fused share - of the lidar tracks in frame (teal), of the camera's boxes (blue)",
+        &[
+            q(entity::TRACKS_FUSED_FRACTION),
+            q(entity::TRACKS_CAMERA_FUSED_FRACTION),
+        ],
         Some((0.0, 1.0)),
-        None,
     )?;
     b.container(
         "fusion",
-        Frame::vertical(Some("Fusion"), &[2.0, 1.0, 3.0, 2.0]),
-        &[service, outcome, window, share],
+        Frame::vertical(Some("Fusion"), &[2.7, 2.2, 2.2]),
+        &[health, counts, share],
     )
 }
 
@@ -1372,10 +1182,10 @@ fn log_page(b: &mut Builder) -> Result<String, RecordingStreamError> {
 /// Left column (13 of 21), what the chain says: the answer as a headline in
 /// large type; the camera picture, edge to edge; and under it the lidar,
 /// the voxels with the track wireframes and the gold answer, with the raw
-/// sweep on a second tab. Right column (8 of 21), six tabs: Demo, the three
+/// sweep on a second tab. Right column (8 of 21), four tabs: Demo, the three
 /// plots a first-time reader needs, shown first; then the auditor's pages,
-/// one full-height page each -- Queues, Latency, Fusion (the stale-camera
-/// causal chain), Bytes, and Log.
+/// one full-height page each -- Fusion (the health lanes and what the fusion
+/// confirmed), Pipeline (each stage's work, time and bytes), and Log.
 fn build(
     bp: &RecordingStream,
     mode: Mode,
@@ -1433,15 +1243,13 @@ fn build(
 
     // ---- right column: the demo and the auditor's pages -------------------
     let demo = demo_page(&mut b, bounds)?;
-    let queues = queues_page(&mut b, bounds)?;
-    let latency = latency_page(&mut b)?;
-    let fusion = fusion_page(&mut b, bounds)?;
-    let bytes = bytes_page(&mut b)?;
+    let fusion = fusion_page(&mut b)?;
+    let pipeline = pipeline_page(&mut b)?;
     let log = log_page(&mut b)?;
     let right = b.container(
         "right",
         Frame::tabs(None, &demo),
-        &[demo.clone(), queues, latency, fusion, bytes, log],
+        &[demo.clone(), fusion, pipeline, log],
     )?;
     let root = b.container("root", Frame::horizontal(&[13.0, 8.0]), &[left, right])?;
 
@@ -1514,24 +1322,7 @@ pub fn send_blueprint(
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use std::collections::BTreeMap;
-
     use super::*;
-
-    #[test]
-    fn edge_path_replaces_the_edge_arrow() {
-        assert_eq!(edge_path("cam0->proc"), "cam0_to_proc");
-        assert_eq!(edge_path("cam0->rerun"), "cam0_to_rerun");
-        assert_eq!(edge_path("cam0"), "cam0");
-    }
-
-    #[test]
-    fn queues_hang_under_queues_and_the_pseudo_edges_under_admission() {
-        assert_eq!(queue_root("cam0->proc"), "queues/cam0_to_proc");
-        assert_eq!(queue_root("cam0->rerun"), "queues/cam0_to_rerun");
-        assert_eq!(queue_root("cam0"), "queues/admission/cam0");
-        assert_eq!(queue_root("velo"), "queues/admission/velo");
-    }
 
     #[test]
     fn every_edge_is_named_once_and_nothing_hangs_under_pipes() {
@@ -1543,14 +1334,13 @@ mod tests {
             assert!(e.contains("->"), "{e} is not a queue");
         }
         // The two sensor drivers and nothing else: a derived stream's producer
-        // row cannot be Missing, so a drops series for it would be a flat
-        // zero.
+        // row cannot be Missing, so it can never say a frame is absent.
         assert_eq!(ADMISSION_EDGES, ["cam0", "velo"]);
         for e in ADMISSION_EDGES {
             assert!(!e.contains("->"), "{e} is a queue, not a driver");
             assert!(!EDGES.contains(&e));
         }
-        let all = entities("cam0->camdet");
+        let all = entities();
         let mut sorted = all.clone();
         sorted.sort();
         sorted.dedup();
@@ -1565,74 +1355,105 @@ mod tests {
     }
 
     #[test]
-    fn the_chart_edges_are_real_edges_in_chain_order() {
-        for (_, e) in CHAIN_BYTES.iter().chain(STAGES.iter()) {
-            assert!(EDGES.contains(e), "{e} is not a queue this binary opens");
-        }
-        // The sweep is read before the voxels, the voxels before the
-        // detections, and so on: the bars are the chain, left to right.
+    fn the_chart_and_table_edges_are_real_edges_in_chain_order() {
+        // The byte chain is read where the next stage of the chain reads it,
+        // and built where the step before made it: the sweep before the
+        // voxels, the voxels before the detections, and so on.
         let pos = |e: &str| EDGES.iter().position(|x| *x == e).unwrap();
+        for link in CHAIN_BYTES {
+            assert!(
+                EDGES.contains(&link.edge),
+                "{}: {} is not a queue this binary opens",
+                link.name,
+                link.edge
+            );
+            assert!(
+                !link.built_by.contains("->"),
+                "{}: {} is a queue, not the row of the step that built it",
+                link.name,
+                link.built_by
+            );
+            assert!(!link.step.is_empty(), "{} says nothing", link.name);
+        }
         for w in CHAIN_BYTES.windows(2) {
             assert!(
-                pos(w[0].1) < pos(w[1].1),
-                "{} is drawn after {}",
-                w[0].0,
-                w[1].0
+                pos(w[0].edge) < pos(w[1].edge),
+                "{} is read after {}",
+                w[0].name,
+                w[1].name
             );
         }
-        for w in STAGES.windows(2) {
-            assert!(
-                pos(w[0].1) < pos(w[1].1),
-                "{} is drawn after {}",
-                w[0].0,
-                w[1].0
-            );
-        }
-        // The allocation chart starts at the one copy and lists queues after.
-        assert_eq!(ALLOC_RATIO[0].1, "velo");
-        assert!(ADMISSION_EDGES.contains(&ALLOC_RATIO[0].1));
-        for (_, e) in &ALLOC_RATIO[1..] {
+        // The lidar driver's own row built the sweep: the chain's one copy.
+        assert_eq!(CHAIN_BYTES[0].built_by, "velo");
+        assert!(ADMISSION_EDGES.contains(&CHAIN_BYTES[0].built_by));
+        // The ready dots: the camera's half, the lidar's two stages --
+        // `detect` done is the lidar's half -- and the answer, the chain's
+        // end, each timed on a real edge. The pairing plot leaves `reduce`
+        // to the zoom.
+        assert_eq!(
+            READY_DOTS.map(|d| (d.clock, d.overview)),
+            [
+                (StageClock::Camera, true),
+                (StageClock::Edge("velo->reduce"), false),
+                (StageClock::Edge("det->detect"), true),
+                (StageClock::Edge("state->sink"), true),
+            ]
+        );
+        let edges: Vec<&str> = READY_DOTS
+            .iter()
+            .filter_map(|d| match d.clock {
+                StageClock::Edge(e) => Some(e),
+                StageClock::Camera => None,
+            })
+            .collect();
+        for e in &edges {
             assert!(EDGES.contains(e), "{e} is not a queue this binary opens");
+        }
+        for w in edges.windows(2) {
+            assert!(pos(w[0]) < pos(w[1]), "{} is drawn after {}", w[0], w[1]);
         }
     }
 
     #[test]
-    fn every_bar_has_a_numbered_name_of_its_own() {
-        // A bar chart's bars carry no label, so each is its own entity and
-        // the viewer names it on hover and orders it by name: each name is
-        // its place in the chart, from 1, then what it is.
-        for names in [
-            CHAIN_BYTES.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
-            STAGES.iter().map(|(n, _)| *n).collect(),
-            ALLOC_RATIO.iter().map(|(n, _)| *n).collect(),
-        ] {
-            for (i, n) in names.iter().enumerate() {
-                let (num, word) = n.split_once('_').unwrap();
-                assert_eq!(num, (i + 1).to_string(), "{n}");
-                assert!(
-                    !word.is_empty()
-                        && word
-                            .chars()
-                            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'),
-                    "{n:?}"
-                );
-            }
+    fn every_ready_dot_is_numbered_in_the_order_it_is_drawn() {
+        // The viewer draws a plot's series in entity order, the last on top:
+        // each leaf is its place, from 1, then what it is, and none is a
+        // leaf the pairing already has.
+        for (i, d) in READY_DOTS.iter().enumerate() {
+            let n = d.leaf;
+            let (num, word) = n.split_once('_').unwrap();
+            assert_eq!(num, (i + 1).to_string(), "{n}");
+            assert!(
+                word.ends_with("_done")
+                    && word
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'),
+                "{n:?}"
+            );
+            assert!(!PAIRING_LEAVES.contains(&n) && n != PAIRING_BAND, "{n}");
         }
-        // The allocation bars are named by their edge's recording path.
-        for (n, e) in &ALLOC_RATIO[1..] {
-            assert!(n.ends_with(&edge_path(e)), "{n} is not {e}");
+        // Every one is in the entity table under the zoom, and the pairing
+        // plot's under the pairing too; each plot shows its root.
+        let all = entities();
+        for d in READY_DOTS {
+            assert!(all.contains(&format!("{}/{}", entity::AFTER_SWEEP, d.leaf)));
+            assert_eq!(
+                all.contains(&format!("{}/{}", entity::PAIRING, d.leaf)),
+                d.overview,
+                "{}",
+                d.leaf
+            );
         }
-        // And every name is in the entity table, under its chart.
-        let all = entities("cam0->camdet");
-        for (n, _) in CHAIN_BYTES {
-            assert!(all.contains(&format!("{}/{n}", entity::BYTES_CHAIN)));
-        }
-        for (n, _) in STAGES {
-            assert!(all.contains(&format!("{}/{n}", entity::LATENCY_STAGES)));
-        }
-        for (n, _) in ALLOC_RATIO {
-            assert!(all.contains(&format!("{}/{n}", entity::BYTES_ALLOC_RATIO)));
-        }
+        // A dot held at an edge is inside its plot: over the band on the
+        // pairing plot, and either side of the sweep's end on the zoom.
+        let (lo, hi) = pairing_range(&bounds());
+        assert!(lo < 0.0 && PAIRING_DONE_TOP * 103.3 < hi, "{lo} {hi}");
+        let (lo, hi) = sweep_end_range(&bounds());
+        let (early, late) = SWEEP_END_ZOOM;
+        assert!(lo < early * 103.3 && early < 0.0 && 0.0 < late && late * 103.3 < hi);
+        // The zoom's line is the pairing plot's `sweep_end`, so it is styled
+        // as the same reference.
+        assert!(PAIRING_LEAVES.contains(&SWEEP_END_LEAF));
     }
 
     #[test]
@@ -1682,27 +1503,12 @@ mod tests {
 
     fn bounds() -> Bounds {
         Bounds {
-            age_queue_ms: BTreeMap::from([("cam0->proc", 413.2), ("cam0->rerun", 103.3)]),
-            queue_cap: BTreeMap::from([
-                ("cam0->proc", 4.0),
-                ("cam0->rerun", 1.0),
-                ("cam0->camdet", 1.0),
-                ("velo->cloud", 2.0),
-                ("velo->reduce", 2.0),
-                ("det->cloud", 4.0),
-                ("det->detect", 4.0),
-                ("obj->sink", 4.0),
-                ("obj->track", 4.0),
-                ("cam_det->track", 64.0),
-                ("track->state", 4.0),
-                ("state->sink", 4.0),
-            ]),
             image_wh: Some((1242.0, 375.0)),
             lidar_lane: true,
             answer: true,
             period_ms: Some(103.3),
             camera_edge: Some("cam0->camdet"),
-            n_frames: Some(154.0),
+            camera_delay_ms: 0,
             rate: Some(1.0),
         }
     }
@@ -1720,7 +1526,7 @@ mod tests {
     fn dashboard_paths_exist() {
         // Every path a view shows is an entity the run logs, or a prefix of
         // one: the tree is the layout, and a view of nothing is a blank tab.
-        let all = entities("cam0->camdet");
+        let all = entities();
         let l = layout(Mode::File);
         assert!(!l.views.is_empty());
         for v in &l.views {
@@ -1744,45 +1550,17 @@ mod tests {
         // The other half of `dashboard_paths_exist`: every entity in the
         // table is shown by some view, directly or under a `/**`. v1 logged
         // 31 entities no view showed; a series nobody can see is a cost with
-        // no reader. Checked for both camera queues a run can feed the
-        // answer from. The two annotation contexts are the exception: they
-        // are not drawn, they name the classes of what is. The table is kept
-        // by hand; what a run actually logs is checked against the layout by
+        // no reader. The two annotation contexts are the exception: they are
+        // not drawn, they name the classes of what is. The table is kept by
+        // hand; what a run actually logs is checked against the layout by
         // `record::tests::every_series_the_dashboard_logs_is_styled_and_in_a_view`
         // (the recorder's mirror) and `tests/dashboard.rs` (a whole run).
-        for camera_edge in ["cam0->camdet", "cam0->proc"] {
-            let (bp, _storage) = RecordingStreamBuilder::new("pipes-test")
-                .blueprint()
-                .memory()
-                .unwrap();
-            bp.set_time_sequence("blueprint", 0);
-            let l = build(
-                &bp,
-                Mode::File,
-                &Bounds {
-                    camera_edge: Some(camera_edge),
-                    ..bounds()
-                },
-            )
-            .unwrap();
-            let shown: Vec<&str> = l
-                .views
-                .iter()
-                .flat_map(|v| v.contents.iter())
-                .map(|c| c.strip_prefix("+ /").unwrap())
-                .collect();
-            for e in entities(camera_edge) {
-                if e == entity::CAMERA_ROOT || e == entity::LIDAR_ROOT {
-                    continue;
-                }
-                assert!(
-                    shown.iter().any(|c| match c.strip_suffix("/**") {
-                        Some(prefix) => e == prefix || e.starts_with(&format!("{prefix}/")),
-                        None => e == *c,
-                    }),
-                    "{e} is logged ({camera_edge}) but no view shows it"
-                );
+        let l = layout(Mode::File);
+        for e in entities() {
+            if e == entity::CAMERA_ROOT || e == entity::LIDAR_ROOT {
+                continue;
             }
+            assert!(l.shows(&e), "{e} is logged but no view shows it");
         }
     }
 
@@ -1797,18 +1575,33 @@ mod tests {
             "Lidar - voxels, tracks",
             "Raw sweep",
             "Time to collision (s) - grey: 3 s",
-            "Pairing - camera instant (blue) inside the sweep window (grey band), ms",
-            "Health (sticky: ok / skipping or stale / dropping or expired)",
-            "Age / bound (1 = at bound)",
-            "4  fused share of the lidar tracks in frame",
+            "Pairing (ms from sweep start) - photo (dot); done: camera, detect, answer (diamonds)",
+            "Sweep's end, zoomed (ms after it) - done: camera, reduce, detect, answer",
+            "Tracks in frame by source - fused (green), lidar-only (teal), camera-only (blue)",
+            "Health - green ok, amber stale or skipping, red expired or dropping, grey gap",
+            "Fused share - of the lidar tracks in frame (teal), of the camera's boxes (blue)",
             "Pipeline - bytes carried per hop (this sweep)",
+            "Byte chain - the lidar's data per sweep, medians",
+            "Stages - what each does and how long it took, medians",
             "Answer - one line per sweep (auditor)",
         ] {
             assert!(names.contains(&want), "no view named {want:?} in {names:?}");
         }
+        // The pages that were cut stay cut: no queue plots, no ratios over a
+        // bound, no bar charts and no storage lane.
+        for gone in [
+            "Fill: depth at push / cap",
+            "Age / bound (1 = at bound)",
+            "Camera service / period",
+            "Alloc / carried (0 = zero-copy)",
+            "Storage shared",
+        ] {
+            assert!(!names.contains(&gone), "{gone:?} is back");
+        }
+        assert!(!l.views.iter().any(|v| v.class == "BarChart"));
         // The first screen is six views: the headline, the camera, the
-        // lidar, and the Demo tab's three plots, which is the right
-        // column's first tab.
+        // lidar, and the Demo tab's three plots, which is the right column's
+        // first tab.
         let demo: Vec<&ViewSpec> = l
             .views
             .iter()
@@ -1817,7 +1610,7 @@ mod tests {
         assert_eq!(demo.len(), 1);
         // No tab is named after an entity path, and every class is one the
         // viewer has.
-        let all = entities("cam0->camdet");
+        let all = entities();
         for v in &l.views {
             assert!(
                 !v.name.contains("_to_")
@@ -1869,21 +1662,53 @@ mod tests {
     }
 
     #[test]
-    fn a_legend_sits_above_everything_its_plot_can_draw() {
-        // The share of each plot's height its legend covers from the top,
-        // measured at 1600x900: five rows on Age / bound, four on the
-        // camera queue's.
-        let covered = |hi: f64, share: f64| hi * (1.0 - share);
-        // The ratios are held at HEADROOM_TOP, so nothing is drawn above it.
-        let (lo, hi) = RATIO_AXIS_UNDER_LEGEND;
-        assert_eq!(lo, 0.0);
-        assert!(HEADROOM_TOP < covered(hi, 115.0 / 369.0), "{hi}");
-        // A queue's depth never passes its capacity.
-        for cap in [1.0, 2.0, 4.0, 16.0, 64.0] {
-            let (lo, hi) = camera_queue_axis(cap);
-            assert_eq!(lo, 0.0);
-            assert!(cap < covered(hi, 95.0 / 190.0), "cap {cap}: {hi}");
+    fn the_pairing_plot_and_the_health_lanes_are_one_view_each() {
+        let l = layout(Mode::File);
+        // One pairing plot, the Demo page's, with the ready dots under the
+        // same root as the window and the frame; and one zoom on the sweep's
+        // end, with its own root.
+        for root in [entity::PAIRING, entity::AFTER_SWEEP] {
+            let plots: Vec<&ViewSpec> = l
+                .views
+                .iter()
+                .filter(|v| {
+                    v.contents
+                        .iter()
+                        .any(|c| c.starts_with(&format!("+ /{root}")))
+                })
+                .collect();
+            assert_eq!(plots.len(), 1, "{root}: {plots:?}");
+            assert_eq!(plots[0].contents, [format!("+ /{root}/**")]);
+            assert_eq!(plots[0].class, "TimeSeries");
         }
+        // One share plot, both sensors' shares on it.
+        let shares: Vec<&ViewSpec> = l
+            .views
+            .iter()
+            .filter(|v| v.contents.iter().any(|c| c.starts_with("+ /tracks/")))
+            .filter(|v| !v.contents.iter().any(|c| c.contains("count")))
+            .collect();
+        assert_eq!(shares.len(), 1, "{shares:?}");
+        assert_eq!(
+            shares[0].contents,
+            [
+                q(entity::TRACKS_FUSED_FRACTION),
+                q(entity::TRACKS_CAMERA_FUSED_FRACTION)
+            ]
+        );
+        // One lane view, the Fusion page's, with every lane in chain order:
+        // the pairing on top, over the queues in front of it.
+        let lanes: Vec<&ViewSpec> = l
+            .views
+            .iter()
+            .filter(|v| v.class == "StateTimeline")
+            .collect();
+        assert_eq!(lanes.len(), 1, "{lanes:?}");
+        assert_eq!(
+            lanes[0].contents,
+            LANE_NAMES.map(|n| q(&lane_path(n))).to_vec()
+        );
+        assert_eq!(LANE_NAMES[0], LANE_PAIRING_NAME);
     }
 
     #[test]
@@ -1940,38 +1765,5 @@ mod tests {
                 assert_eq!(linked, want, "{mode:?}: {} ({})", v.name, v.class);
             }
         }
-    }
-
-    #[test]
-    fn the_camera_queue_plot_is_the_one_that_feeds_the_answer_at_this_run_s_cap() {
-        let l = layout(Mode::File);
-        let names: Vec<&str> = l.views.iter().map(|v| v.name.as_str()).collect();
-        assert!(names.contains(&"cam0 -> camdet, cap 1"), "{names:?}");
-        // Its series are that queue's, and it is scaled to that cap.
-        let v = l
-            .views
-            .iter()
-            .find(|v| v.name.starts_with("cam0 -> "))
-            .unwrap();
-        for leaf in CAMERA_QUEUE_LEAVES {
-            assert!(
-                v.contents
-                    .contains(&format!("+ /queues/cam0_to_camdet/{leaf}")),
-                "{:?}",
-                v.contents
-            );
-        }
-        // Without the detector the same plot follows proc's queue.
-        let (bp, _storage) = RecordingStreamBuilder::new("pipes-test")
-            .blueprint()
-            .memory()
-            .unwrap();
-        bp.set_time_sequence("blueprint", 0);
-        let off = Bounds {
-            camera_edge: Some("cam0->proc"),
-            ..bounds()
-        };
-        let l = build(&bp, Mode::File, &off).unwrap();
-        assert!(l.views.iter().any(|v| v.name == "cam0 -> proc, cap 4"));
     }
 }

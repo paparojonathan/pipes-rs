@@ -62,8 +62,7 @@ but neither project depends on the other.
 This branch builds the first working slice of that pipeline. It replays a recorded
 KITTI drive, camera and lidar together, through Pipes in real time, fuses the two
 into an answer about the objects around the car at every lidar sweep, and records
-what happened to every sample on the way. What we found on drive 0009, sweep by
-sweep, is in the [Sprint 1 findings](https://claude.ai/artifact/3p5HVyjUMuV8PATy3pdqpF).
+what happened to every sample on the way. 
 
 ## Setup
 
@@ -350,12 +349,12 @@ repeat, that a stale camera changes only the camera half of each track, that slo
 the detector expires exactly the frames it lost, that drive 0009 records frames
 177–180 as absent, and that the reported distances match the raw lidar points on most
 sweeps. Before `fetch`, `docker compose run --rm test --` skips those ten and runs
-the other 388.
+the other 384.
 
 ## The dashboard
 
 The window opens straight into a fixed layout: what the pipeline concluded on the
-left, and six tabs on the right that show how.
+left, and four tabs on the right that show how.
 
 At the top left is the answer as a headline: the nearest object in the car's path,
 with its class if the camera saw it, its distance, its time to contact, and how old
@@ -368,12 +367,27 @@ the image, and a sweep with no answer puts the reason in the headline, such as
 
 | Tab | What it shows |
 |---|---|
-| Demo | Time to contact, each camera instant inside its sweep's window, and the tracks in frame by source. |
-| Queues | A health lane per queue and for the pairing (green ok, amber skipping or stale, red dropping or expired, grey for a source gap), how full each queue is, and each drop with its reason. |
-| Latency | Each measured time against its budget, such as the answer's age, the fusion's wait and the detector's time per frame. |
-| Fusion | A stale camera from cause to effect: detector time, pairing outcome, the camera instant against the sweep's window, and the share of lidar tracks in frame that the camera confirmed. |
-| Bytes | The pipeline as a graph with each hop's bytes, the byte chain as a table, allocated over carried bytes per edge (0 is zero-copy), and whether each stage read its producer's buffer. |
+| Demo | Time to contact; the pairing, each camera instant inside its sweep's window beside when the camera's half, the lidar's half and the answer were ready; and a zoom onto the sweep's end with the same finishes and `reduce`'s, in ms after the sweep ended. |
+| Fusion | A health lane for the pairing and for each queue in front of it (green ok, amber stale or skipping, red expired or dropping, grey for a source gap); the tracks in frame by source; and the fused share of each sensor's objects in frame: the lidar tracks the camera confirmed, and the camera's boxes the lidar confirmed. |
+| Pipeline | The pipeline as a graph with each hop's bytes; the byte chain, with what each step does, what it built and what reading it cost (0 is zero-copy); and every stage with what it does, its median time and what it hands on. |
 | Log | Every warning, such as a drop and its reason, above the answer as one line per sweep. |
+
+On the Demo tab's pairing plot, in ms from the sweep's start, the grey band is the
+lidar's sweep, about 103 ms, and the blue dot is the instant of the camera frame paired
+with it. The diamonds are when each half and the answer were done: blue for the
+camera's detections, teal for `detect`, the lidar's last stage, gold for the answer.
+In the healthy run the camera's result is ready about 4 ms before the sweep ends and
+the lidar's boxes about 9 ms after, so the blue diamond sits below the teal one. A
+blue diamond above the teal one is a camera frame the fusion had to wait for or do
+without: with `--consumer-delay-ms 50` it comes about 46 ms after the sweep ends,
+which is what the stale camera and "why the fusion waits" experiments show. Anything
+more than 1.5 sweeps late is drawn on the plot's top edge.
+
+The plot under it zooms onto the sweep's end, in ms after the sweep ended, with the
+end itself as a line at 0 and `reduce`, the lidar's first stage, in a lighter teal. In
+the healthy run the camera is done about 4 ms before the end, `reduce` about 4 ms
+after it, `detect` about 9 ms after, and the answer half a millisecond after that. A
+finish outside the zoom, 15 ms before the end to 26 ms after it, is drawn on its edge.
 
 ## Output
 
