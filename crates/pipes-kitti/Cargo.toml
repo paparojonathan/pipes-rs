@@ -1,0 +1,34 @@
+[package]
+name = "pipes-kitti"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "KITTI dataset driver for Pipes: timestamps parser, paced PNG camera replayer and Arrow frame builder."
+publish = false
+repository = "https://github.com/EthanMBoos/pipes-rs"
+
+[features]
+# Compiles `pipes_kitti::testing` (the synthetic drive) into a normal build so
+# other crates' tests can use it. Off by default: a plain `cargo build`
+# contains none of it.
+testing = ["dep:tempfile"]
+
+[dependencies]
+arrow.workspace = true
+chrono.workspace = true
+image.workspace = true
+pipes-core.workspace = true
+tract-onnx.workspace = true
+sha2.workspace = true
+# Optional, and enabled by `testing`, because a downstream crate that turns the
+# feature on does NOT get this crate's dev-dependencies -- `testing.rs` would
+# then fail to build for `pipes`.
+tempfile = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile.workspace = true
+# Self dev-dependency: `tests/*.rs` link the ordinary lib, where `cfg(test)` is
+# false, so without this `cargo test -p pipes-kitti` cannot see
+# `pipes_kitti::testing` at all. It resolves to this same package.
+pipes-kitti = { workspace = true, features = ["testing"] }

@@ -1,0 +1,42 @@
+[workspace]
+resolver = "2"
+members = ["crates/pipes-core", "crates/pipes-kitti", "crates/pipes"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.96"
+# MIT, per the repository owner. Covers the three crates, which are entirely
+# this branch's work; see LICENSE for what it does and does not reach.
+# `publish = false` on every crate still keeps this off crates.io.
+license = "MIT"
+
+[workspace.dependencies]
+arrow = "58.4"
+rerun = "0.38.1"
+chrono = "0.4.45"
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+csv = "1.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive", "env"] }
+# Dev-only: the integration tests build synthetic KITTI drives in temp dirs
+# and run the binary with its CWD inside one. Never reaches the shipped binary.
+tempfile = "3"
+# The frozen camera detector's runtime: pure Rust, builds from source with
+# --locked. Single-threaded, and so run-to-run deterministic: nothing in this
+# workspace enables tract-linalg's `multithread-mm`, the one feature that would
+# give it a thread pool (`cargo tree -e features -i tract-linalg`).
+# `default-features = false` drops tract-transformers, which ONNX CNNs do not
+# need. Pinned exactly: a different runtime version is a different model.
+tract-onnx = { version = "=0.23.8", default-features = false }
+# The model file's sha256, checked at load: "frozen" is a claim about bytes.
+sha2 = "0.10"
+pipes-core = { path = "crates/pipes-core" }
+pipes-kitti = { path = "crates/pipes-kitti" }
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+debug = 1

@@ -1,0 +1,28 @@
+[package]
+name = "pipes"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Single-stream zero-copy sensor pipeline: paced replay, bounded queues, evidence rows and a live Rerun dashboard."
+publish = false
+repository = "https://github.com/EthanMBoos/pipes-rs"
+
+[[bin]]
+name = "pipes"
+path = "src/main.rs"
+
+[dependencies]
+arrow.workspace = true
+rerun.workspace = true
+clap.workspace = true
+csv.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+pipes-core.workspace = true
+pipes-kitti.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+# The integration tests drive the real binary against a synthetic KITTI drive.
+pipes-kitti = { workspace = true, features = ["testing"] }

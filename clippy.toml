@@ -1,0 +1,8 @@
+disallowed-methods = [
+  { path = "std::time::Instant::now", reason = "clocks are read only in pipes_core::clock" },
+  { path = "std::time::SystemTime::now", reason = "clocks are read only in pipes_core::clock" },
+]
+disallowed-types = [
+  { path = "std::collections::HashMap", reason = "nondeterministic iteration; use BTreeMap" },
+  { path = "std::collections::HashSet", reason = "nondeterministic iteration; use BTreeSet" },
+]
