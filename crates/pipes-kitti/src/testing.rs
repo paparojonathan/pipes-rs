@@ -79,11 +79,25 @@ pub fn write_fixture_at(
     n_frames: usize,
     period_ns: i64,
 ) -> std::io::Result<()> {
+    write_camera_fixture_at(root, date, drive, "image_02", n_frames, period_ns)
+}
+
+/// [`write_fixture_at`] for either camera's directory: `image_02` is the
+/// left camera, `image_03` the right, with the same frames and timestamps,
+/// as KITTI's two colour cameras have.
+pub fn write_camera_fixture_at(
+    root: &Path,
+    date: &str,
+    drive: &str,
+    image: &str,
+    n_frames: usize,
+    period_ns: i64,
+) -> std::io::Result<()> {
     debug_assert!(
         n_frames as i64 * period_ns < 60_000_000_000,
         "fixture_timestamp_line hard-codes 00:00, so the drive must stay inside the first minute"
     );
-    let image_dir = root.join(date).join(drive).join("image_02");
+    let image_dir = root.join(date).join(drive).join(image);
     let data_dir = image_dir.join("data");
     std::fs::create_dir_all(&data_dir)?;
     for i in 0..n_frames {
@@ -216,7 +230,11 @@ pub fn write_calib_fixture_at(root: &Path, date: &str, w: u32, h: u32) -> std::i
              S_rect_02: {w:e} {h:e}\n\
              P_rect_02: 7.215377e+02 0.000000e+00 6.095593e+02 4.485728e+01 0.000000e+00 \
              7.215377e+02 1.728540e+02 2.163791e-01 0.000000e+00 0.000000e+00 1.000000e+00 \
-             2.745884e-03\n",
+             2.745884e-03\n\
+             S_rect_03: {w:e} {h:e}\n\
+             P_rect_03: 7.215377e+02 0.000000e+00 6.095593e+02 -3.395242e+02 0.000000e+00 \
+             7.215377e+02 1.728540e+02 2.199936e+00 0.000000e+00 0.000000e+00 1.000000e+00 \
+             2.729905e-03\n",
             w = f64::from(w),
             h = f64::from(h)
         ),
@@ -334,6 +352,55 @@ fn write_velo_frames_at(
         lines(&|t| t + period_ns),
     )?;
     Ok(())
+}
+
+/// Writes `<root>/<date>/<drive>/oxts/{data/{i:010}.txt, timestamps.txt}`:
+/// one 30-field row per frame of `0..n_frames` not in `absent`, laid out
+/// the way KITTI lays out a gap (a blank line, no file), stamped two thirds
+/// of a period after the frame's instant -- after the lidar's trigger and
+/// before the sweep ends, where drive 0005's rows fall.
+///
+/// `motion(i)` gives frame `i`'s `(vf, vl, yaw_rate)`: forward and leftward
+/// speed in m/s and the yaw rate in rad/s, written to fields 8, 9 and 22
+/// (and 19, the earth-frame yaw rate, the same number on a level drive).
+/// Every other field is 0 but the five status words, which are drive
+/// 0005's.
+pub fn write_oxts_fixture_at(
+    root: &Path,
+    date: &str,
+    drive: &str,
+    n_frames: usize,
+    absent: &[usize],
+    period_ns: i64,
+    motion: &dyn Fn(usize) -> (f64, f64, f64),
+) -> std::io::Result<()> {
+    let oxts_dir = root.join(date).join(drive).join("oxts");
+    let data_dir = oxts_dir.join("data");
+    std::fs::create_dir_all(&data_dir)?;
+    let mut text = String::new();
+    for i in 0..n_frames {
+        if absent.contains(&i) {
+            text.push('\n');
+            continue;
+        }
+        let (vf, vl, yaw) = motion(i);
+        let mut row = [0.0f64; 30];
+        row[8] = vf;
+        row[9] = vl;
+        row[19] = yaw;
+        row[22] = yaw;
+        row[25] = 4.0;
+        row[26] = 10.0;
+        row[27] = 4.0;
+        row[28] = 4.0;
+        let line: Vec<String> = row.iter().map(|v| format!("{v}")).collect();
+        std::fs::write(data_dir.join(format!("{i:010}.txt")), line.join(" ") + "\n")?;
+        text.push_str(&fixture_timestamp_line_ns(
+            i as i64 * period_ns + period_ns * 2 / 3,
+        ));
+        text.push('\n');
+    }
+    std::fs::write(oxts_dir.join("timestamps.txt"), text)
 }
 
 /// A fixture drive in a [`TempDir`] that deletes itself on drop.
@@ -457,6 +524,50 @@ impl FixtureDrive {
     /// case a test asserts rather than a gap.
     pub fn write_calib(&self) -> std::io::Result<()> {
         write_calib_fixture_at(self.root(), FIXTURE_DATE, FIXTURE_W, FIXTURE_H)
+    }
+
+    /// Adds `oxts/` to this drive: a row for every frame of the drive not in
+    /// `absent`, with `motion(i)` as frame `i`'s `(vf, vl, yaw_rate)`. See
+    /// [`write_oxts_fixture_at`]. The camera-only and camera-plus-lidar
+    /// constructors stay without one, deliberately: a drive with no GPS/IMU
+    /// has to stay the common, tested case.
+    pub fn write_oxts(
+        &self,
+        absent: &[usize],
+        motion: impl Fn(usize) -> (f64, f64, f64),
+    ) -> std::io::Result<()> {
+        write_oxts_fixture_at(
+            self.root(),
+            FIXTURE_DATE,
+            FIXTURE_DRIVE,
+            self.n_frames.max(self.n_sweeps),
+            absent,
+            self.period_ns,
+            &motion,
+        )
+    }
+
+    /// Adds `image_03/` to this drive: the right camera, with the left's
+    /// frames and timestamps. The default constructors stay without one, as
+    /// they stay without a lidar: a left-camera-only download is the common
+    /// case and must stay the tested one.
+    pub fn write_right_camera(&self) -> std::io::Result<()> {
+        write_camera_fixture_at(
+            self.root(),
+            FIXTURE_DATE,
+            FIXTURE_DRIVE,
+            "image_03",
+            self.n_frames,
+            self.period_ns,
+        )
+    }
+
+    /// `<root>/<date>/<drive>/oxts`, whether or not it exists.
+    pub fn oxts_dir(&self) -> PathBuf {
+        self.root()
+            .join(FIXTURE_DATE)
+            .join(FIXTURE_DRIVE)
+            .join("oxts")
     }
 
     /// `<root>/<date>/<drive>/velodyne_points`, whether or not it exists.

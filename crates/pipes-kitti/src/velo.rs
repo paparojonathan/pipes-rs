@@ -468,7 +468,7 @@ impl std::fmt::Display for VeloError {
                 // this line called `off` the default and told the reader to
                 // pass it, which is advice to set a flag they have not set.
                 f.write_str(
-                    "Run `cargo run --release -- drives` to see which drives have lidar, or drop \
+                    "Run `pipes drives` to see which drives have lidar, or drop \
                      `--lidar on`: the default `auto` replays this drive as a \
                      camera-only one",
                 )
@@ -489,7 +489,7 @@ impl std::fmt::Display for VeloError {
                  needs all three of its instants, so the three must have the same \
                  number of lines, and which frame a line belongs to would \
                  otherwise be a guess. Re-extract velodyne_points from the \
-                 drive's zip; `cargo run --release -- drives` checks every drive \
+                 drive's zip; `pipes drives` checks every drive \
                  the same way"
             ),
             VeloError::BlankLinesDiffer {
@@ -503,7 +503,7 @@ impl std::fmt::Display for VeloError {
                  timestamp files when the frame has no sweep, and a sweep needs \
                  all three of its instants, so whether frame {} has a sweep would \
                  be a guess. Re-extract velodyne_points from the drive's zip; \
-                 `cargo run --release -- drives` checks every drive the same way",
+                 `pipes drives` checks every drive the same way",
                 line.saturating_sub(1)
             ),
             // The wrapped text is the whole message: it names the directory,
@@ -515,7 +515,7 @@ impl std::fmt::Display for VeloError {
                  and timestamps_end.txt) ends before it starts: a sweep is a \
                  rotation of about 103 ms, so this line is not one, and no camera \
                  instant could be paired inside it. Re-extract velodyne_points \
-                 from the drive's zip; `cargo run --release -- drives` checks \
+                 from the drive's zip; `pipes drives` checks \
                  every drive the same way"
             ),
         }

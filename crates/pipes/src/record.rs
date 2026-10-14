@@ -159,9 +159,10 @@ const C_DETECTION: [u8; 3] = [155, 123, 216];
 /// A failure that has already happened, #E5484D -- and the time to contact,
 /// the one number on the demo screen that is bad when it is small.
 const C_FAIL: [u8; 3] = [229, 72, 77];
-/// A band a measurement is read inside, and what belongs to no sensor, the
-/// admission on the pipeline graph: mid grey. The viewer draws a band only
-/// in an opaque colour at a width of at least 1.
+/// A band a measurement is read inside, and what is neither camera nor
+/// lidar on the pipeline graph -- the admission, and the GPS/IMU, whose
+/// rows are about the vehicle rather than the scene: mid grey. The viewer
+/// draws a band only in an opaque colour at a width of at least 1.
 const C_BOUND: [u8; 3] = [150, 150, 150];
 /// A reference line a measurement is read against -- the 3 s warning, a
 /// sweep's ends and its trigger: a bright grey, #D2D2D2, because a mid-grey
@@ -274,7 +275,7 @@ impl SeriesStyle {
 /// colour fails the build's tests rather than quietly producing another
 /// anonymous line in the viewer.
 #[cfg(test)]
-const SERIES_LEAVES: [&str; 15] = [
+const SERIES_LEAVES: [&str; 16] = [
     // Logged by the `track` stage straight onto the recording, for every
     // sweep: the pairing window is in no evidence column.
     "sweep_start",
@@ -283,12 +284,14 @@ const SERIES_LEAVES: [&str; 15] = [
     "camera",
     // On the same plot, and on its zoom onto the sweep's end, by the
     // evidence mirror ([`Dashboard::log_done`]): when the pairing's two
-    // halves, the lidar's first stage and the answer were ready. The zoom's
-    // line at the sweep's end is the `sweep_end` above.
+    // halves, the lidar's first stage, the answer and the lidar detector
+    // were ready. The zoom's line at the sweep's end is the `sweep_end`
+    // above.
     "1_camera_done",
     "2_reduce_done",
-    "3_detect_done",
-    "4_answer_done",
+    "3_pillars_done",
+    "4_detect_done",
+    "5_answer_done",
     // The answer's own series. Logged by `state-sink` straight onto the
     // recording rather than mirrored off an evidence row -- an evidence row
     // carries how long a sample took and how big it was, never what it SAID.
@@ -364,8 +367,11 @@ fn series_style(leaf: &str) -> Option<SeriesStyle> {
         // `detect`'s is a camera frame the lidar's boxes waited for.
         "1_camera_done" => points("camera done (ms)", C_CAMERA_ONLY, 3.5, MarkerShape::Diamond),
         "2_reduce_done" => points("reduce done (ms)", C_LIDAR_EARLY, 3.5, MarkerShape::Diamond),
-        "3_detect_done" => points("detect done (ms)", C_LIDAR_ONLY, 3.5, MarkerShape::Diamond),
-        "4_answer_done" => points("answer done (ms)", C_ANSWER, 3.5, MarkerShape::Diamond),
+        // The lidar detector, in the detectors' violet: the third thing the
+        // fusion waits for, on a run that has it.
+        "3_pillars_done" => points("pillars done (ms)", C_DETECTION, 3.5, MarkerShape::Diamond),
+        "4_detect_done" => points("detect done (ms)", C_LIDAR_ONLY, 3.5, MarkerShape::Diamond),
+        "5_answer_done" => points("answer done (ms)", C_ANSWER, 3.5, MarkerShape::Diamond),
         // Time to contact with the object the answer flags, as POINTS: the
         // flagged object changes from sweep to sweep, and a line joined one
         // object's approach to the next one's with a vertical jump no object
@@ -378,9 +384,10 @@ fn series_style(leaf: &str) -> Option<SeriesStyle> {
         // The line those points are read against: 3 s.
         "ttc_warn" => s("TTC warning (s)", C_REFERENCE, 1.5, true),
         // Counts, so they hold their value: in the frame, how many tracks the
-        // camera confirmed, how many only the lidar holds, and how many
-        // detections only the camera holds. A stale camera moves the first
-        // down and the other two up.
+        // cameras confirmed, how many only the lidar holds (a track one
+        // camera matched and the other did not confirm counts here), and
+        // how many detections only the camera holds. A stale camera moves
+        // the first down and the other two up.
         "fused" => s("fused (count)", C_FUSED, 2.0, true),
         "lidar_only" => s("lidar-only (count)", C_LIDAR_ONLY, 2.0, true),
         "camera_only" => s("camera-only (count)", C_CAMERA_ONLY, 2.0, true),
@@ -636,13 +643,14 @@ fn zoom_ms(after_due_ns: i64, rate: f64, period_ms: f64) -> f64 {
 /// chain's links as the next stage read them and as the step before built
 /// them ([`CHAIN_BYTES`]), and every stage's own row and what it handed on
 /// ([`stage_rows`]) -- the camera stage's under either of its names.
-const TABLE_EDGES: [&str; 14] = [
+const TABLE_EDGES: [&str; 20] = [
     "velo->reduce",
     "det->detect",
     "obj->track",
     "track->state",
     "state->sink",
     "velo",
+    "oxts",
     "det",
     "obj",
     "track",
@@ -651,6 +659,11 @@ const TABLE_EDGES: [&str; 14] = [
     "cam_det",
     "cam0->camdet",
     "cam0->proc",
+    "cam1",
+    "cam1_det",
+    "cam1->camdet",
+    "velo->pillars",
+    "pillar_det",
 ];
 
 /// Answers after which the tables are first written, so a live viewer has
@@ -809,10 +822,14 @@ struct StageRow {
     noun: &'static str,
 }
 
-/// Every stage the table can list, the camera's, the lidar's and the
-/// fusion's: the camera stage is the detector with it and `proc` without,
-/// whichever feeds the answer (`camera_edge`), and it is second.
-fn stage_rows(camera_edge: Option<&str>) -> [StageRow; 7] {
+/// Every stage the table can list, the camera's, the lidar's, the GPS/IMU's
+/// and the fusion's: the camera stage is the detector with it and `proc`
+/// without, whichever feeds the answer (`camera_edge`), and it is second.
+fn stage_rows(
+    camera_edge: Option<&str>,
+    right_camera: bool,
+    lidar_detector: bool,
+) -> Vec<StageRow> {
     let camera = if camera_edge == Some("cam0->proc") {
         StageRow {
             stage: "proc",
@@ -830,7 +847,29 @@ fn stage_rows(camera_edge: Option<&str>) -> [StageRow; 7] {
             noun: "of boxes",
         }
     };
-    [
+    // The right camera's two rows, on a run that has it: its driver and
+    // its own detector thread, after the left's.
+    let right: &[StageRow] = if right_camera {
+        &[
+            StageRow {
+                stage: "cam1",
+                what: "decodes the right camera's PNG into an Arrow buffer",
+                timed_on: "cam1",
+                hands_on: "cam1",
+                noun: "image",
+            },
+            StageRow {
+                stage: "camdet-right",
+                what: "finds objects in the right frame, on its own thread",
+                timed_on: "cam1->camdet",
+                hands_on: "cam1_det",
+                noun: "of boxes",
+            },
+        ]
+    } else {
+        &[]
+    };
+    let mut rows = vec![
         StageRow {
             stage: "cam0",
             what: "decodes each PNG into an Arrow buffer",
@@ -839,12 +878,22 @@ fn stage_rows(camera_edge: Option<&str>) -> [StageRow; 7] {
             noun: "image",
         },
         camera,
+    ];
+    rows.extend_from_slice(right);
+    rows.extend_from_slice(&[
         StageRow {
             stage: "velo",
             what: "loads each 360° sweep: x, y, z, reflectance",
             timed_on: "velo",
             hands_on: "velo",
             noun: "sweep",
+        },
+        StageRow {
+            stage: "oxts",
+            what: "reads the GPS/IMU row: the car's speed and turn rate",
+            timed_on: "oxts",
+            hands_on: "oxts",
+            noun: "row",
         },
         StageRow {
             stage: "reduce",
@@ -860,6 +909,19 @@ fn stage_rows(camera_edge: Option<&str>) -> [StageRow; 7] {
             hands_on: "obj",
             noun: "of boxes",
         },
+    ]);
+    // The lidar detector's row, on a run that has it: a second reader of
+    // the raw sweep, beside the chain.
+    if lidar_detector {
+        rows.push(StageRow {
+            stage: "pillars",
+            what: "PointPillars names cars, people, cyclists in the raw sweep",
+            timed_on: "velo->pillars",
+            hands_on: "pillar_det",
+            noun: "of boxes",
+        });
+    }
+    rows.extend_from_slice(&[
         StageRow {
             stage: "track",
             what: "gives boxes ids, fuses them with the camera",
@@ -874,7 +936,8 @@ fn stage_rows(camera_edge: Option<&str>) -> [StageRow; 7] {
             hands_on: "state",
             noun: "answer",
         },
-    ]
+    ]);
+    rows
 }
 
 /// One stage's line of the stage table: its row, and its medians.
@@ -909,10 +972,13 @@ fn stage_table(lines: &[StageLine], notes: &[String]) -> String {
 }
 
 /// What the camera stage's node on the pipeline graph says it does: the
-/// detector's boxes, or `proc`'s grayscale frame reference.
-fn camera_words(stage: &str) -> &'static str {
+/// detector's boxes -- from both cameras, each on its own thread, on a run
+/// with the right one -- or `proc`'s grayscale frame reference.
+fn camera_words(stage: &str, right_camera: bool) -> &'static str {
     if stage == "proc" {
         "grayscale, frame ref"
+    } else if right_camera {
+        "YOLOX-Nano boxes, x2 cameras"
     } else {
         "YOLOX-Nano boxes"
     }
@@ -956,7 +1022,13 @@ enum Sensor {
 fn sensors_of(stream: u8) -> &'static [Sensor] {
     match StreamId(stream) {
         StreamId::CAM0 | StreamId::CAM_DET => &[Sensor::Camera],
-        StreamId::LIDAR | StreamId::LIDAR_DET | StreamId::LIDAR_OBJ => &[Sensor::Lidar],
+        // The right camera has no lane or picture of its own, and the left
+        // one's frames are the fusion's: a frame absent in its source is in
+        // the WARN log and the stage table, and nothing here.
+        StreamId::CAM1 | StreamId::CAM1_DET => &[],
+        StreamId::LIDAR | StreamId::LIDAR_DET | StreamId::LIDAR_OBJ | StreamId::PILLAR_DET => {
+            &[Sensor::Lidar]
+        }
         // The fusion's output and the answer: an instant either sensor's
         // source lacks makes no set.
         StreamId::TRACKS | StreamId::EGO => &[Sensor::Camera, Sensor::Lidar],
@@ -1034,6 +1106,13 @@ pub struct Bounds {
     /// pairing lane, for the same reason: a run with no answer has nothing
     /// to replace them afterwards.
     pub answer: bool,
+    /// Whether the run replays the right camera too: its node on the
+    /// pipeline graph and its two rows of the stage table exist only then.
+    pub right_camera: bool,
+    /// Whether the run runs the lidar detector too: its node on the
+    /// pipeline graph, its row of the stage table and its ready dot exist
+    /// only then.
+    pub lidar_detector: bool,
 }
 
 /// The live dashboard (M8): mirrors evidence rows onto the run's Rerun
@@ -1137,10 +1216,12 @@ impl Dashboard {
     /// `SourceGap` event naming the whole gap, are logged where every drop and
     /// event is.
     fn log_absent(&mut self, e: &Evidence) -> Result<(), RecError> {
-        let sensor = if e.edge == "cam0" {
-            Sensor::Camera
-        } else {
-            Sensor::Lidar
+        // The GPS/IMU has no lane and no picture: a row its source lacks is
+        // in the WARN log and the stage table, and nothing here.
+        let sensor = match e.edge {
+            "cam0" => Sensor::Camera,
+            "velo" => Sensor::Lidar,
+            _ => return Ok(()),
         };
         self.absent.insert((sensor, e.seq));
         if e.edge == "cam0" {
@@ -1355,10 +1436,22 @@ impl Dashboard {
     /// does not describe -- the camera, the admission and the camera stage --
     /// carry a second line saying what they do.
     fn log_graph(&mut self, e: &Evidence) -> Result<(), RecError> {
+        // The right camera's node and edge only on a run that has it: a
+        // sensor the run never read is not on its picture.
+        let right = self.bounds.right_camera;
+        // And the lidar detector's node and edges, on the same terms.
+        let lidar = self.bounds.lidar_detector;
+        let shown = |id: &str| (id != "cam1" || right) && (id != "pillars" || lidar);
         if !self.graphed {
             self.rec.log_static(
                 entity::GRAPH_PIPELINE,
-                &GraphEdges::new(GRAPH_EDGES).with_directed_edges(),
+                &GraphEdges::new(
+                    GRAPH_EDGES
+                        .iter()
+                        .filter(|(from, to)| shown(from) && shown(to))
+                        .copied(),
+                )
+                .with_directed_edges(),
             )?;
             self.graphed = true;
         }
@@ -1374,16 +1467,22 @@ impl Dashboard {
                 None => what.to_string(),
             };
             match id {
-                "cam0" => format!("{}\ndecoded from PNG", with("camera", "cam0")),
+                "cam0" => format!(
+                    "{}\ndecoded from PNG",
+                    with(if right { "left camera" } else { "camera" }, "cam0")
+                ),
+                "cam1" => format!("{}\ndecoded from PNG", with("right camera", "cam1")),
+                "oxts" => format!("{}\nspeed, turn rate", with("gps/imu", "oxts")),
                 "velo" => with("lidar", "velo"),
                 "admit" => "admission\none arrival order".to_string(),
                 "camera" => format!(
                     "{}\n{}",
                     with(camera_stage, "cam_det"),
-                    camera_words(camera_stage)
+                    camera_words(camera_stage, right)
                 ),
                 "reduce" => with("voxels", "det"),
                 "detect" => with("dets", "obj"),
+                "pillars" => format!("{}\nPointPillars names", with("lidar boxes", "pillar_det")),
                 "track" => with("tracks", "track"),
                 "state" => with("state", "state"),
                 _ => match e.measurement_age_ns {
@@ -1393,20 +1492,22 @@ impl Dashboard {
             }
         };
         let rgb = |id: &str| match id {
-            "cam0" | "camera" => C_CAMERA_ONLY,
+            "cam0" | "cam1" | "camera" => C_CAMERA_ONLY,
             "velo" | "reduce" => C_LIDAR_ONLY,
-            "detect" | "track" | "state" => C_DETECTION,
+            "detect" | "pillars" | "track" | "state" => C_DETECTION,
             "answer" => C_ANSWER,
             _ => C_BOUND,
         };
-        let nodes = GraphNodes::new(GRAPH_NODES.map(|(id, _, _)| id))
-            .with_positions(GRAPH_NODES.map(|(_, x, y)| [x, y]))
-            .with_labels(GRAPH_NODES.map(|(id, _, _)| label(id)))
-            .with_colors(GRAPH_NODES.map(|(id, _, _)| {
+        let drawn: Vec<&(&str, f32, f32)> =
+            GRAPH_NODES.iter().filter(|(id, _, _)| shown(id)).collect();
+        let nodes = GraphNodes::new(drawn.iter().map(|(id, _, _)| *id))
+            .with_positions(drawn.iter().map(|(_, x, y)| [*x, *y]))
+            .with_labels(drawn.iter().map(|(id, _, _)| label(id)))
+            .with_colors(drawn.iter().map(|(id, _, _)| {
                 let c = rgb(id);
                 Color::from_rgb(c[0], c[1], c[2])
             }))
-            .with_radii([GRAPH_NODE_RADIUS; GRAPH_NODES.len()])
+            .with_radii(drawn.iter().map(|_| GRAPH_NODE_RADIUS))
             .with_show_labels(true);
         self.rec.log(entity::GRAPH_PIPELINE, &nodes)?;
         Ok(())
@@ -1450,7 +1551,11 @@ impl Dashboard {
     /// and what their times are and are not.
     fn log_stage_table(&self) -> Result<(), RecError> {
         let rows = |edge: &str| self.table.get(edge);
-        let stages = stage_rows(self.bounds.camera_edge);
+        let stages = stage_rows(
+            self.bounds.camera_edge,
+            self.bounds.right_camera,
+            self.bounds.lidar_detector,
+        );
         let lines: Vec<StageLine> = stages
             .iter()
             .filter(|s| rows(s.timed_on).is_some() || rows(s.hands_on).is_some())
@@ -1956,8 +2061,9 @@ mod tests {
             [
                 ("1_camera_done", C_CAMERA_ONLY, diamond),
                 ("2_reduce_done", C_LIDAR_EARLY, diamond),
-                ("3_detect_done", C_LIDAR_ONLY, diamond),
-                ("4_answer_done", C_ANSWER, diamond),
+                ("3_pillars_done", C_DETECTION, diamond),
+                ("4_detect_done", C_LIDAR_ONLY, diamond),
+                ("5_answer_done", C_ANSWER, diamond),
             ]
         );
         // `reduce`'s is the lidar's teal, lighter: brighter on every channel.
@@ -2226,7 +2332,7 @@ mod tests {
         );
         assert_eq!(
             lines[6],
-            "| 5 answer | state: one 68-byte record per track | **13 kB** | ÷ 1.5 | 17 kB | 0 B |"
+            "| 5 answer | state: one 76-byte record per track | **13 kB** | ÷ 1.5 | 17 kB | 0 B |"
         );
         // What built and read mean: where each result lives.
         assert!(t.contains("**built** is what the step allocated"), "{t}");
@@ -2282,7 +2388,11 @@ mod tests {
             .chain(
                 [Some("cam0->camdet"), Some("cam0->proc")]
                     .into_iter()
-                    .flat_map(|c| stage_rows(c).map(|s| [s.timed_on, s.hands_on]))
+                    .flat_map(|c| {
+                        stage_rows(c, true, true)
+                            .into_iter()
+                            .map(|s| [s.timed_on, s.hands_on])
+                    })
                     .flatten(),
             )
             .collect();
@@ -2292,16 +2402,48 @@ mod tests {
         kept.sort_unstable();
         assert_eq!(read, kept);
         // The camera stage is second, and is the one that feeds the answer.
-        assert_eq!(stage_rows(Some("cam0->camdet"))[1].stage, "camdet");
-        assert_eq!(stage_rows(Some("cam0->proc"))[1].stage, "proc");
+        assert_eq!(
+            stage_rows(Some("cam0->camdet"), false, false)[1].stage,
+            "camdet"
+        );
+        assert_eq!(
+            stage_rows(Some("cam0->proc"), false, false)[1].stage,
+            "proc"
+        );
         for c in ["cam0->camdet", "cam0->proc"] {
-            assert_eq!(stage_rows(Some(c))[1].timed_on, c);
+            assert_eq!(stage_rows(Some(c), false, false)[1].timed_on, c);
         }
+        // The right camera's rows follow it, only on a run that has it.
+        let with_right = stage_rows(Some("cam0->camdet"), true, false);
+        assert_eq!(
+            with_right.len(),
+            stage_rows(Some("cam0->camdet"), false, false).len() + 2
+        );
+        assert_eq!(
+            (with_right[2].stage, with_right[3].stage),
+            ("cam1", "camdet-right")
+        );
+        assert_eq!(with_right[3].timed_on, "cam1->camdet");
+        // The lidar detector's row follows `detect`, only on a run that has
+        // it: timed on the raw sweep's edge, handing on its own boxes.
+        let plain = stage_rows(Some("cam0->camdet"), false, false);
+        let with_lidar = stage_rows(Some("cam0->camdet"), false, true);
+        assert_eq!(with_lidar.len(), plain.len() + 1);
+        assert!(plain.iter().all(|s| s.stage != "pillars"));
+        let at = with_lidar
+            .iter()
+            .position(|s| s.stage == "pillars")
+            .unwrap();
+        assert_eq!(with_lidar[at - 1].stage, "detect");
+        assert_eq!(
+            (with_lidar[at].timed_on, with_lidar[at].hands_on),
+            ("velo->pillars", "pillar_det")
+        );
     }
 
     #[test]
     fn the_stage_table_says_what_each_stage_does_and_how_long_it_took() {
-        let rows = stage_rows(Some("cam0->camdet"));
+        let rows = stage_rows(Some("cam0->camdet"), false, false);
         let line = |i: usize, time_ns, carried| StageLine {
             row: &rows[i],
             time_ns,
@@ -2310,9 +2452,10 @@ mod tests {
         let lines = [
             line(0, Some(3_120_000), Some(1_397_406)),
             line(1, Some(37_590_000), Some(486)),
-            line(3, Some(4_390_000), Some(517_940)),
-            line(5, Some(120_000), None),
-            line(6, Some(34_000), Some(12_973)),
+            line(3, Some(430_000), Some(240)),
+            line(4, Some(4_390_000), Some(517_940)),
+            line(6, Some(120_000), None),
+            line(7, Some(34_000), Some(12_973)),
         ];
         let t = stage_table(&lines, &["A note.".to_string(), "Another.".to_string()]);
         let got: Vec<&str> = t.lines().collect();
@@ -2327,15 +2470,19 @@ mod tests {
         );
         assert_eq!(
             got[4],
+            "| oxts | reads the GPS/IMU row: the car's speed and turn rate | 0.43 ms | 240 B row |"
+        );
+        assert_eq!(
+            got[5],
             "| reduce | averages the points into 20 cm cubes | 4.4 ms | 518 kB of cubes |"
         );
         // A stage with no output row yet says so rather than inventing one.
         assert_eq!(
-            got[5],
+            got[6],
             "| track | gives boxes ids, fuses them with the camera | 0.12 ms | - |"
         );
         assert_eq!(
-            got[6],
+            got[7],
             "| state | writes the answer, flags the nearest in path | 0.034 ms | 13 kB answer |"
         );
         // Each note its own paragraph, after the table.
@@ -2477,7 +2624,7 @@ mod tests {
             .insert("cam0->camdet", rows(116, 1_397_406, 80_243_692));
         d.table.insert("cam_det", rows(116, 486, 6_900));
         d.camera_later = (116, 116);
-        let notes = d.stage_notes(&stage_rows(Some("cam0->camdet"))[1]);
+        let notes = d.stage_notes(&stage_rows(Some("cam0->camdet"), false, false)[1]);
         assert_eq!(
             notes[1..],
             [
@@ -2494,7 +2641,7 @@ mod tests {
         d.table
             .insert("cam0->camdet", rows(154, 1_397_406, 80_243_692));
         d.camera_later = (154, 0);
-        let notes = d.stage_notes(&stage_rows(Some("cam0->camdet"))[1]);
+        let notes = d.stage_notes(&stage_rows(Some("cam0->camdet"), false, false)[1]);
         assert_eq!(notes.len(), 3, "{notes:?}");
         assert_eq!(
             notes[2],
@@ -2626,6 +2773,8 @@ mod tests {
                 rate: Some(1.0),
                 lidar_lane: true,
                 answer: true,
+                right_camera: false,
+                lidar_detector: false,
             };
             let (rec, storage) = RecordingStreamBuilder::new("pipes-test").memory().unwrap();
             let viewer = ViewerQueue::new(1 << 16);
@@ -2656,13 +2805,13 @@ mod tests {
             for want in [
                 "lanes/pairing",
                 "pairing/1_camera_done",
-                "pairing/3_detect_done",
-                "pairing/4_answer_done",
+                "pairing/4_detect_done",
+                "pairing/5_answer_done",
                 "after_sweep/sweep_end",
                 "after_sweep/1_camera_done",
                 "after_sweep/2_reduce_done",
-                "after_sweep/3_detect_done",
-                "after_sweep/4_answer_done",
+                "after_sweep/4_detect_done",
+                "after_sweep/5_answer_done",
                 "latency/table",
                 "bytes/table",
                 "graph/pipeline",

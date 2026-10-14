@@ -44,9 +44,13 @@
 //! * **`YAW_RATE_MAX`** = this drive's measured maximum, 0.252 rad/s. Over one
 //!   sweep that is 1.49 deg, and at the detector's 30 m bound a static object
 //!   swings 0.78 m through the frame. **This term is pure ego motion and it is
-//!   a quarter of the gate.** The pipeline does not replay OXTS, so the
-//!   tracker cannot subtract it and has to widen the gate to swallow it
-//!   instead — see the section below for what that costs.
+//!   a quarter of the gate** -- and it is only in the gate on a run without
+//!   the vehicle's own motion. With it (the OXTS stream, [`crate::oxts`]),
+//!   every track is carried through what the vehicle did between the two
+//!   sweeps before it is matched ([`EgoMotion::carry`]), the swing is
+//!   subtracted rather than tolerated, and the closing term is an object's
+//!   own speed rather than two road users' head-on: `gate = V_OBJ_MAX * dt +
+//!   voxel_edge`, 1.63 m at this drive's interval.
 //! * **the voxel edge** = a centroid is the mean of whichever returns landed
 //!   in a 0.20 m cell, and which returns those are changes between sweeps.
 //!
@@ -154,19 +158,26 @@
 //! the change in bearing over omega — tens of milliseconds at most, and zero
 //! for anything that stays at one bearing.
 //!
-//! # The velocity is in the sensor frame and is NOT ego-compensated
+//! # The velocity's frame: over ground with the vehicle's motion, relative to
+//! # the vehicle without it
 //!
-//! Stated plainly because it is the difference between a number that is wrong
-//! and a number that is right for a different question than you might assume.
-//! A parked car ahead of a vehicle doing 5 m/s has a tracked velocity of
-//! -5 m/s in this frame.
+//! Stated plainly because the two are different numbers for the same track. A
+//! parked car ahead of a vehicle doing 5 m/s has a velocity of -5 m/s relative
+//! to the vehicle and 0 over ground.
 //!
-//! For the answer this chain produces — *how fast is the gap between me and
-//! that thing closing* — that is the correct quantity and an ego-compensated
-//! one would be the wrong one. For "is that object moving in the world", it is
-//! not, and this module cannot answer that, because nothing in the pipeline
-//! replays OXTS. Both facts are in [`state`](crate::state)'s docs at the point
-//! where the number is used.
+//! With the OXTS stream the tracker carries every live track -- its position,
+//! its box and the far end of its velocity baseline -- through what the
+//! vehicle did between the two sweeps ([`EgoMotion::carry`]: translate by
+//! the distance travelled, rotate by minus the turn), so a stationary object
+//! stays where it is and a track's velocity is the object's own, over
+//! ground, in the current sensor frame's axes. In a turn that is the
+//! difference between a tracker that works and one that reports every wall
+//! sliding sideways at the yaw rate times its range. The batch says which
+//! frame its velocities are in (`ego_outcome`, [`EgoOutcome`]), and
+//! [`crate::state`] turns a ground velocity back into a closing speed with
+//! the vehicle's own forward speed, which the batch carries too. Without
+//! the stream the velocities are relative to the vehicle, as they always
+//! were.
 //!
 //! # Determinism
 //!
@@ -194,26 +205,34 @@ use arrow::buffer::{Buffer, MutableBuffer, OffsetBuffer, ScalarBuffer};
 use arrow::datatypes::{DataType, Field, FieldRef, Float32Type, Int64Type, Schema, UInt32Type};
 
 use crate::calib::{Calib, ImageBox};
+use crate::cam0::Camera;
 use crate::camdet::DetView;
-use crate::detect::DETECTION_LANES;
-use crate::fuse::{build_camera_only, FusePlan, Fuser, POPULATION_FUSED, POPULATION_UNFUSED};
+use crate::detect::{EgoMotion, DETECTION_LANES};
+use crate::fuse::{
+    build_camera_only, demote_to_one_camera, FusePlan, Fuser, RightHalf, Stereo, POPULATION_FUSED,
+    POPULATION_ONE_CAMERA, POPULATION_UNFUSED,
+};
+use crate::name::{name_tracks, NamePlan};
+use crate::oxts::EgoRates;
+use crate::path::Rect;
+use crate::pillars::PILLAR_DET_LANES;
 use crate::velo::SweepError;
 use crate::voxel::VoxelSize;
 
 /// f32 lanes in one track record. See [`TRACK_BYTES`] for the layout.
-pub const TRACK_VALUES: i32 = 26;
+pub const TRACK_VALUES: i32 = 34;
 
 /// [`TRACK_VALUES`] as a `usize`, for slicing. The same number twice because
 /// Arrow's `FixedSizeListArray` wants an `i32` width and `as_chunks` wants a
 /// `usize` const generic; derived from the other so the pair cannot drift.
 pub const TRACK_LANES: usize = TRACK_VALUES as usize;
 
-/// Bytes in one track: 26 f32 lanes, in this order.
+/// Bytes in one track: 34 f32 lanes, in this order.
 ///
 /// | lanes | field | why it is here |
 /// |---|---|---|
 /// | 0-2 | `position` x, y, z | the centroid of the latest observation, in the lidar frame. |
-/// | 3-5 | `velocity` vx, vy, vz | m/s in the **sensor** frame, over the track's whole life. Not ego-compensated — see the module docs. |
+/// | 3-5 | `velocity` vx, vy, vz | m/s along the sensor frame's axes, over the track's whole life: the object's velocity **over ground** when the batch's `ego_outcome` is `compensated` or `stale` (the track was carried through the vehicle's own motion), and relative to the vehicle otherwise. See the module docs. |
 /// | 6 | `id` | stable while the track lives; never reissued within a run. |
 /// | 7 | `observations` | sweeps the track was matched in, starting at 1. What the emission rule ([`MIN_OBSERVATIONS`]) counts; **not** the track's age, which it understates whenever the track coasts. |
 /// | 8 | `misses` | consecutive sweeps with no observation, 0 or [`MAX_MISSES`]. `0` means "seen this sweep". |
@@ -227,6 +246,10 @@ pub const TRACK_LANES: usize = TRACK_VALUES as usize;
 /// | 23 | `class_id` | that detection's class, an index into [`crate::camdet::COCO_CLASSES`]; `0` when there is none, which is also "person" -- so it is read only on a fused track (lane 25). |
 /// | 24 | `confidence` | that detection's score, above the detector's 0.3 by construction; `0` when there is none. |
 /// | 25 | `population` | [`crate::fuse::POPULATION_FUSED`] with a detection, [`crate::fuse::POPULATION_LIDAR_ONLY`] when a detector's output was associated and nothing matched, [`crate::fuse::POPULATION_UNFUSED`] when there was no detector output to associate with (`--detector off`, whose frame reference carries no detections). |
+/// | 26 | `lidar_det_index` | **the lidar detector's half.** The index, in the sweep's `PILLAR_DET` batch, of the box whose footprint this track's centroid lies in ([`crate::name`]), or `-1`: no box, a coasted track, or no lidar detector. |
+/// | 27 | `lidar_class_id` | that box's class, an index into [`crate::pillars::CLASSES`]; `0` when there is none, which is also "car" -- so it is read only with lane 26. |
+/// | 28 | `lidar_confidence` | that box's score, at or above the naming's 0.3 ([`crate::name::NAME_SCORE_MIN`]); `0` when there is none. |
+/// | 29-33 | `lidar_box` x, y, length, width, yaw | that box seen from above: its centre, its extent along and across its heading, and the heading, radians from +x towards +y. What [`crate::path`] asks whether a named track stands on the vehicle's path: a tight rectangle turned to the object, where lanes 9-14 are the axis-aligned hull of a cluster. All zero when there is none. |
 ///
 /// **A fused track carries its distance, velocity and age from the lidar
 /// (lanes 0-20) and its class and confidence from the camera (lanes 23-24),**
@@ -252,8 +275,13 @@ pub const TRACK_LANES: usize = TRACK_VALUES as usize;
 ///
 /// The five camera lanes (21-25) are in the same buffer for the same reason:
 /// a fused object is ONE record with one address, so the zero-copy proof that
-/// follows the tracks to `state` follows the fusion with them.
-pub const TRACK_BYTES: usize = 104;
+/// follows the tracks to `state` follows the fusion with them. The three
+/// lidar-detector lanes (26-28) too: a track named by the lidar is the same
+/// record, with the same address, as the one the camera named. Lanes 29-33
+/// carry that box's own rectangle rather than leaving it in the detector's
+/// batch, because the stage that asks what is on the vehicle's path reads
+/// tracks and nothing else.
+pub const TRACK_BYTES: usize = 136;
 
 /// Lane 21 of [`TRACK_BYTES`]: the associated detection's index, or -1.
 pub const LANE_DET_INDEX: usize = 21;
@@ -265,8 +293,20 @@ pub const LANE_CLASS_ID: usize = 23;
 pub const LANE_CONFIDENCE: usize = 24;
 /// Lane 25: the population code.
 pub const LANE_POPULATION: usize = 25;
+/// Lane 26: the lidar detector's box this track lies in, or -1.
+pub const LANE_LIDAR_DET_INDEX: usize = 26;
+/// Lane 27: that box's class id.
+pub const LANE_LIDAR_CLASS_ID: usize = 27;
+/// Lane 28: that box's score.
+pub const LANE_LIDAR_CONFIDENCE: usize = 28;
+/// Lanes 29-33: that box's rectangle in the ground plane -- centre x, y,
+/// length, width, yaw.
+pub const LANE_LIDAR_BOX: usize = 29;
 
-/// Value of the `track_format` column: what the 26 lanes mean.
+/// Value of the `track_format` column: what the 29 lanes mean (`d1` the
+/// lidar detector's box index, `l1` its class, `w1` its score, after the
+/// camera's lanes, then `r5`, its rectangle; the format changed with them, as
+/// it did with the camera's).
 ///
 /// `p3` position, `v3` velocity, `i1` id, `n1` observations, `m1` misses, `b6`
 /// two box corners, `c4` the camera rectangle, `a1` age in seconds, `s1`
@@ -277,7 +317,7 @@ pub const LANE_POPULATION: usize = 25;
 /// when lane 7 stopped being called the age, and again when the camera lanes
 /// were added, because a lane whose meaning changes under the same format
 /// string is the failure the string exists to prevent.
-pub const TRACK_FORMAT: &str = "trk_p3v3i1n1m1b6c4a1s1j1u1k1q1o1_f32le";
+pub const TRACK_FORMAT: &str = "trk_p3v3i1n1m1b6c4a1s1j1u1k1q1o1d1l1w1r5_f32le";
 
 /// Relative speed two road users can close at, m/s.
 ///
@@ -290,10 +330,15 @@ pub const V_REL_MAX_MPS: f64 = 13.89 + 6.46;
 
 /// Ego yaw rate bound, rad/s: drive_0005's measured maximum (-0.252..+0.192).
 ///
-/// This term exists only because the pipeline does not replay OXTS. With the
-/// vehicle's own rotation available it would be subtracted rather than
-/// tolerated, and the gate would be about a quarter narrower.
+/// In the gate only on a run without the vehicle's own motion. With the OXTS
+/// stream the rotation is subtracted rather than tolerated
+/// ([`Tracker::plan`]), and this term is gone.
 pub const YAW_RATE_MAX_RPS: f64 = 0.252;
+
+/// Speed one road user can move at over ground, m/s: the urban limit alone
+/// (50 km/h), the closing term of the gate once the vehicle's own motion has
+/// been subtracted. [`V_REL_MAX_MPS`] less the ego speed it was built with.
+pub const V_OBJ_MAX_MPS: f64 = 13.89;
 
 /// Consecutive sweeps a track survives without an observation before it dies.
 ///
@@ -323,22 +368,40 @@ pub const MIN_OBSERVATIONS: u32 = 2;
 ///
 /// See the module docs for where each term comes from. `range_limit_m` is the
 /// detector's own bound, because that is the largest radius at which a
-/// detection can exist and therefore the largest lever ego yaw has.
-pub fn association_gate_m(dt_s: f64, voxel: VoxelSize, range_limit_m: f32) -> f64 {
+/// detection can exist and therefore the largest lever ego yaw has. With
+/// `ego`, the vehicle's own motion is subtracted before the match
+/// ([`Tracker::plan`]), so the swing term is gone and the closing term is
+/// one object's speed rather than two road users' head-on.
+pub fn association_gate_m(dt_s: f64, voxel: VoxelSize, range_limit_m: f32, ego: bool) -> f64 {
+    if ego {
+        return V_OBJ_MAX_MPS * dt_s + f64::from(voxel.metres());
+    }
     let closing = V_REL_MAX_MPS * dt_s;
     let swing = YAW_RATE_MAX_RPS * dt_s * f64::from(range_limit_m);
     closing + swing + f64::from(voxel.metres())
 }
 
-/// The gate's three terms in one line, so a run's own output can state where
-/// its number came from and a reader never has to take it on trust.
-pub fn gate_note(dt_s: f64, voxel: VoxelSize, range_limit_m: f32) -> String {
+/// The gate's terms in one line, so a run's own output can state where its
+/// number came from and a reader never has to take it on trust.
+pub fn gate_note(dt_s: f64, voxel: VoxelSize, range_limit_m: f32, ego: bool) -> String {
+    if ego {
+        return format!(
+            "gate = {:.3} m at dt = {:.1} ms: {:.3} m closing ({} m/s, an urban limit, one object's \
+             own speed over ground -- the vehicle's motion is subtracted from every track before \
+             the match, from the oxts stream, so there is no ego-yaw term) + {} m voxel quantisation",
+            association_gate_m(dt_s, voxel, range_limit_m, true),
+            dt_s * 1e3,
+            V_OBJ_MAX_MPS * dt_s,
+            V_OBJ_MAX_MPS,
+            voxel.metres(),
+        );
+    }
     format!(
         "gate = {:.3} m at dt = {:.1} ms: {:.3} m closing ({} m/s relative, an urban limit plus \
          this drive's measured max ego speed) + {:.3} m ego-yaw swing ({} rad/s measured, at the \
-         detector's {} m bound -- this term is ego motion the pipeline cannot subtract because \
-         oxts is not replayed) + {} m voxel quantisation",
-        association_gate_m(dt_s, voxel, range_limit_m),
+         detector's {} m bound -- this term is ego motion the tracker cannot subtract because \
+         the run has no oxts stream) + {} m voxel quantisation",
+        association_gate_m(dt_s, voxel, range_limit_m, false),
         dt_s * 1e3,
         V_REL_MAX_MPS * dt_s,
         V_REL_MAX_MPS,
@@ -347,6 +410,74 @@ pub fn gate_note(dt_s: f64, voxel: VoxelSize, range_limit_m: f32) -> String {
         range_limit_m,
         voxel.metres(),
     )
+}
+
+/// Whether, and from which row, the vehicle's own motion was subtracted
+/// from this sweep's tracks.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum EgoOutcome {
+    /// The OXTS row of the sweep's own frame number.
+    Compensated,
+    /// No row of the sweep's number had arrived; the newest earlier one, at
+    /// most two frames old, stood in. A declared substitute, named here
+    /// and in `ego_seq`.
+    Stale,
+    /// The run has an OXTS stream but no usable row for this sweep: nothing
+    /// was subtracted, and the velocities are relative to the vehicle.
+    Missing,
+    /// The run has no OXTS stream at all.
+    #[default]
+    Unavailable,
+}
+
+impl EgoOutcome {
+    /// The payload spelling.
+    pub fn name(self) -> &'static str {
+        match self {
+            EgoOutcome::Compensated => "compensated",
+            EgoOutcome::Stale => "stale",
+            EgoOutcome::Missing => "missing",
+            EgoOutcome::Unavailable => "unavailable",
+        }
+    }
+
+    /// The outcome a payload spells, or `None` for a word that is not one.
+    pub fn parse(s: &str) -> Option<EgoOutcome> {
+        [
+            EgoOutcome::Compensated,
+            EgoOutcome::Stale,
+            EgoOutcome::Missing,
+            EgoOutcome::Unavailable,
+        ]
+        .into_iter()
+        .find(|o| o.name() == s)
+    }
+
+    /// Whether the sweep's tracks were carried through the vehicle's motion,
+    /// so their velocities are over ground.
+    pub fn compensated(self) -> bool {
+        matches!(self, EgoOutcome::Compensated | EgoOutcome::Stale)
+    }
+}
+
+/// The vehicle's own half of a sweep: which OXTS row said what it was doing,
+/// and what it said.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct EgoHalf {
+    /// How the row was found.
+    pub outcome: EgoOutcome,
+    /// The row's frame number, or -1.
+    pub seq: i64,
+    /// What it said; zero when there was no row.
+    pub rates: EgoRates,
+}
+
+impl EgoHalf {
+    /// The motion the tracker subtracts, or `None` when the outcome says
+    /// nothing was.
+    pub fn rates(&self) -> Option<EgoRates> {
+        self.outcome.compensated().then_some(self.rates)
+    }
 }
 
 /// What happened when this sweep was matched to a camera frame.
@@ -385,6 +516,13 @@ pub enum Pairing {
     /// for it. The pairing itself is still by time; the frame number only
     /// names why no instant fell inside the range.
     AbsentInSource,
+    /// The camera has had no frame to pair for several sweeps running, in a
+    /// run with two cameras, so the fusion declared it silent and did not
+    /// wait for it this sweep: the set is the other camera's, on one
+    /// camera's terms. Said rather than counted as [`Pairing::Late`],
+    /// because a late frame is waited for and a silent camera is not, and
+    /// the evidence has to say which it was.
+    Silent,
 }
 
 impl Pairing {
@@ -397,6 +535,7 @@ impl Pairing {
             Pairing::Late => "pair_late",
             Pairing::Absent => "pair_absent",
             Pairing::AbsentInSource => "pair_absent_in_source",
+            Pairing::Silent => "pair_silent",
         }
     }
 
@@ -404,6 +543,54 @@ impl Pairing {
     /// **expired** set: nothing is emitted and the evidence says why.
     pub fn produces(self) -> bool {
         matches!(self, Pairing::Paired | Pairing::Stale)
+    }
+}
+
+/// How the lidar detector's batch for a sweep was found at the fusion, on
+/// [`Pairing`]'s terms: the batch is the sweep's own (its seq is the sweep's
+/// number), so there is no window and no stale version of it, only whether it
+/// was in hand in time.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Naming {
+    /// The sweep's batch was in hand, inside the wait: the tracks were
+    /// named from it.
+    Named,
+    /// The wait expired with no batch for this sweep and none newer: the
+    /// detector is behind.
+    Late,
+    /// A batch for a later sweep had arrived and this sweep's never came:
+    /// produced and lost upstream, or the stage failed on it.
+    Dropped,
+    /// The detector had delivered nothing for several sweeps running, so the
+    /// fusion did not wait for it this sweep.
+    Silent,
+    /// No lidar detector reaches this stage at all.
+    #[default]
+    Off,
+}
+
+impl Naming {
+    /// The payload / evidence spelling.
+    pub fn name(self) -> &'static str {
+        match self {
+            Naming::Named => "named",
+            Naming::Late => "lidar_late",
+            Naming::Dropped => "lidar_dropped",
+            Naming::Silent => "lidar_silent",
+            Naming::Off => "lidar_off",
+        }
+    }
+
+    /// The spelling read back.
+    pub fn parse(s: &str) -> Option<Naming> {
+        Some(match s {
+            "named" => Naming::Named,
+            "lidar_late" => Naming::Late,
+            "lidar_dropped" => Naming::Dropped,
+            "lidar_silent" => Naming::Silent,
+            "lidar_off" => Naming::Off,
+            _ => return None,
+        })
     }
 }
 
@@ -439,9 +626,17 @@ fn track_field() -> FieldRef {
 /// source_sweep_seq i64, source_detections u32, source_voxel_count u32,
 /// source_point_count u32, gate_m f32, dt_s f32, cam_seq i64, cam_tov_ns i64,
 /// pair_age_ns i64, pair_outcome Utf8, image_width u32, image_height u32,
-/// paired bool, tracks LargeList<FixedSizeList<Float32, 26>>, fused_count
+/// paired bool, tracks LargeList<FixedSizeList<Float32, 34>>, fused_count
 /// u32, fuse_contested u32, fuse_crowded u32, camera_only
-/// LargeList<FixedSizeList<Float32, 7>>`.
+/// LargeList<FixedSizeList<Float32, 7>>`, the vehicle's five, the second
+/// camera's six, and the lidar detector's four: `lidar_det_outcome Utf8,
+/// lidar_det_seq i64, lidar_det_count u32, named_count u32`.
+///
+/// The last four are the lidar detector's half ([`Naming`], [`crate::name`]):
+/// whether the sweep's own `PILLAR_DET` batch was in hand when the set was
+/// built, late, lost, or not waited for; which batch (its seq is the sweep's);
+/// how many boxes it held; and how many tracks took a class from one, which
+/// is also what lanes 26-28 say and the run checks that it is.
 ///
 /// The last four are the association's own statement ([`crate::fuse`]):
 /// how many tracks it fused, how often a detection or a track had more than
@@ -475,6 +670,24 @@ fn track_field() -> FieldRef {
 /// `queue_wait_ns`: the run records the measurement and the check computes the
 /// verdict, so a reader can apply their own staleness threshold to a recording
 /// made under someone else's.
+///
+/// `ego_outcome` to `ego_yaw_rate` are the vehicle's own half ([`EgoHalf`]):
+/// whether the tracks were carried through its motion (`ego_outcome`, which
+/// decides what frame lanes 3-5 are in), which OXTS row said so, and the
+/// forward speed, leftward speed and yaw rate it said. The forward speed is
+/// what [`crate::state`] needs to turn a ground velocity back into a closing
+/// speed.
+///
+/// The last six are the second camera's half: `cam_side` says which camera
+/// the frame of `cam_seq` -- and so every image rectangle and every
+/// camera-only row -- belongs to (`left` unless the sweep was answered from
+/// the right camera's frame alone), `cam1_seq`, `cam1_tov_ns`,
+/// `cam1_pair_age_ns` and `cam1_pair_outcome` are the right camera's frame
+/// and pairing on the terms of the left's, `-1`, `0`, `0` and `pair_absent`
+/// without a right camera, and `cam0_pair_outcome` is the left camera's own
+/// pairing -- `pair_outcome` again on a set built on the left frame, and
+/// what became of the left frame on one built on the right.
+/// `run::pair_check` joins them too.
 pub fn track_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         Field::new("track_count", DataType::UInt32, false),
@@ -498,11 +711,40 @@ pub fn track_schema() -> Arc<Schema> {
         Field::new("fuse_contested", DataType::UInt32, false),
         Field::new("fuse_crowded", DataType::UInt32, false),
         Field::new("camera_only", crate::fuse::camera_only_data_type(), false),
+        Field::new("ego_outcome", DataType::Utf8, false),
+        Field::new("ego_seq", DataType::Int64, false),
+        Field::new("ego_vf", DataType::Float32, false),
+        Field::new("ego_vl", DataType::Float32, false),
+        Field::new("ego_yaw_rate", DataType::Float32, false),
+        Field::new("cam_side", DataType::Utf8, false),
+        Field::new("cam1_seq", DataType::Int64, false),
+        Field::new("cam1_tov_ns", DataType::Int64, false),
+        Field::new("cam1_pair_age_ns", DataType::Int64, false),
+        Field::new("cam1_pair_outcome", DataType::Utf8, false),
+        Field::new("cam0_pair_outcome", DataType::Utf8, false),
+        Field::new("lidar_det_outcome", DataType::Utf8, false),
+        Field::new("lidar_det_seq", DataType::Int64, false),
+        Field::new("lidar_det_count", DataType::UInt32, false),
+        Field::new("named_count", DataType::UInt32, false),
     ]))
 }
 
+/// The vehicle's own half of a track batch: how its OXTS row was found and
+/// what it said. `None` for a batch without the columns.
+pub fn track_ego(batch: &RecordBatch) -> Option<EgoHalf> {
+    Some(EgoHalf {
+        outcome: EgoOutcome::parse(str_col(batch, "ego_outcome")?)?,
+        seq: i64_col(batch, "ego_seq")?,
+        rates: EgoRates {
+            vf: f64::from(f32_col(batch, "ego_vf")?),
+            vl: f64::from(f32_col(batch, "ego_vl")?),
+            yaw_rate: f64::from(f32_col(batch, "ego_yaw_rate")?),
+        },
+    })
+}
+
 /// The interleaved track lanes of a track batch, shared with the buffer the
-/// stage built. `chunks_exact(26)` gives one track each.
+/// stage built. `chunks_exact(34)` gives one track each.
 pub fn tracks_f32(batch: &RecordBatch) -> Option<&[f32]> {
     Some(
         batch
@@ -564,7 +806,7 @@ pub fn track_count(batch: &RecordBatch) -> Option<u32> {
     u32_col(batch, "track_count")
 }
 
-/// What the 26 lanes of a track MEAN, read back out of the batch.
+/// What the 34 lanes of a track MEAN, read back out of the batch.
 pub fn track_format(batch: &RecordBatch) -> Option<&str> {
     str_col(batch, "track_format")
 }
@@ -628,6 +870,40 @@ pub fn pair_outcome(batch: &RecordBatch) -> Option<&str> {
     str_col(batch, "pair_outcome")
 }
 
+/// Which camera `cam_seq`'s frame, the image rectangles and the camera-only
+/// rows belong to. `None` for a batch without the column, or one naming
+/// neither camera.
+pub fn cam_side(batch: &RecordBatch) -> Option<Camera> {
+    str_col(batch, "cam_side").and_then(Camera::parse)
+}
+
+/// The right camera's frame the sweep was paired with, or -1.
+pub fn cam1_seq(batch: &RecordBatch) -> Option<i64> {
+    i64_col(batch, "cam1_seq")
+}
+
+/// That frame's instant, ns on the sensor clock, or 0 when unpaired.
+pub fn cam1_tov_ns(batch: &RecordBatch) -> Option<i64> {
+    i64_col(batch, "cam1_tov_ns")
+}
+
+/// `cam1_tov_ns - tov_trigger_ns`, ns, or 0 when unpaired.
+pub fn cam1_pair_age_ns(batch: &RecordBatch) -> Option<i64> {
+    i64_col(batch, "cam1_pair_age_ns")
+}
+
+/// How the right camera's pairing went, as [`Pairing::name`] spells it.
+pub fn cam1_pair_outcome(batch: &RecordBatch) -> Option<&str> {
+    str_col(batch, "cam1_pair_outcome")
+}
+
+/// How the left camera's pairing went, as [`Pairing::name`] spells it:
+/// `pair_outcome` again on a set built on the left frame, and the left
+/// frame's own fate on a set built on the right one.
+pub fn cam0_pair_outcome(batch: &RecordBatch) -> Option<&str> {
+    str_col(batch, "cam0_pair_outcome")
+}
+
 /// Whether the camera frame was inside the sweep's range (as opposed to a
 /// declared stale one).
 pub fn paired(batch: &RecordBatch) -> Option<bool> {
@@ -655,6 +931,28 @@ pub fn fuse_contested(batch: &RecordBatch) -> Option<u32> {
 /// same contest seen from the other side.
 pub fn fuse_crowded(batch: &RecordBatch) -> Option<u32> {
     u32_col(batch, "fuse_crowded")
+}
+
+/// How the lidar detector's batch for the sweep was found, as
+/// [`Naming::name`] spells it.
+pub fn lidar_det_outcome(batch: &RecordBatch) -> Option<&str> {
+    str_col(batch, "lidar_det_outcome")
+}
+
+/// That batch's seq, or -1.
+pub fn lidar_det_seq(batch: &RecordBatch) -> Option<i64> {
+    i64_col(batch, "lidar_det_seq")
+}
+
+/// Boxes in that batch; 0 without one.
+pub fn lidar_det_count(batch: &RecordBatch) -> Option<u32> {
+    u32_col(batch, "lidar_det_count")
+}
+
+/// Tracks that took a class from one of them: the batch's own count, beside
+/// the lanes it counts.
+pub fn named_count(batch: &RecordBatch) -> Option<u32> {
+    u32_col(batch, "named_count")
 }
 
 /// Errors from building one track batch.
@@ -699,7 +997,7 @@ impl std::error::Error for TrackError {
     }
 }
 
-/// One live track. Internal: the Arrow record is the 26 lanes of
+/// One live track. Internal: the Arrow record is the 34 lanes of
 /// [`TRACK_BYTES`], and this carries the extra state that produces them.
 #[derive(Clone, Copy, Debug)]
 struct Live {
@@ -909,6 +1207,13 @@ impl Tracker {
     /// `sweep_seq` is the velodyne sweep the detections came from, carried
     /// through the chain so "consecutive" is exact; `trigger_ns` is that
     /// sweep's forward-facing trigger, which is what `dt` is measured between.
+    ///
+    /// `ego` is what the vehicle itself did over the interval, from the OXTS
+    /// stream, or `None` without one. With it, every live track is carried
+    /// through that motion before the match ([`EgoMotion::carry`]): its
+    /// position, its box, and the first position its velocity is measured
+    /// from, so the velocity comes out over ground. The gate loses its
+    /// ego-yaw term ([`association_gate_m`]).
     pub fn plan(
         &mut self,
         dets: &[[f32; DETECTION_LANES]],
@@ -916,6 +1221,7 @@ impl Tracker {
         trigger_ns: i64,
         voxel: VoxelSize,
         range_limit_m: f32,
+        ego: Option<EgoRates>,
     ) -> TrackPlan {
         let mut plan = TrackPlan {
             source_detections: dets.len() as u32,
@@ -934,12 +1240,39 @@ impl Tracker {
             0.0
         };
         let gate = if consecutive {
-            association_gate_m(dt, voxel, range_limit_m)
+            association_gate_m(dt, voxel, range_limit_m, ego.is_some())
         } else {
             0.0
         };
         plan.dt_s = dt;
         plan.gate_m = gate;
+        // The vehicle moved and turned between the two sweeps: carry every
+        // track to where a world-fixed thing at its last position would be
+        // seen now. The box keeps its shape and moves with its centroid --
+        // a turn of 1.5 deg a sweep does not need the corners re-fitted --
+        // and the velocity's far end is carried too, so the baseline stays
+        // in one frame.
+        if let (true, Some(r)) = (consecutive, ego) {
+            let m = EgoMotion {
+                vf: r.vf,
+                vl: r.vl,
+                yaw_rate: r.yaw_rate,
+                dt,
+            };
+            for t in &mut self.live {
+                let p = m.carry(t.pos);
+                for ((lo, hi), d) in
+                    t.lo.iter_mut()
+                        .zip(t.hi.iter_mut())
+                        .zip(p.iter().zip(t.pos).map(|(a, b)| a - b))
+                {
+                    *lo += d;
+                    *hi += d;
+                }
+                t.pos = p;
+                t.first_pos = m.carry(t.first_pos);
+            }
+        }
 
         self.pairs.clear();
         self.det_taken.clear();
@@ -1059,7 +1392,7 @@ impl Tracker {
         calib: Option<&Calib>,
         schema: &Arc<Schema>,
     ) -> Result<(RecordBatch, usize, u32), TrackError> {
-        let b = self.build_fused(plan, meta, calib, None, schema)?;
+        let b = self.build_fused(plan, meta, calib, None, Right::Off, None, schema)?;
         Ok((b.batch, b.storage_id, b.in_frame))
     }
 
@@ -1082,12 +1415,26 @@ impl Tracker {
     /// the projection and before the buffer is frozen, rather than on the
     /// finished batch. Call [`crate::fuse::Fuser::reserve`] outside the
     /// measured window first, or its scratch grows inside it.
+    ///
+    /// `right` is the other camera's part ([`Right`]): with its frame, every
+    /// track is projected into it too and the association's second pass
+    /// runs ([`crate::fuse::Fuser::confirm`], after
+    /// [`crate::fuse::Fuser::reserve_right`]); without it, in a run that has
+    /// it, every match is demoted to one camera's.
+    // Eight arguments: the plan, the sweep's facts, and one input per sensor
+    // half -- the left camera's projection and detections, the right camera's
+    // part, the lidar detector's boxes -- plus the schema. Each is a different
+    // sensor's contribution, and folding them into a struct would only move
+    // the same eight names behind one.
+    #[allow(clippy::too_many_arguments)]
     pub fn build_fused(
         &self,
         plan: &TrackPlan,
         meta: &TrackMeta,
         calib: Option<&Calib>,
         fusion: Option<(&DetView<'_>, &mut Fuser)>,
+        right: Right<'_>,
+        named: Option<&[[f32; PILLAR_DET_LANES]]>,
         schema: &Arc<Schema>,
     ) -> Result<Built, TrackError> {
         let emitted: Vec<&Live> = self
@@ -1142,15 +1489,60 @@ impl Tracker {
                 // with; otherwise this is the record's final word.
                 lane[LANE_DET_INDEX] = -1.0;
                 lane[LANE_POPULATION] = POPULATION_UNFUSED as f32;
+                // And no lidar box yet: `name_tracks` below rewrites lanes
+                // 26-28 of every track that lies in one.
+                lane[LANE_LIDAR_DET_INDEX] = -1.0;
             }
         }
         let (camera_only, fuse) = match fusion {
             Some((dets, fuser)) => {
                 let (rows, _) = buf.typed_data_mut::<f32>().as_chunks_mut::<TRACK_LANES>();
-                let fuse = fuser.associate(rows, dets);
-                (build_camera_only(Some(dets), fuser.taken())?, fuse)
+                let mut fuse = fuser.associate(rows, dets);
+                match right {
+                    Right::Off => (build_camera_only(Some(dets), fuser.taken(), None)?, fuse),
+                    Right::Missing => {
+                        demote_to_one_camera(rows, &mut fuse);
+                        (build_camera_only(Some(dets), fuser.taken(), None)?, fuse)
+                    }
+                    Right::Frame {
+                        dets: right_dets,
+                        calib: right_calib,
+                        stereo,
+                    } => {
+                        // Each track's box in the right image, from the same
+                        // 3D box the left's came from.
+                        let boxes = fuser.right_boxes(rows.len());
+                        for (slot, t) in boxes.iter_mut().zip(emitted.iter()) {
+                            *slot = right_calib.project_box(t.lo, t.hi);
+                        }
+                        let half = RightHalf {
+                            dets: right_dets,
+                            stereo,
+                        };
+                        fuser.confirm(rows, dets, &half, &mut fuse);
+                        (
+                            build_camera_only(
+                                Some(dets),
+                                fuser.taken(),
+                                Some(fuser.stereo_ranges()),
+                            )?,
+                            fuse,
+                        )
+                    }
+                }
             }
-            None => (build_camera_only(None, &[])?, FusePlan::default()),
+            None => (build_camera_only(None, &[], None)?, FusePlan::default()),
+        };
+        // The lidar detector's half, after the camera's and in the same
+        // buffer: a class from the lidar's own boxes on every fresh track
+        // whose centroid lies in one (`crate::name`). Nothing when the
+        // sweep's batch was not in hand, which `lidar_det_outcome` says.
+        let names = match named {
+            Some(dets) => {
+                let (rows, _) = buf.typed_data_mut::<f32>().as_chunks_mut::<TRACK_LANES>();
+                name_tracks(rows, dets)
+            }
+            None => NamePlan::default(),
         };
         let (arr, storage_id, n) = build_tracks_array(Buffer::from(buf))?;
         let columns: Vec<ArrayRef> = vec![
@@ -1179,14 +1571,58 @@ impl Tracker {
             Arc::new(UInt32Array::from(vec![fuse.contested])),
             Arc::new(UInt32Array::from(vec![fuse.crowded])),
             camera_only,
+            Arc::new(StringArray::from(vec![meta.ego.outcome.name()])),
+            Arc::new(Int64Array::from(vec![meta.ego.seq])),
+            Arc::new(Float32Array::from(vec![meta.ego.rates.vf as f32])),
+            Arc::new(Float32Array::from(vec![meta.ego.rates.vl as f32])),
+            Arc::new(Float32Array::from(vec![meta.ego.rates.yaw_rate as f32])),
+            Arc::new(StringArray::from(vec![meta.side.name()])),
+            Arc::new(Int64Array::from(vec![meta
+                .cam_right
+                .map_or(-1, |c| c.seq as i64)])),
+            Arc::new(Int64Array::from(vec![meta
+                .cam_right
+                .map_or(0, |c| c.tov_ns)])),
+            Arc::new(Int64Array::from(vec![meta
+                .cam_right
+                .map_or(0, |c| c.tov_ns - meta.trigger_ns)])),
+            Arc::new(StringArray::from(vec![meta.pairing_right.name()])),
+            Arc::new(StringArray::from(vec![meta.pairing_left.name()])),
+            Arc::new(StringArray::from(vec![meta.naming.name()])),
+            Arc::new(Int64Array::from(vec![meta.lidar_det_seq])),
+            Arc::new(UInt32Array::from(vec![names.detections])),
+            Arc::new(UInt32Array::from(vec![names.named])),
         ];
         Ok(Built {
             batch: RecordBatch::try_new(Arc::clone(schema), columns).map_err(SweepError::Arrow)?,
             storage_id,
             in_frame,
             fuse,
+            names,
         })
     }
+}
+
+/// The second camera's part in one set's association, beside the paired
+/// frame's detections.
+pub enum Right<'a> {
+    /// The run has one camera: a track that camera matched is fused.
+    Off,
+    /// The run has two cameras and this sweep has no frame of the second:
+    /// one camera's match is not an agreement, so every match is
+    /// [`POPULATION_ONE_CAMERA`] and the camera-only detections keep no
+    /// range ([`demote_to_one_camera`]).
+    Missing,
+    /// The second camera's frame: its detections, its calibration, and the
+    /// rig's baseline for the stereo rules.
+    Frame {
+        /// What the detector found in it.
+        dets: &'a DetView<'a>,
+        /// Its projection, for each track's box in it.
+        calib: &'a Calib,
+        /// The two cameras' baseline.
+        stereo: Stereo,
+    },
 }
 
 /// What [`Tracker::build_fused`] made: the batch, the address of its track
@@ -1203,6 +1639,8 @@ pub struct Built {
     /// The association's counts: all zero, with `ran == false`, when there
     /// was nothing to associate with.
     pub fuse: FusePlan,
+    /// What the lidar detector's boxes named, on the same terms.
+    pub names: NamePlan,
 }
 
 /// Everything about one sweep that is not a track: what it came from, and
@@ -1221,6 +1659,24 @@ pub struct TrackMeta {
     pub cam: Option<CamRef>,
     /// How the pairing went.
     pub pairing: Pairing,
+    /// The vehicle's own motion over the interval, and where it came from.
+    pub ego: EgoHalf,
+    /// Which camera `cam` is: the left, unless the left's frame was lost and
+    /// the right's stood in for the whole set.
+    pub side: Camera,
+    /// The right camera's frame the sweep was paired with, if any. When
+    /// `side` is the right, this is `cam` again.
+    pub cam_right: Option<CamRef>,
+    /// How the right camera's pairing went; `Pairing::Absent` without one.
+    pub pairing_right: Pairing,
+    /// How the left camera's pairing went: `pairing` again when `side` is
+    /// the left, and the left frame's own fate when it is the right.
+    pub pairing_left: Pairing,
+    /// How the lidar detector's batch for this sweep was found;
+    /// `Naming::Off` without a lidar detector.
+    pub naming: Naming,
+    /// That batch's seq (the sweep's number), or -1.
+    pub lidar_det_seq: i64,
 }
 
 /// The one-row `tracks` column, wrapping `buf` **without copying it**.
@@ -1354,6 +1810,17 @@ pub fn track_population(t: &[f32; TRACK_LANES]) -> u32 {
     t[LANE_POPULATION] as u32
 }
 
+/// The class a camera gave one track record, as `(class_id, confidence)`:
+/// a fused track's, which both cameras agreed on where there were two, or a
+/// one-camera track's, which one gave and the other did not confirm. `None`
+/// for a track no camera matched. Read off the population lane, for the
+/// reason [`track_detection`] is.
+pub fn track_class(t: &[f32; TRACK_LANES]) -> Option<(u32, f32)> {
+    let pop = t[LANE_POPULATION];
+    (pop == POPULATION_FUSED as f32 || pop == POPULATION_ONE_CAMERA as f32)
+        .then(|| (t[LANE_CLASS_ID] as u32, t[LANE_CONFIDENCE]))
+}
+
 /// The camera detection one track record was fused with, as `(det_index,
 /// iou, class_id, confidence)`, or `None` for a track that was not fused.
 ///
@@ -1367,6 +1834,42 @@ pub fn track_detection(t: &[f32; TRACK_LANES]) -> Option<(u32, f32, u32, f32)> {
             t[LANE_FUSE_IOU],
             t[LANE_CLASS_ID] as u32,
             t[LANE_CONFIDENCE],
+        )
+    })
+}
+
+/// The `(class_id, score)` the lidar detector gave one track record
+/// ([`crate::name`]), an index into [`crate::pillars::CLASSES`], or `None`
+/// for a track in none of its boxes. Read off lane 26 and the score
+/// together: class 0 is "car", so lane 27 alone cannot say "no class", and
+/// a named track's score is above the detector's threshold by construction,
+/// so a row of zeros reads as unnamed rather than as box 0 at no confidence.
+pub fn track_lidar_class(t: &[f32; TRACK_LANES]) -> Option<(u32, f32)> {
+    (t[LANE_LIDAR_DET_INDEX] >= 0.0 && t[LANE_LIDAR_CONFIDENCE] > 0.0)
+        .then(|| (t[LANE_LIDAR_CLASS_ID] as u32, t[LANE_LIDAR_CONFIDENCE]))
+}
+
+/// The rectangle, in the ground plane, of the lidar detector's box one
+/// track record lies in (lanes 29-33), or `None` for a track it did not
+/// name, on [`track_lidar_class`]'s terms.
+pub fn track_lidar_box(t: &[f32; TRACK_LANES]) -> Option<Rect> {
+    (t[LANE_LIDAR_DET_INDEX] >= 0.0 && t[LANE_LIDAR_CONFIDENCE] > 0.0).then(|| Rect {
+        x: t[LANE_LIDAR_BOX],
+        y: t[LANE_LIDAR_BOX + 1],
+        dx: t[LANE_LIDAR_BOX + 2],
+        dy: t[LANE_LIDAR_BOX + 3],
+        yaw: t[LANE_LIDAR_BOX + 4],
+    })
+}
+
+/// The lidar detector's box one track record lies in, as `(det_index,
+/// class_id, score)`, or `None`, on [`track_lidar_class`]'s terms.
+pub fn track_lidar_detection(t: &[f32; TRACK_LANES]) -> Option<(u32, u32, f32)> {
+    (t[LANE_LIDAR_DET_INDEX] >= 0.0 && t[LANE_LIDAR_CONFIDENCE] > 0.0).then(|| {
+        (
+            t[LANE_LIDAR_DET_INDEX] as u32,
+            t[LANE_LIDAR_CLASS_ID] as u32,
+            t[LANE_LIDAR_CONFIDENCE],
         )
     })
 }
@@ -1410,12 +1913,170 @@ mod tests {
             source_points: 0,
             cam: None,
             pairing: Pairing::Absent,
+            ego: EgoHalf::default(),
+            side: Camera::Left,
+            cam_right: None,
+            pairing_right: Pairing::Absent,
+            pairing_left: Pairing::Absent,
+            naming: Naming::Off,
+            lidar_det_seq: -1,
         }
     }
 
     fn plan_at(tk: &mut Tracker, dets: &[[f32; DETECTION_LANES]], seq: i64) -> TrackPlan {
         tk.reserve(dets.len());
-        tk.plan(dets, seq, seq * DT_NS, size(), RANGE)
+        tk.plan(dets, seq, seq * DT_NS, size(), RANGE, None)
+    }
+
+    /// [`plan_at`] with the vehicle's own motion over the interval.
+    fn plan_ego(
+        tk: &mut Tracker,
+        dets: &[[f32; DETECTION_LANES]],
+        seq: i64,
+        ego: EgoRates,
+    ) -> TrackPlan {
+        tk.reserve(dets.len());
+        tk.plan(dets, seq, seq * DT_NS, size(), RANGE, Some(ego))
+    }
+
+    /// Where a world-fixed point at `p` is seen one interval later, from a
+    /// vehicle moving at `ego`: the tracker's own carry, applied to a
+    /// detection so a test can put a stationary object where the sensor
+    /// would really see it.
+    fn seen_later(p: [f32; 3], ego: EgoRates) -> [f32; 3] {
+        EgoMotion {
+            vf: ego.vf,
+            vl: ego.vl,
+            yaw_rate: ego.yaw_rate,
+            dt: DT_NS as f64 * 1e-9,
+        }
+        .carry(p)
+    }
+
+    /// A stationary object seen from a turning vehicle: with the vehicle's
+    /// motion subtracted it keeps its id and reports no velocity; without
+    /// it, the same observations read as an object sliding sideways at the
+    /// yaw rate times its range -- the number the turning problem is made
+    /// of.
+    #[test]
+    fn a_turn_is_subtracted_from_a_stationary_object() {
+        // 5 m/s forward, turning left at 0.25 rad/s: drive 0005's hardest
+        // corner, at a 20 m range.
+        let ego = EgoRates {
+            vf: 5.0,
+            vl: 0.0,
+            yaw_rate: 0.25,
+        };
+        let p0 = [20.0f32, 0.0, -1.0];
+        let p1 = seen_later(p0, ego);
+        let p2 = seen_later(p1, ego);
+        // The sensor really does see it swing: half a metre a sweep.
+        assert!((p1[1] - p0[1]).abs() > 0.4, "{p1:?}");
+        // The velocity is over the track's whole life, two intervals.
+        let two_dt = 2.0 * DT_NS as f32 * 1e-9;
+        for (compensated, want_lateral, want_forward) in [
+            (true, 0.0f32, 0.0f32),
+            (false, (p2[1] - p0[1]) / two_dt, (p2[0] - p0[0]) / two_dt),
+        ] {
+            let mut tk = Tracker::new();
+            let at = |tk: &mut Tracker, p: [f32; 3], seq: i64| {
+                let d = [det(p[0], p[1], p[2])];
+                if compensated {
+                    plan_ego(tk, &d, seq, ego)
+                } else {
+                    plan_at(tk, &d, seq)
+                }
+            };
+            at(&mut tk, p0, 0);
+            at(&mut tk, p1, 1);
+            let p = at(&mut tk, p2, 2);
+            assert_eq!(
+                (p.live, p.emitted, p.born, p.matched),
+                (1, 1, 0, 1),
+                "compensated = {compensated}"
+            );
+            let (batch, _, _) = tk
+                .build(&p, &meta(2, 2 * DT_NS), None, &track_schema())
+                .unwrap();
+            let t = track_rows(&batch)[0];
+            assert_eq!(t[6], 0.0, "the id was reissued");
+            // Lateral velocity: nothing over ground, the swing relative to
+            // the vehicle.
+            assert!(
+                (t[4] - want_lateral).abs() < 0.05,
+                "compensated = {compensated}: vy = {} m/s, want {want_lateral}",
+                t[4]
+            );
+            // Forward: nothing over ground, the closing speed relative to it.
+            assert!(
+                (t[3] - want_forward).abs() < 0.05,
+                "compensated = {compensated}: vx = {} m/s, want {want_forward}",
+                t[3]
+            );
+            // The position is the latest observation either way.
+            assert!((t[0] - p2[0]).abs() < 1e-4 && (t[1] - p2[1]).abs() < 1e-4);
+        }
+    }
+
+    /// With the vehicle's motion the gate is the object's own speed and the
+    /// voxel, and nothing of the vehicle's.
+    #[test]
+    fn the_compensated_gate_has_no_ego_term() {
+        let dt = 0.103_27;
+        let g = association_gate_m(dt, size(), RANGE, true);
+        assert!(
+            (g - (V_OBJ_MAX_MPS * dt + f64::from(V))).abs() < 1e-9,
+            "{g}"
+        );
+        assert!(g < association_gate_m(dt, size(), RANGE, false) / 1.8);
+        assert!(gate_note(dt, size(), RANGE, true).contains("no ego-yaw term"));
+        assert!(gate_note(dt, size(), RANGE, false).contains("ego-yaw swing"));
+        let mut tk = Tracker::new();
+        let d = [det(10.0, 0.0, -1.0)];
+        let ego = EgoRates::default();
+        plan_ego(&mut tk, &d, 0, ego);
+        let p = plan_ego(&mut tk, &d, 1, ego);
+        assert!((p.gate_m - g).abs() < 1e-9);
+    }
+
+    #[test]
+    fn the_ego_half_travels_in_the_batch() {
+        let mut tk = Tracker::new();
+        let d = [det(10.0, 0.0, -1.0)];
+        plan_at(&mut tk, &d, 0);
+        let p = plan_at(&mut tk, &d, 1);
+        let half = EgoHalf {
+            outcome: EgoOutcome::Stale,
+            seq: 40,
+            rates: EgoRates {
+                vf: 5.5,
+                vl: -0.25,
+                yaw_rate: 0.125,
+            },
+        };
+        let m = TrackMeta {
+            ego: half,
+            ..meta(1, DT_NS)
+        };
+        let (b, _, _) = tk.build(&p, &m, None, &track_schema()).unwrap();
+        assert_eq!(track_ego(&b), Some(half));
+        assert_eq!(track_ego(&b).unwrap().rates(), Some(half.rates));
+        // Without a stream, the batch says so and offers no rates.
+        let (b, _, _) = tk
+            .build(&p, &meta(1, DT_NS), None, &track_schema())
+            .unwrap();
+        let none = track_ego(&b).unwrap();
+        assert_eq!(none.outcome, EgoOutcome::Unavailable);
+        assert_eq!(none.rates(), None);
+        for o in [
+            EgoOutcome::Compensated,
+            EgoOutcome::Stale,
+            EgoOutcome::Missing,
+            EgoOutcome::Unavailable,
+        ] {
+            assert_eq!(EgoOutcome::parse(o.name()), Some(o));
+        }
+        assert_eq!(EgoOutcome::parse("paired"), None);
     }
 
     /// The gate is arithmetic over stated constants, so this pins the number
@@ -1423,11 +2084,11 @@ mod tests {
     #[test]
     fn the_gate_is_the_sum_of_its_three_stated_terms() {
         let dt = 0.103_27;
-        let g = association_gate_m(dt, size(), RANGE);
+        let g = association_gate_m(dt, size(), RANGE, false);
         assert!((g - (2.101 + 0.781 + 0.200)).abs() < 0.005, "gate = {g}");
         // It scales with dt -- the property a fixed gate does not have, and the
         // one that stops an eviction from silently retuning the tracker.
-        let wide = association_gate_m(dt * 6.0, size(), RANGE);
+        let wide = association_gate_m(dt * 6.0, size(), RANGE, false);
         assert!(wide > g * 5.0, "{wide} is not ~6x {g}");
         // And the ego-yaw term really is a quarter of it: the cost of not
         // replaying oxts, as a number rather than a claim.
@@ -1623,7 +2284,7 @@ mod tests {
         let mut last = None;
         for (seq, ns) in [(0i64, 0i64), (1, 100_000_000), (2, 250_000_000)] {
             tk.reserve(d.len());
-            let p = tk.plan(&d, seq, ns, size(), RANGE);
+            let p = tk.plan(&d, seq, ns, size(), RANGE, None);
             last = Some((p, ns));
         }
         let (p, ns) = last.unwrap();
@@ -1754,6 +2415,13 @@ mod tests {
                 height: 375,
             }),
             pairing: Pairing::Paired,
+            ego: EgoHalf::default(),
+            side: Camera::Left,
+            cam_right: None,
+            pairing_right: Pairing::Absent,
+            pairing_left: Pairing::Paired,
+            naming: Naming::Off,
+            lidar_det_seq: -1,
         };
         let (b, sid, _) = tk.build(&p, &m, None, &track_schema()).unwrap();
         assert_eq!(cam_seq(&b), Some(41));
@@ -1868,7 +2536,15 @@ mod tests {
         let (_d, calib) = kitti_calib();
         let (tk, p) = two_tracks_in_frame();
         let b = tk
-            .build_fused(&p, &meta(1, DT_NS), Some(&calib), None, &track_schema())
+            .build_fused(
+                &p,
+                &meta(1, DT_NS),
+                Some(&calib),
+                None,
+                Right::Off,
+                None,
+                &track_schema(),
+            )
             .unwrap();
         assert!(!b.fuse.ran);
         let rows = track_rows(&b.batch);
@@ -1886,6 +2562,92 @@ mod tests {
         assert!(crate::fuse::camera_only_rows(&b.batch).is_empty());
     }
 
+    /// With the lidar detector's boxes, the fresh track whose centroid lies
+    /// in one takes its class in lanes 26-28 and nowhere else: the lanes
+    /// before them are the plain build's, bit for bit, the batch counts the
+    /// named track beside the lanes, and says how the batch was found.
+    #[test]
+    fn build_fused_names_the_track_inside_a_lidar_box_and_moves_nothing_else() {
+        let (_d, calib) = kitti_calib();
+        let (tk, p) = two_tracks_in_frame();
+        let plain = tk
+            .build_fused(
+                &p,
+                &meta(1, DT_NS),
+                Some(&calib),
+                None,
+                Right::Off,
+                None,
+                &track_schema(),
+            )
+            .unwrap();
+        assert_eq!(lidar_det_outcome(&plain.batch), Some("lidar_off"));
+        assert_eq!(named_count(&plain.batch), Some(0));
+        assert!(!plain.names.ran);
+        // A small box, turned a little, on the near track's centroid alone.
+        let near = tk.live[0].pos;
+        let boxes = [crate::pillars::LidarDet {
+            x: near[0],
+            y: near[1],
+            z: near[2],
+            dx: 1.0,
+            dy: 0.6,
+            dz: 1.5,
+            yaw: 0.3,
+            class_id: 2,
+            score: 0.95,
+        }
+        .lanes()];
+        let named = TrackMeta {
+            naming: Naming::Named,
+            lidar_det_seq: 1,
+            ..meta(1, DT_NS)
+        };
+        let b = tk
+            .build_fused(
+                &p,
+                &named,
+                Some(&calib),
+                None,
+                Right::Off,
+                Some(&boxes),
+                &track_schema(),
+            )
+            .unwrap();
+        assert!(b.names.ran);
+        assert_eq!(
+            (
+                b.names.detections,
+                b.names.named,
+                b.names.used,
+                b.names.unused
+            ),
+            (1, 1, 1, 0)
+        );
+        let rows = track_rows(&b.batch);
+        assert_eq!(track_lidar_class(&rows[0]), Some((2, 0.95)));
+        assert_eq!(track_lidar_detection(&rows[0]), Some((0, 2, 0.95)));
+        assert_eq!(track_lidar_class(&rows[1]), None);
+        assert_eq!(rows[1][LANE_LIDAR_DET_INDEX], -1.0);
+        assert_eq!(named_count(&b.batch), Some(1));
+        assert_eq!(lidar_det_count(&b.batch), Some(1));
+        assert_eq!(lidar_det_seq(&b.batch), Some(1));
+        assert_eq!(lidar_det_outcome(&b.batch), Some("named"));
+        for (a, z) in rows.iter().zip(track_rows(&plain.batch)) {
+            assert_eq!(
+                a[..LANE_LIDAR_DET_INDEX]
+                    .iter()
+                    .map(|x| x.to_bits())
+                    .collect::<Vec<_>>(),
+                z[..LANE_LIDAR_DET_INDEX]
+                    .iter()
+                    .map(|x| x.to_bits())
+                    .collect::<Vec<_>>()
+            );
+        }
+        assert_eq!(track_storage_id(&b.batch), Some(b.storage_id));
+    }
+
     /// With the paired frame's detections, the track whose projected box the
     /// detection covers is FUSED -- class and confidence in its own record,
     /// beside the lidar lanes, which do not move -- the other is lidar-only,
@@ -1895,7 +2657,15 @@ mod tests {
         let (_d, calib) = kitti_calib();
         let (tk, p) = two_tracks_in_frame();
         let plain = tk
-            .build_fused(&p, &meta(1, DT_NS), Some(&calib), None, &track_schema())
+            .build_fused(
+                &p,
+                &meta(1, DT_NS),
+                Some(&calib),
+                None,
+                Right::Off,
+                None,
+                &track_schema(),
+            )
             .unwrap();
         let near = track_rows(&plain.batch)[0];
         let nb = track_image_box(&near).unwrap();
@@ -1923,6 +2693,8 @@ mod tests {
                 &meta(1, DT_NS),
                 Some(&calib),
                 Some((&view, &mut fuser)),
+                Right::Off,
+                None,
                 &track_schema(),
             )
             .unwrap();
@@ -1957,6 +2729,137 @@ mod tests {
         );
         // Still one buffer for the tracks, at the address the batch reports.
         assert_eq!(track_storage_id(&b.batch), Some(b.storage_id));
+    }
+
+    /// With the right camera's frame, the left's match is confirmed where
+    /// the right detector found the same class in the same place -- and the
+    /// track's box in the right image is its own, 54 cm further along the
+    /// baseline -- and demoted to one camera's where the right frame is
+    /// missing. The second camera's columns say which frame and how.
+    #[test]
+    fn build_fused_confirms_a_match_with_the_right_camera_and_demotes_without_it() {
+        let (dir, calib) = kitti_calib();
+        let right_calib = Calib::load_camera(dir.path(), "2011_09_26", Camera::Right).unwrap();
+        let stereo = Stereo::of(&calib, &right_calib);
+        assert!(stereo.px_m > 300.0, "{stereo:?}");
+        let (tk, p) = two_tracks_in_frame();
+        let plain = tk
+            .build_fused(
+                &p,
+                &meta(1, DT_NS),
+                Some(&calib),
+                None,
+                Right::Off,
+                None,
+                &track_schema(),
+            )
+            .unwrap();
+        let near = track_rows(&plain.batch)[0];
+        let nb = track_image_box(&near).unwrap();
+        let tight = ImageBox {
+            x0: nb.x0 + 2.0,
+            y0: nb.y0 + 2.0,
+            x1: nb.x1 - 2.0,
+            y1: nb.y1,
+        };
+        let left = cam_dets(&[tight]);
+        let lv = crate::camdet::cam_det_view(&left).unwrap();
+        // The right camera's box: the near track's own box in the right
+        // image, the way its left box is in the left, a little tighter.
+        let rb = right_calib
+            .project_box(tk.live[0].lo, tk.live[0].hi)
+            .unwrap();
+        let right_tight = ImageBox {
+            x0: rb.x0 + 2.0,
+            y0: rb.y0 + 2.0,
+            x1: rb.x1 - 2.0,
+            y1: rb.y1,
+        };
+        assert!(
+            rb.x0 < nb.x0 && (nb.x0 - rb.x0) > 10.0,
+            "the right box is not further left: {rb:?} vs {nb:?}"
+        );
+        let right = cam_dets(&[right_tight]);
+        let rv = crate::camdet::cam_det_view(&right).unwrap();
+        let mut fuser = crate::fuse::Fuser::new();
+        fuser.reserve(2, 1);
+        fuser.reserve_right(2, 1, 1);
+        let right_ref = CamRef {
+            seq: 1,
+            tov_ns: DT_NS,
+            width: 1242,
+            height: 375,
+        };
+        let with_right = TrackMeta {
+            cam: Some(right_ref),
+            pairing: Pairing::Paired,
+            cam_right: Some(right_ref),
+            pairing_right: Pairing::Paired,
+            pairing_left: Pairing::Paired,
+            ..meta(1, DT_NS)
+        };
+        let b = tk
+            .build_fused(
+                &p,
+                &with_right,
+                Some(&calib),
+                Some((&lv, &mut fuser)),
+                Right::Frame {
+                    dets: &rv,
+                    calib: &right_calib,
+                    stereo,
+                },
+                None,
+                &track_schema(),
+            )
+            .unwrap();
+        assert!(b.fuse.right_ran);
+        assert_eq!(
+            (b.fuse.fused, b.fuse.confirmed, b.fuse.one_camera),
+            (1, 1, 0)
+        );
+        let rows = track_rows(&b.batch);
+        assert_eq!(track_population(&rows[0]), POPULATION_FUSED);
+        assert_eq!(track_class(&rows[0]), Some((2, 0.9)));
+        assert_eq!(fused_count(&b.batch), Some(1));
+        assert_eq!(cam_side(&b.batch), Some(Camera::Left));
+        assert_eq!(cam1_seq(&b.batch), Some(1));
+        assert_eq!(cam1_pair_outcome(&b.batch), Some("paired"));
+        assert_eq!(cam0_pair_outcome(&b.batch), Some("paired"));
+        // The stereo range of the confirmed track is the lidar's distance,
+        // give or take the box: two sensors, one object.
+        let checks = fuser.stereo_checks();
+        assert_eq!(checks.len(), 1);
+        assert!((checks[0].0 - 11.5).abs() < 1e-3, "{checks:?}");
+        assert!((checks[0].1 - 12.0).abs() < 1e-3, "{checks:?}");
+        assert!((checks[0].2 - 12.0).abs() < 1.5, "{checks:?}");
+
+        // Without the right frame, in a run that has the camera.
+        let b = tk
+            .build_fused(
+                &p,
+                &TrackMeta {
+                    pairing_right: Pairing::Late,
+                    ..with_right
+                },
+                Some(&calib),
+                Some((&lv, &mut fuser)),
+                Right::Missing,
+                None,
+                &track_schema(),
+            )
+            .unwrap();
+        assert!(b.fuse.demoted && !b.fuse.right_ran);
+        assert_eq!(
+            (b.fuse.fused, b.fuse.unconfirmed, b.fuse.one_camera),
+            (0, 1, 1)
+        );
+        let rows = track_rows(&b.batch);
+        assert_eq!(track_population(&rows[0]), POPULATION_ONE_CAMERA);
+        assert_eq!(track_class(&rows[0]), Some((2, 0.9)));
+        assert_eq!(track_detection(&rows[0]), None);
+        assert_eq!(fused_count(&b.batch), Some(0));
+        assert_eq!(cam1_pair_outcome(&b.batch), Some("pair_late"));
     }
 
     /// The "not in frame" encoding: four zeros, and the accessor is the one

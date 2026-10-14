@@ -1,19 +1,31 @@
-//! The frozen camera detector: YOLOX-Nano run on each camera frame, and the
-//! `CAM_DET` batch its detections travel in.
+//! The frozen camera detector: a YOLOX network run on each camera frame, and
+//! the `CAM_DET` batch its detections travel in.
 //!
 //! **Frozen** means three things, each checked rather than asserted: the
-//! weights are one file whose sha256 is pinned here ([`MODEL_SHA256`]) and
-//! compared at load; nothing in this module learns or adapts; and the runtime
-//! (`tract-onnx`, pinned exactly) runs single-threaded, so the same frame
-//! gives the same bytes on every run. Which frames it is given is not this
-//! module's to promise: on a loaded host the queue in front of it can evict
-//! one.
+//! weights are one file whose sha256 is pinned here ([`ModelSpec::sha256`])
+//! and compared at load; nothing in this module learns or adapts; and the
+//! default runtime (`tract-onnx`, pinned exactly) runs single-threaded, so
+//! the same frame gives the same bytes on every run. Which frames it is given
+//! is not this module's to promise: on a loaded host the queue in front of it
+//! can evict one.
+//!
+//! Six models and three runtimes ([`MODELS`], [`Backend`]). The models are
+//! YOLOX-Nano, -S, -M, -L and -X as Megvii publishes them, each as a derived
+//! file with its declared input set to the size the pipeline feeds
+//! (`scripts/prepare_models.py`; ONNX Runtime refuses any other size, tract
+//! ignores the declared one). The two biggest are for the GPU, at the
+//! frame's own resolution and with their weights as 16-bit floats, which a
+//! GPU runs half as fast again and which finds the same objects. The runtimes are tract on one thread, ONNX
+//! Runtime on a CPU thread pool, and ONNX Runtime's CUDA provider on the
+//! GPU; the second and third are loaded from the library `ORT_DYLIB_PATH`
+//! names, so a machine without it still runs the default.
 //!
 //! Every number below is the model's, not a tuning of this project's: the
-//! input shape, the letterbox fill, the channel order, the score threshold
-//! and the NMS overlap are the ones the model was published and evaluated
-//! with, adapted only in the input shape — 640x192 keeps the KITTI frame's
-//! aspect ratio instead of padding 70 % of a 416x416 square. They were
+//! letterbox fill, the channel order, the score threshold and the NMS
+//! overlap are the ones the model was published and evaluated with, adapted
+//! only in the input shape — 640x192 keeps the KITTI frame's aspect ratio
+//! instead of padding 70 % of a 416x416 square, and 1024x320 gives the
+//! bigger models the frame at four fifths of its own resolution. They were
 //! checked against the model's reference implementation (ONNX Runtime and
 //! YOLOX's own preprocessing) on drive_0005 when the detector was chosen, and
 //! the facts that matter are restated at each constant rather than left in
@@ -30,7 +42,7 @@
 use std::cmp::Ordering;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use arrow::array::{
     Array, ArrayRef, AsArray, Float32Array, Int64Array, LargeListArray, RecordBatch, StringArray,
@@ -45,32 +57,246 @@ use tract_onnx::prelude::{
     TypedRunnableModel,
 };
 
+use crate::onnx::ort_session;
 use crate::track::CamRef;
 
-/// Where `pipes run` looks for the weights, relative to the working directory
-/// (the repository root, where `runs/` also goes).
-pub const MODEL_FILE: &str = "models/yolox_nano.onnx";
+/// Which runtime runs the network.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Backend {
+    /// `tract`, pure Rust, one thread: the same frame gives the same bytes on
+    /// every run, on any machine. The default.
+    #[default]
+    Tract,
+    /// ONNX Runtime on the CPU, with an intra-op thread pool.
+    Ort,
+    /// ONNX Runtime's CUDA execution provider: the network on the GPU, with
+    /// cuDNN's convolution algorithms chosen by its heuristics rather than
+    /// by timing ([`CudaSearch::Heuristic`]) and TF32 off, so a run is
+    /// repeatable on one machine.
+    Cuda,
+}
 
-/// The script that puts [`MODEL_FILE`] there. Named by every error that
-/// means "the model is not usable", so the message ends at a next step.
+/// How the `cuda` backend picks each convolution's cuDNN algorithm.
+///
+/// A run uses [`CudaSearch::Heuristic`]: cuDNN's own ranking by shape, the
+/// same every time on one machine, so two runs give the same bytes. The
+/// others exist for `pipes bench-detector` to measure against it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CudaSearch {
+    /// `cudnnGetConvolutionForwardAlgorithm_v7`: ranked by heuristics, no
+    /// timing, deterministic.
+    #[default]
+    Heuristic,
+    /// cuDNN's default algorithm for every convolution, whatever its shape:
+    /// deterministic, and very slow for depthwise convolutions.
+    Default,
+    /// `cudnnFindConvolutionForwardAlgorithmEx`: every algorithm timed on
+    /// the first frame and the fastest kept. Can pick differently from run
+    /// to run.
+    Exhaustive,
+}
+
+impl CudaSearch {
+    /// The CLI / `run.json` spelling.
+    pub fn name(self) -> &'static str {
+        match self {
+            CudaSearch::Heuristic => "heuristic",
+            CudaSearch::Default => "default",
+            CudaSearch::Exhaustive => "exhaustive",
+        }
+    }
+}
+
+/// The `cuda` backend's two knobs, both recorded by a run: how each
+/// convolution's algorithm is chosen, and whether the GPU's tensor cores
+/// may round the matmuls' inputs to TF32 (10 bits of mantissa). Off, the
+/// arithmetic is single precision like the CPU's and the detections are the
+/// CPU's to the last places the algorithms allow; on, faster on an Ampere
+/// GPU and still the same bytes on every run of one machine.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CudaOptions {
+    /// The algorithm choice.
+    pub search: CudaSearch,
+    /// TF32 on the tensor cores.
+    pub tf32: bool,
+}
+
+impl Backend {
+    /// The CLI / `run.json` spelling.
+    pub fn name(self) -> &'static str {
+        match self {
+            Backend::Tract => "tract",
+            Backend::Ort => "ort",
+            Backend::Cuda => "cuda",
+        }
+    }
+
+    /// Whether the backend is ONNX Runtime, loaded from [`ORT_DYLIB_ENV`].
+    pub fn is_ort(self) -> bool {
+        matches!(self, Backend::Ort | Backend::Cuda)
+    }
+}
+
+/// The environment variable naming the ONNX Runtime library the `ort` and
+/// `cuda` backends load (`libonnxruntime.so`, version 1.22.0, the GPU build
+/// for `cuda`); [`ORT_DYLIB_DEFAULT`] when unset.
+pub const ORT_DYLIB_ENV: &str = "ORT_DYLIB_PATH";
+
+/// Where the Docker images put the library.
+pub const ORT_DYLIB_DEFAULT: &str = "/opt/onnxruntime/lib/libonnxruntime.so";
+
+/// One model `pipes` can run: the published network, as a file derived from
+/// it with the declared input at the size the pipeline feeds, and that size.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ModelSpec {
+    /// The name `--detector-model` takes and `run.json` records.
+    pub name: &'static str,
+    /// The derived file, relative to the working directory (the repository
+    /// root, where `runs/` also goes).
+    pub file: &'static str,
+    /// sha256 of that file: the one file this spec will load.
+    pub sha256: &'static str,
+    /// The published file it is derived from, in `models/`.
+    pub source: &'static str,
+    /// That file's sha256.
+    pub source_sha256: &'static str,
+    /// Network input width and height in pixels.
+    ///
+    /// 640x192 is the KITTI frame's aspect ratio (1242/375 = 3.31) rounded to
+    /// the network's stride of 32: r = 0.512, content 635x192, five columns
+    /// of padding. The published 416x416 would spend 70 % of its compute on
+    /// padding and see objects at the scale of a 416x128 input. 1024x320 is
+    /// the same ratio at r = 0.824: four fifths of the frame's own
+    /// resolution, for the models with the capacity to use it. 1248x384 is
+    /// the frame itself, to the stride: r = 1.005, content 1248x376.
+    pub input_w: usize,
+    /// Network input height in pixels. See `input_w`.
+    pub input_h: usize,
+    /// Parameters, millions, from the model zoo: the size of the network.
+    pub params_m: f32,
+    /// Whether the file's weights and inner tensors are 16-bit floats, its
+    /// input and output still 32-bit: a file for ONNX Runtime, and in
+    /// practice for the GPU. tract is not given one.
+    pub half: bool,
+}
+
+/// YOLOX-Nano at 640x192: the detector every run before sprint 2 used, and
+/// still the default. 0.9 M parameters.
+pub const YOLOX_NANO: ModelSpec = ModelSpec {
+    name: "yolox_nano",
+    file: "models/yolox_nano-640x192.onnx",
+    sha256: "2e657f4a4dd9673fe8952d30290c4ef522ae0898ce5a834f6187f320e502efde",
+    source: "yolox_nano.onnx",
+    source_sha256: "c789161ed43c8269fcd4e67c67eeeb4e80c622da2eb296a20bc6007bd18a0b7d",
+    input_w: 640,
+    input_h: 192,
+    params_m: 0.91,
+    half: false,
+};
+
+/// YOLOX-S at 640x192: ten times the parameters of Nano at the same input.
+pub const YOLOX_S: ModelSpec = ModelSpec {
+    name: "yolox_s",
+    file: "models/yolox_s-640x192.onnx",
+    sha256: "e299a91106dff16bf0c7150f734ca66554d613ea862f90d0486d64c4e3ad7db8",
+    source: "yolox_s.onnx",
+    source_sha256: "c5c2d13e59ae883e6af3b45daea64af4833a4951c92d116ec270d9ddbe998063",
+    input_w: 640,
+    input_h: 192,
+    params_m: 9.0,
+    half: false,
+};
+
+/// YOLOX-S at 1024x320: the same network given four fifths of the frame's
+/// resolution.
+pub const YOLOX_S_1024: ModelSpec = ModelSpec {
+    name: "yolox_s-1024",
+    file: "models/yolox_s-1024x320.onnx",
+    sha256: "78bca087b51cb8c0858d136d06c81cbb823f76706933ecc834da40f6dbbf04dc",
+    source: "yolox_s.onnx",
+    source_sha256: "c5c2d13e59ae883e6af3b45daea64af4833a4951c92d116ec270d9ddbe998063",
+    input_w: 1024,
+    input_h: 320,
+    params_m: 9.0,
+    half: false,
+};
+
+/// YOLOX-M at 1024x320: 25 million parameters.
+pub const YOLOX_M_1024: ModelSpec = ModelSpec {
+    name: "yolox_m-1024",
+    file: "models/yolox_m-1024x320.onnx",
+    sha256: "44c08f3bf3623416823cc975d9d4018471d1eac1174eb16e944b6940659a1867",
+    source: "yolox_m.onnx",
+    source_sha256: "21ff6cfdeb53b013bac2249599e55f00bff3cfdfdab37ed7a4620818c1d15b3f",
+    input_w: 1024,
+    input_h: 320,
+    params_m: 25.3,
+    half: false,
+};
+
+/// YOLOX-L at 1248x384, 16-bit weights: 54 million parameters given the
+/// frame at its own resolution. For the GPU.
+pub const YOLOX_L_1248: ModelSpec = ModelSpec {
+    name: "yolox_l-1248",
+    file: "models/yolox_l-1248x384-fp16.onnx",
+    sha256: "a12d84e874f8a0a28e918708378da6bfc2f73f113c4be5d7741ace980818ac0d",
+    source: "yolox_l.onnx",
+    source_sha256: "7860ae79de6c89a3c1eb72ae9a2756c0ccfbe04b7791bb5880afabd97855a411",
+    input_w: 1248,
+    input_h: 384,
+    params_m: 54.2,
+    half: true,
+};
+
+/// YOLOX-X at 1248x384, 16-bit weights: 99 million parameters, the biggest
+/// network of the family, at the frame's own resolution. For the GPU.
+pub const YOLOX_X_1248: ModelSpec = ModelSpec {
+    name: "yolox_x-1248",
+    file: "models/yolox_x-1248x384-fp16.onnx",
+    sha256: "8a0b683a887c3cf7242f123dfecf4644e7aafc3dab6dfd80f6022667591d0169",
+    source: "yolox_x.onnx",
+    source_sha256: "c892d7aaf1c4746d8a4d675bec669a4db4f434b4ee1efb654bc9b353379c7c55",
+    input_w: 1248,
+    input_h: 384,
+    params_m: 99.1,
+    half: true,
+};
+
+/// Every model `--detector-model` can name, the default first.
+pub const MODELS: [&ModelSpec; 6] = [
+    &YOLOX_NANO,
+    &YOLOX_S,
+    &YOLOX_S_1024,
+    &YOLOX_M_1024,
+    &YOLOX_L_1248,
+    &YOLOX_X_1248,
+];
+
+/// The model of that name, or `None`.
+pub fn model_named(name: &str) -> Option<&'static ModelSpec> {
+    MODELS.iter().copied().find(|m| m.name == name)
+}
+
+/// Where `pipes run` looks for the default detector's weights, relative to
+/// the working directory: [`YOLOX_NANO`]'s file.
+pub const MODEL_FILE: &str = YOLOX_NANO.file;
+
+/// The script that puts the models there (`scripts/prepare_models.py` does
+/// the deriving; this one downloads and runs it on Windows). Named by every
+/// error that means "the model is not usable", so the message ends at a
+/// next step.
 pub const FETCH_SCRIPT: &str = "scripts/fetch_model.ps1";
 
-/// sha256 of the one file this module will load: `yolox_nano.onnx` from
-/// YOLOX release 0.1.1rc0, 3,659,407 bytes.
-pub const MODEL_SHA256: &str = "c789161ed43c8269fcd4e67c67eeeb4e80c622da2eb296a20bc6007bd18a0b7d";
+/// sha256 of the default detector's file: [`YOLOX_NANO`]'s.
+pub const MODEL_SHA256: &str = YOLOX_NANO.sha256;
 
-/// Model name, as `run.json` and the schema metadata record it.
-pub const MODEL_NAME: &str = "yolox_nano";
+/// The default model's name, as `run.json` and the schema metadata record it.
+pub const MODEL_NAME: &str = YOLOX_NANO.name;
 
-/// Network input width in pixels.
-///
-/// 640x192 is the KITTI frame's aspect ratio (1242/375 = 3.31) rounded to the
-/// network's stride of 32: r = 0.512, content 635x192, five columns of padding.
-/// The published 416x416 would spend 70 % of its compute on padding and see
-/// objects at the scale of a 416x128 input.
-pub const INPUT_W: usize = 640;
-/// Network input height in pixels. See [`INPUT_W`].
-pub const INPUT_H: usize = 192;
+/// The default model's input width in pixels. See [`ModelSpec::input_w`].
+pub const INPUT_W: usize = YOLOX_NANO.input_w;
+/// The default model's input height in pixels.
+pub const INPUT_H: usize = YOLOX_NANO.input_h;
 
 /// Value of every letterbox pixel outside the resized image, per channel.
 /// YOLOX's own preprocessing fills with 114.
@@ -92,10 +318,9 @@ pub const OUTPUT_COLS: usize = 85;
 /// The three strides of YOLOX's heads, in output-row order.
 pub const STRIDES: [usize; 3] = [8, 16, 32];
 
-/// Anchors (output rows) at [`INPUT_W`]x[`INPUT_H`]: 1920 + 480 + 120.
-pub const ANCHORS: usize = (INPUT_W / 8) * (INPUT_H / 8)
-    + (INPUT_W / 16) * (INPUT_H / 16)
-    + (INPUT_W / 32) * (INPUT_H / 32);
+/// Anchors (output rows) of the default model, at [`INPUT_W`]x[`INPUT_H`]:
+/// 1920 + 480 + 120. See [`ModelSpec::anchors`].
+pub const ANCHORS: usize = YOLOX_NANO.anchors();
 
 /// Value of the `ref_format` column of a detection batch.
 ///
@@ -233,6 +458,8 @@ pub enum CamDetError {
         path: PathBuf,
         /// What its bytes hash to.
         got: String,
+        /// What the spec pins.
+        expected: &'static str,
     },
     /// The runtime refused the model or the input.
     Runtime(String),
@@ -250,8 +477,9 @@ pub enum CamDetError {
 impl std::fmt::Display for CamDetError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let fetch = format!(
-            "run `powershell -ExecutionPolicy Bypass -File {}` from the repository root \
-             to download it, or pass `--detector off`",
+            "run `docker compose build` to put it in the image (outside Docker, \
+             `powershell -ExecutionPolicy Bypass -File {}` from the repository root), \
+             or pass `--detector off`",
             FETCH_SCRIPT.replace('/', "\\")
         );
         match self {
@@ -261,9 +489,13 @@ impl std::fmt::Display for CamDetError {
                 p.display()
             ),
             CamDetError::Io(p, e) => write!(f, "{}: {e}", p.display()),
-            CamDetError::Sha256Mismatch { path, got } => write!(
+            CamDetError::Sha256Mismatch {
+                path,
+                got,
+                expected,
+            } => write!(
                 f,
-                "{} is not the pinned camera detector: sha256 {got}, expected {MODEL_SHA256}; \
+                "{} is not the pinned camera detector: sha256 {got}, expected {expected}; \
                  delete it and {fetch}",
                 path.display()
             ),
@@ -288,24 +520,63 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     s
 }
 
-/// The loaded network. Built once, before the clock starts; `run` is the only
-/// thing a frame costs.
+/// The network as one runtime holds it.
+enum Engine {
+    /// tract's optimised plan: `run` takes `&self` and makes its own state.
+    Tract(Arc<TypedRunnableModel>),
+    /// An ONNX Runtime session, whose `run` takes `&mut self`: one per
+    /// stage, so two cameras never queue on one lock.
+    Ort(Mutex<ort::session::Session>),
+}
+
+/// The loaded network. Built once, before the clock starts; `infer` is the
+/// only thing a frame costs.
 pub struct Model {
-    plan: Arc<TypedRunnableModel>,
-    /// sha256 of the file it was loaded from — equal to [`MODEL_SHA256`], or
-    /// [`Model::load`] would have refused it.
+    engine: Engine,
+    /// Which model, and so which input size and which file.
+    pub spec: ModelSpec,
+    /// Which runtime runs it.
+    pub backend: Backend,
+    /// The CPU threads the `ort` backend was given; 1 for the others.
+    pub threads: usize,
+    /// sha256 of the file it was loaded from — equal to the spec's, or
+    /// [`Model::load_with`] would have refused it.
     pub sha256: String,
 }
 
 impl Model {
-    /// Reads `path`, checks its sha256 against [`MODEL_SHA256`], and builds the
-    /// runnable plan at 1x3x[`INPUT_H`]x[`INPUT_W`].
-    ///
-    /// The file declares a 416x416 input; `with_ignore_value_info` and
-    /// `with_ignore_output_shapes` drop those declared shapes so the input
-    /// fact can be replaced (its reshapes are `[1, 85, -1]`, so any multiple
-    /// of 32 works). Without them tract fails to unify 640 with 416.
+    /// The default: [`YOLOX_NANO`] on tract, from `path`.
     pub fn load(path: &Path) -> Result<Model, CamDetError> {
+        Model::load_with(path, &YOLOX_NANO, Backend::Tract, 1, CudaOptions::default())
+    }
+
+    /// Reads `path`, checks its sha256 against `spec`'s, and builds the
+    /// network on `backend` at 1x3x`input_h`x`input_w`; `threads` is the
+    /// `ort` backend's CPU pool and `cuda` the `cuda` backend's knobs, each
+    /// ignored by the other backends.
+    ///
+    /// On tract the file's declared shapes are dropped (`with_ignore_value_info`
+    /// and `with_ignore_output_shapes`) and the input fact set to the spec's
+    /// size: any multiple of 32 works, the network's reshapes being `[1, 85,
+    /// -1]`. ONNX Runtime takes the declared shapes as they are, which is
+    /// why every spec's file is the published graph with its declared input
+    /// at the spec's size.
+    pub fn load_with(
+        path: &Path,
+        spec: &ModelSpec,
+        backend: Backend,
+        threads: usize,
+        cuda: CudaOptions,
+    ) -> Result<Model, CamDetError> {
+        // Refused by name, before any file is opened: a CPU run that asks
+        // for a GPU model is told so whether or not the file is there.
+        if spec.half && backend == Backend::Tract {
+            return Err(CamDetError::Runtime(format!(
+                "{} is a file of 16-bit weights, made for ONNX Runtime on the GPU: run it with \
+                 --detector-backend cuda (or ort, slowly); tract runs the 32-bit models",
+                spec.name
+            )));
+        }
         let mut file = match std::fs::File::open(path) {
             Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -317,32 +588,74 @@ impl Model {
         file.read_to_end(&mut bytes)
             .map_err(|e| CamDetError::Io(path.to_path_buf(), e))?;
         let sha256 = sha256_hex(&bytes);
-        if sha256 != MODEL_SHA256 {
+        if sha256 != spec.sha256 {
             return Err(CamDetError::Sha256Mismatch {
                 path: path.to_path_buf(),
                 got: sha256,
+                expected: spec.sha256,
             });
         }
-        let rt = |e: tract_onnx::prelude::TractError| CamDetError::Runtime(format!("{e:#}"));
-        let plan = tract_onnx::onnx()
-            .with_ignore_value_info(true)
-            .with_ignore_output_shapes(true)
-            .model_for_read(&mut bytes.as_slice())
-            .map_err(rt)?
-            .with_input_fact(0, f32::fact([1, 3, INPUT_H, INPUT_W]).into())
-            .map_err(rt)?
-            .into_optimized()
-            .map_err(rt)?
-            .into_runnable()
-            .map_err(rt)?;
-        Ok(Model { plan, sha256 })
+        let engine = match backend {
+            Backend::Tract => {
+                let rt =
+                    |e: tract_onnx::prelude::TractError| CamDetError::Runtime(format!("{e:#}"));
+                let plan = tract_onnx::onnx()
+                    .with_ignore_value_info(true)
+                    .with_ignore_output_shapes(true)
+                    .model_for_read(&mut bytes.as_slice())
+                    .map_err(rt)?
+                    .with_input_fact(0, f32::fact([1, 3, spec.input_h, spec.input_w]).into())
+                    .map_err(rt)?
+                    .into_optimized()
+                    .map_err(rt)?
+                    .into_runnable()
+                    .map_err(rt)?;
+                Engine::Tract(plan)
+            }
+            // The session the lidar detector gets too, built in one place
+            // (`crate::onnx`): the library, the thread pool, cuDNN's
+            // algorithm rule and TF32 on the same terms for both networks.
+            Backend::Ort | Backend::Cuda => Engine::Ort(Mutex::new(
+                ort_session(&bytes, threads, (backend == Backend::Cuda).then_some(cuda))
+                    .map_err(CamDetError::Runtime)?,
+            )),
+        };
+        let model = Model {
+            engine,
+            spec: *spec,
+            backend,
+            threads: if backend == Backend::Ort {
+                threads.max(1)
+            } else {
+                1
+            },
+            sha256,
+        };
+        // The first frame's cost, paid here, before the clock: a runtime
+        // allocates its buffers and loads its kernels on its first run --
+        // a third of a second on the GPU, where the pipeline's first three
+        // frames were then late and the fusion declared the camera silent.
+        let blank = vec![0.0f32; 3 * spec.input_w * spec.input_h];
+        model.infer(blank, 1.0, spec.input_w as u32, spec.input_h as u32)?;
+        Ok(model)
     }
 
-    /// Runs the network on one tensor from [`preprocess`], which it consumes,
-    /// and [`decode`]s the `[ANCHORS x 85]` output **where the runtime left
-    /// it**: the 857 KB output is read in place, never copied out.
+    /// The network input for one RGB8 frame, at this model's size:
+    /// [`ModelSpec::preprocess`].
+    pub fn preprocess(
+        &self,
+        rgb: &[u8],
+        width: u32,
+        height: u32,
+    ) -> Result<(Vec<f32>, f64), CamDetError> {
+        self.spec.preprocess(rgb, width, height)
+    }
+
+    /// Runs the network on one tensor from [`Model::preprocess`], which it
+    /// consumes, and decodes the `[anchors x 85]` output **where the runtime
+    /// left it**: the output is read in place, never copied out.
     ///
-    /// `r`, `width` and `height` are the letterbox ratio [`preprocess`]
+    /// `r`, `width` and `height` are the letterbox ratio `preprocess`
     /// returned and the frame's own size, which the boxes are mapped back to.
     /// The candidates come back in output-row order, before [`nms`].
     pub fn infer(
@@ -352,149 +665,221 @@ impl Model {
         width: u32,
         height: u32,
     ) -> Result<Vec<Det>, CamDetError> {
-        let rt = |e: tract_onnx::prelude::TractError| CamDetError::Runtime(format!("{e:#}"));
-        // Moved, not copied: the tensor takes the Vec's buffer.
-        let t: Tensor = tract_ndarray::Array4::from_shape_vec((1, 3, INPUT_H, INPUT_W), input)
-            .map_err(|e| CamDetError::Runtime(e.to_string()))?
-            .into();
-        let out = self.plan.run(tvec!(t.into())).map_err(rt)?;
-        let first = out
-            .first()
-            .ok_or_else(|| CamDetError::Runtime("no output".to_string()))?;
-        let view = first.to_plain_array_view::<f32>().map_err(rt)?;
-        // A tract tensor owns one contiguous, standard-layout buffer, so the
-        // view is a slice and the fallback copy is never expected to run; it
-        // exists so a layout change would cost time rather than correctness.
-        let copied: Vec<f32>;
-        let raw: &[f32] = match view.as_slice() {
-            Some(s) => s,
-            None => {
-                copied = view.iter().copied().collect();
-                &copied
-            }
+        let (h, w) = (self.spec.input_h, self.spec.input_w);
+        let want = self.spec.anchors() * OUTPUT_COLS;
+        let wrong = |n: usize| {
+            CamDetError::Runtime(format!(
+                "output has {n} values, expected {} x {OUTPUT_COLS}",
+                self.spec.anchors()
+            ))
         };
-        if raw.len() != ANCHORS * OUTPUT_COLS {
-            return Err(CamDetError::Runtime(format!(
-                "output has {} values, expected {ANCHORS} x {OUTPUT_COLS}",
-                raw.len()
-            )));
-        }
-        Ok(decode(raw, r, width, height))
-    }
-}
-
-/// The letterbox scale for a `width x height` frame: the largest `r` that fits
-/// the frame inside the input, as YOLOX computes it (f64, then truncated).
-pub fn letterbox_ratio(width: u32, height: u32) -> f64 {
-    (INPUT_H as f64 / f64::from(height)).min(INPUT_W as f64 / f64::from(width))
-}
-
-/// The resized content size inside the letterbox: `trunc(w r) x trunc(h r)`.
-pub fn letterbox_size(width: u32, height: u32) -> (u32, u32) {
-    let r = letterbox_ratio(width, height);
-    (
-        ((f64::from(width) * r) as u32).clamp(1, INPUT_W as u32),
-        ((f64::from(height) * r) as u32).clamp(1, INPUT_H as u32),
-    )
-}
-
-/// The network input for one RGB8 frame, read **in place** from `rgb`.
-///
-/// Resize bilinear (`Triangle`, which reproduces the reference cv2
-/// `INTER_LINEAR` detections to within 0.01 of score) to
-/// [`letterbox_size`], place it at the TOP-LEFT of a [`INPUT_W`]x[`INPUT_H`]
-/// canvas filled with [`PAD_VALUE`], planes in B, G, R order, raw 0..255
-/// values, NCHW. Returns the tensor and the ratio [`decode`] divides by.
-///
-/// Three allocations, all real and all reported by the stage: the resize's
-/// own intermediate (its vertical pass writes a four-channel f32 image of the
-/// frame's width by the new height, 1242 x 192 x 16 = 3,815,424 bytes on
-/// KITTI), the resized image (`trunc(w r) * trunc(h r) * 3` = 365,760
-/// bytes) and the tensor (`3 * 192 * 640 * 4` = 1,474,560 bytes) -- 5,655,744
-/// bytes. A run on drive_0005 measures 5,655,808 per frame: 64 bytes more,
-/// not traced.
-pub fn preprocess(rgb: &[u8], width: u32, height: u32) -> Result<(Vec<f32>, f64), CamDetError> {
-    let bad = CamDetError::BadFrame {
-        width,
-        height,
-        got: rgb.len(),
-    };
-    if width == 0 || height == 0 || rgb.len() != width as usize * height as usize * 3 {
-        return Err(bad);
-    }
-    let src: ImageBuffer<Rgb<u8>, &[u8]> = ImageBuffer::from_raw(width, height, rgb).ok_or(bad)?;
-    let r = letterbox_ratio(width, height);
-    let (nw, nh) = letterbox_size(width, height);
-    let resized = image::imageops::resize(&src, nw, nh, image::imageops::FilterType::Triangle);
-    let plane = INPUT_W * INPUT_H;
-    let mut t = vec![PAD_VALUE; 3 * plane];
-    let (nw, nh) = (nw as usize, nh as usize);
-    let raw = resized.as_raw();
-    for y in 0..nh {
-        let row = &raw[y * nw * 3..(y + 1) * nw * 3];
-        let (px, _) = row.as_chunks::<3>();
-        let base = y * INPUT_W;
-        for (x, p) in px.iter().enumerate() {
-            t[base + x] = f32::from(p[2]);
-            t[plane + base + x] = f32::from(p[1]);
-            t[2 * plane + base + x] = f32::from(p[0]);
-        }
-    }
-    Ok((t, r))
-}
-
-/// Every anchor whose score is above [`SCORE_THRESHOLD`], as a box in the
-/// frame's own pixels.
-///
-/// The output is `[ANCHORS x 85]`, stride-8 cells first (row-major), then
-/// stride 16, then 32. Columns 0..3 are grid-relative `(dx, dy, log w, log
-/// h)`; 4 is objectness and 5..84 the class probabilities, both already
-/// through a sigmoid. `cx = (dx + gx) s`, `w = exp(log w) s`; corners divided
-/// by `r` and clipped to the image. Class = argmax (the first on a tie).
-pub fn decode(raw: &[f32], r: f64, width: u32, height: u32) -> Vec<Det> {
-    let mut out = Vec::new();
-    let (wf, hf) = (width as f32, height as f32);
-    let r = r as f32;
-    let mut row = 0usize;
-    for s in STRIDES {
-        let (gw, gh) = (INPUT_W / s, INPUT_H / s);
-        for gy in 0..gh {
-            for gx in 0..gw {
-                let i = row;
-                row += 1;
-                let Some(a) = raw.get(i * OUTPUT_COLS..(i + 1) * OUTPUT_COLS) else {
-                    return out;
-                };
-                let obj = a[4];
-                let mut best = 0usize;
-                for (k, v) in a[5..].iter().enumerate() {
-                    if *v > a[5 + best] {
-                        best = k;
+        match &self.engine {
+            Engine::Tract(plan) => {
+                let rt =
+                    |e: tract_onnx::prelude::TractError| CamDetError::Runtime(format!("{e:#}"));
+                // Moved, not copied: the tensor takes the Vec's buffer.
+                let t: Tensor = tract_ndarray::Array4::from_shape_vec((1, 3, h, w), input)
+                    .map_err(|e| CamDetError::Runtime(e.to_string()))?
+                    .into();
+                let out = plan.run(tvec!(t.into())).map_err(rt)?;
+                let first = out
+                    .first()
+                    .ok_or_else(|| CamDetError::Runtime("no output".to_string()))?;
+                let view = first.to_plain_array_view::<f32>().map_err(rt)?;
+                // A tract tensor owns one contiguous, standard-layout buffer,
+                // so the view is a slice and the fallback copy is never
+                // expected to run; it exists so a layout change would cost
+                // time rather than correctness.
+                let copied: Vec<f32>;
+                let raw: &[f32] = match view.as_slice() {
+                    Some(s) => s,
+                    None => {
+                        copied = view.iter().copied().collect();
+                        &copied
                     }
+                };
+                if raw.len() != want {
+                    return Err(wrong(raw.len()));
                 }
-                let score = obj * a[5 + best];
-                // Positive test: a NaN score is never kept.
-                if score.partial_cmp(&SCORE_THRESHOLD) != Some(Ordering::Greater) {
-                    continue;
+                Ok(self.spec.decode(raw, r, width, height))
+            }
+            Engine::Ort(session) => {
+                let rt = |e: ort::Error| CamDetError::Runtime(format!("ONNX Runtime: {e}"));
+                // Moved, not copied, into the input tensor; the output is
+                // read where the runtime left it.
+                let t = ort::value::Tensor::<f32>::from_array(([1usize, 3, h, w], input))
+                    .map_err(rt)?;
+                let mut s = session.lock().unwrap_or_else(PoisonError::into_inner);
+                let out = s.run(ort::inputs![t]).map_err(rt)?;
+                let (_, raw) = out[0].try_extract_tensor::<f32>().map_err(rt)?;
+                if raw.len() != want {
+                    return Err(wrong(raw.len()));
                 }
-                let sf = s as f32;
-                let cx = (a[0] + gx as f32) * sf;
-                let cy = (a[1] + gy as f32) * sf;
-                let w = a[2].exp() * sf;
-                let h = a[3].exp() * sf;
-                out.push(Det {
-                    x0: ((cx - w / 2.0) / r).clamp(0.0, wf),
-                    y0: ((cy - h / 2.0) / r).clamp(0.0, hf),
-                    x1: ((cx + w / 2.0) / r).clamp(0.0, wf),
-                    y1: ((cy + h / 2.0) / r).clamp(0.0, hf),
-                    class_id: best as u32,
-                    score,
-                    row: i as u32,
-                });
+                Ok(self.spec.decode(raw, r, width, height))
             }
         }
     }
-    out
+}
+
+impl ModelSpec {
+    /// Anchors (output rows) at this input size: one per cell of each of the
+    /// three heads' grids.
+    pub const fn anchors(&self) -> usize {
+        (self.input_w / 8) * (self.input_h / 8)
+            + (self.input_w / 16) * (self.input_h / 16)
+            + (self.input_w / 32) * (self.input_h / 32)
+    }
+
+    /// The input shape as the words `1x3xHxW`, and that the weights are
+    /// 16-bit floats when they are.
+    pub fn input_words(&self) -> String {
+        let half = if self.half { ", 16-bit weights" } else { "" };
+        format!("1x3x{}x{}{half}", self.input_h, self.input_w)
+    }
+
+    /// The letterbox scale for a `width x height` frame: the largest `r`
+    /// that fits the frame inside the input, as YOLOX computes it (f64, then
+    /// truncated).
+    pub fn letterbox_ratio(&self, width: u32, height: u32) -> f64 {
+        (self.input_h as f64 / f64::from(height)).min(self.input_w as f64 / f64::from(width))
+    }
+
+    /// The resized content size inside the letterbox: `trunc(w r) x trunc(h
+    /// r)`.
+    pub fn letterbox_size(&self, width: u32, height: u32) -> (u32, u32) {
+        let r = self.letterbox_ratio(width, height);
+        (
+            ((f64::from(width) * r) as u32).clamp(1, self.input_w as u32),
+            ((f64::from(height) * r) as u32).clamp(1, self.input_h as u32),
+        )
+    }
+
+    /// The network input for one RGB8 frame, read **in place** from `rgb`.
+    ///
+    /// Resize bilinear (`Triangle`, which reproduces the reference cv2
+    /// `INTER_LINEAR` detections to within 0.01 of score) to
+    /// [`ModelSpec::letterbox_size`], place it at the TOP-LEFT of an
+    /// `input_w` x `input_h` canvas filled with [`PAD_VALUE`], planes in B,
+    /// G, R order, raw 0..255 values, NCHW. Returns the tensor and the ratio
+    /// [`ModelSpec::decode`] divides by.
+    ///
+    /// Three allocations, all real and all reported by the stage: the
+    /// resize's own intermediate (its vertical pass writes a four-channel f32
+    /// image of the frame's width by the new height, 1242 x 192 x 16 =
+    /// 3,815,424 bytes on KITTI at 640x192), the resized image (`trunc(w r) *
+    /// trunc(h r) * 3` = 365,760 bytes) and the tensor (`3 * 192 * 640 * 4` =
+    /// 1,474,560 bytes) -- 5,655,744 bytes. A run on drive_0005 measures
+    /// 5,655,808 per frame: 64 bytes more, not traced.
+    pub fn preprocess(
+        &self,
+        rgb: &[u8],
+        width: u32,
+        height: u32,
+    ) -> Result<(Vec<f32>, f64), CamDetError> {
+        let bad = CamDetError::BadFrame {
+            width,
+            height,
+            got: rgb.len(),
+        };
+        if width == 0 || height == 0 || rgb.len() != width as usize * height as usize * 3 {
+            return Err(bad);
+        }
+        let src: ImageBuffer<Rgb<u8>, &[u8]> =
+            ImageBuffer::from_raw(width, height, rgb).ok_or(bad)?;
+        let r = self.letterbox_ratio(width, height);
+        let (nw, nh) = self.letterbox_size(width, height);
+        let resized = image::imageops::resize(&src, nw, nh, image::imageops::FilterType::Triangle);
+        let plane = self.input_w * self.input_h;
+        let mut t = vec![PAD_VALUE; 3 * plane];
+        let (nw, nh) = (nw as usize, nh as usize);
+        let raw = resized.as_raw();
+        for y in 0..nh {
+            let row = &raw[y * nw * 3..(y + 1) * nw * 3];
+            let (px, _) = row.as_chunks::<3>();
+            let base = y * self.input_w;
+            for (x, p) in px.iter().enumerate() {
+                t[base + x] = f32::from(p[2]);
+                t[plane + base + x] = f32::from(p[1]);
+                t[2 * plane + base + x] = f32::from(p[0]);
+            }
+        }
+        Ok((t, r))
+    }
+
+    /// Every anchor whose score is above [`SCORE_THRESHOLD`], as a box in the
+    /// frame's own pixels.
+    ///
+    /// The output is `[anchors x 85]`, stride-8 cells first (row-major), then
+    /// stride 16, then 32. Columns 0..3 are grid-relative `(dx, dy, log w,
+    /// log h)`; 4 is objectness and 5..84 the class probabilities, both
+    /// already through a sigmoid. `cx = (dx + gx) s`, `w = exp(log w) s`;
+    /// corners divided by `r` and clipped to the image. Class = argmax (the
+    /// first on a tie).
+    pub fn decode(&self, raw: &[f32], r: f64, width: u32, height: u32) -> Vec<Det> {
+        let mut out = Vec::new();
+        let (wf, hf) = (width as f32, height as f32);
+        let r = r as f32;
+        let mut row = 0usize;
+        for s in STRIDES {
+            let (gw, gh) = (self.input_w / s, self.input_h / s);
+            for gy in 0..gh {
+                for gx in 0..gw {
+                    let i = row;
+                    row += 1;
+                    let Some(a) = raw.get(i * OUTPUT_COLS..(i + 1) * OUTPUT_COLS) else {
+                        return out;
+                    };
+                    let obj = a[4];
+                    let mut best = 0usize;
+                    for (k, v) in a[5..].iter().enumerate() {
+                        if *v > a[5 + best] {
+                            best = k;
+                        }
+                    }
+                    let score = obj * a[5 + best];
+                    // Positive test: a NaN score is never kept.
+                    if score.partial_cmp(&SCORE_THRESHOLD) != Some(Ordering::Greater) {
+                        continue;
+                    }
+                    let sf = s as f32;
+                    let cx = (a[0] + gx as f32) * sf;
+                    let cy = (a[1] + gy as f32) * sf;
+                    let w = a[2].exp() * sf;
+                    let h = a[3].exp() * sf;
+                    out.push(Det {
+                        x0: ((cx - w / 2.0) / r).clamp(0.0, wf),
+                        y0: ((cy - h / 2.0) / r).clamp(0.0, hf),
+                        x1: ((cx + w / 2.0) / r).clamp(0.0, wf),
+                        y1: ((cy + h / 2.0) / r).clamp(0.0, hf),
+                        class_id: best as u32,
+                        score,
+                        row: i as u32,
+                    });
+                }
+            }
+        }
+        out
+    }
+}
+
+/// [`ModelSpec::letterbox_ratio`] of the default model.
+pub fn letterbox_ratio(width: u32, height: u32) -> f64 {
+    YOLOX_NANO.letterbox_ratio(width, height)
+}
+
+/// [`ModelSpec::letterbox_size`] of the default model.
+pub fn letterbox_size(width: u32, height: u32) -> (u32, u32) {
+    YOLOX_NANO.letterbox_size(width, height)
+}
+
+/// [`ModelSpec::preprocess`] of the default model.
+pub fn preprocess(rgb: &[u8], width: u32, height: u32) -> Result<(Vec<f32>, f64), CamDetError> {
+    YOLOX_NANO.preprocess(rgb, width, height)
+}
+
+/// [`ModelSpec::decode`] of the default model.
+pub fn decode(raw: &[f32], r: f64, width: u32, height: u32) -> Vec<Det> {
+    YOLOX_NANO.decode(raw, r, width, height)
 }
 
 /// Intersection over union of two boxes; 0 when either is empty.
@@ -537,7 +922,7 @@ pub fn detect_frame(
     width: u32,
     height: u32,
 ) -> Result<Vec<Det>, CamDetError> {
-    let (t, r) = preprocess(rgb, width, height)?;
+    let (t, r) = model.preprocess(rgb, width, height)?;
     Ok(nms(model.infer(t, r, width, height)?))
 }
 
@@ -571,14 +956,22 @@ fn det_item_field() -> Arc<Field> {
 /// **Provenance** of the model is in the schema's metadata — `model`,
 /// `model_sha256`, `input`, `score_threshold`, `nms_iou` — which every batch
 /// carries by reference at no per-frame cost. The frame's own seq and instant
-/// are the first two columns; the sample's `parent` names it too.
+/// are the first two columns; the sample's `parent` names it too. This is
+/// the default model's schema; [`cam_det_schema_of`] is any model's.
 pub fn cam_det_schema(model_sha256: &str) -> Arc<Schema> {
+    cam_det_schema_of(&YOLOX_NANO, model_sha256)
+}
+
+/// [`cam_det_schema`] for the model that made the detections: its name and
+/// its input size are in the metadata, so a file of detections says which
+/// network they are from.
+pub fn cam_det_schema_of(spec: &ModelSpec, model_sha256: &str) -> Arc<Schema> {
     let meta = [
-        ("model", MODEL_NAME.to_string()),
+        ("model", spec.name.to_string()),
         ("model_sha256", model_sha256.to_string()),
         (
             "input",
-            format!("1x3x{INPUT_H}x{INPUT_W} bgr letterbox-top-left"),
+            format!("{} bgr letterbox-top-left", spec.input_words()),
         ),
         ("score_threshold", SCORE_THRESHOLD.to_string()),
         ("nms_iou", NMS_IOU.to_string()),
@@ -812,6 +1205,103 @@ mod tests {
         }
     }
 
+    /// The catalog: six models, each its own file and hash, the default
+    /// first and the three sizes the pipeline feeds, with the anchor counts
+    /// those sizes give.
+    #[test]
+    fn the_catalog_names_six_models_at_three_sizes() {
+        assert_eq!(MODELS[0].name, MODEL_NAME);
+        assert_eq!(
+            (MODEL_FILE, MODEL_SHA256),
+            (YOLOX_NANO.file, YOLOX_NANO.sha256)
+        );
+        let mut files: Vec<&str> = MODELS.iter().map(|m| m.file).collect();
+        files.sort_unstable();
+        files.dedup();
+        assert_eq!(files.len(), MODELS.len(), "two models share a file");
+        for m in MODELS {
+            assert_eq!(m.sha256.len(), 64, "{}", m.name);
+            assert!(
+                m.sha256.chars().all(|c| c.is_ascii_hexdigit()),
+                "{}",
+                m.name
+            );
+            assert_eq!(m.source_sha256.len(), 64, "{}", m.name);
+            assert!(m.input_w % 32 == 0 && m.input_h % 32 == 0, "{}", m.name);
+            assert_eq!(model_named(m.name), Some(m));
+            // The derived file's name says its size, and that its weights
+            // are 16-bit when they are.
+            let tail = if m.half { "-fp16" } else { "" };
+            assert!(
+                m.file
+                    .ends_with(&format!("-{}x{}{tail}.onnx", m.input_w, m.input_h)),
+                "{}",
+                m.file
+            );
+            assert_eq!(m.input_words().contains("16-bit"), m.half, "{}", m.name);
+        }
+        assert_eq!(YOLOX_NANO.anchors(), 2520);
+        assert_eq!(YOLOX_S.anchors(), 2520);
+        assert_eq!(YOLOX_S_1024.anchors(), 6720);
+        assert_eq!(YOLOX_M_1024.anchors(), 6720);
+        assert_eq!(YOLOX_L_1248.anchors(), 9828);
+        assert_eq!(YOLOX_X_1248.anchors(), 9828);
+        assert_eq!(model_named("yolox_l"), None);
+        // The biggest input is the frame itself, to the network's stride:
+        // six columns and eight rows of padding, and no resolution given up.
+        assert_eq!(YOLOX_X_1248.letterbox_size(1242, 375), (1248, 376));
+        assert!((YOLOX_X_1248.letterbox_ratio(1242, 375) - 1.0048).abs() < 1e-3);
+        assert_eq!(YOLOX_X_1248.input_words(), "1x3x384x1248, 16-bit weights");
+        // The 16-bit files are ONNX Runtime's: tract is refused them by
+        // name, before any file is opened for it.
+        assert!(MODELS.iter().filter(|m| m.half).count() == 2);
+        let refused = Model::load_with(
+            Path::new("no/such/file.onnx"),
+            &YOLOX_X_1248,
+            Backend::Tract,
+            1,
+            CudaOptions::default(),
+        );
+        assert!(
+            matches!(&refused, Err(CamDetError::Runtime(m)) if m.contains("16-bit weights")),
+            "a GPU model on tract was not refused by name"
+        );
+        // The bigger input keeps the frame's aspect ratio at four fifths of
+        // its resolution.
+        assert_eq!(YOLOX_S_1024.letterbox_size(1242, 375), (1024, 309));
+        assert!((YOLOX_S_1024.letterbox_ratio(1242, 375) - 0.8245).abs() < 1e-3);
+        assert_eq!(YOLOX_S_1024.input_words(), "1x3x320x1024");
+        for b in [Backend::Tract, Backend::Ort, Backend::Cuda] {
+            assert_eq!(b.is_ort(), b != Backend::Tract);
+        }
+    }
+
+    /// Decoding at the bigger size: the grids are 128x40, 64x20 and 32x10,
+    /// and an anchor of the second head lands where its cell says.
+    #[test]
+    fn decode_at_1024_by_320_reads_the_bigger_grids() {
+        let spec = YOLOX_S_1024;
+        let mut raw = vec![0f32; spec.anchors() * OUTPUT_COLS];
+        // Row 5120 + 3 * 64 + 7: stride 16, cell (7, 3).
+        let i = 128 * 40 + 3 * 64 + 7;
+        let a = &mut raw[i * OUTPUT_COLS..(i + 1) * OUTPUT_COLS];
+        a[0] = 0.5;
+        a[1] = 0.5;
+        a[2] = 0.0;
+        a[3] = 0.0;
+        a[4] = 1.0;
+        a[5 + 2] = 0.9;
+        let d = spec.decode(&raw, 0.8245, 1242, 375);
+        assert_eq!(d.len(), 1);
+        let d = d[0];
+        assert_eq!((d.class_id, d.row), (2, i as u32));
+        // Centre (7.5, 3.5) cells of 16 px, a 16 px box, over the ratio.
+        let (cx, cy) = (7.5 * 16.0 / 0.8245, 3.5 * 16.0 / 0.8245);
+        assert!((0.5 * (d.x0 + d.x1) - cx).abs() < 0.01, "{d:?}");
+        assert!((0.5 * (d.y0 + d.y1) - cy).abs() < 0.01, "{d:?}");
+        assert!((d.x1 - d.x0 - 16.0 / 0.8245).abs() < 0.01, "{d:?}");
+    }
+
     #[test]
     fn the_kitti_frame_letterboxes_to_635_by_192() {
         assert_eq!(ANCHORS, 2520);
@@ -931,6 +1421,18 @@ mod tests {
     fn the_batch_round_trips_and_carries_its_provenance() {
         let schema = cam_det_schema(MODEL_SHA256);
         assert_eq!(schema.metadata()["model_sha256"], MODEL_SHA256);
+        assert_eq!(schema.metadata()["model"], MODEL_NAME);
+        assert_eq!(
+            schema.metadata()["input"],
+            "1x3x192x640 bgr letterbox-top-left"
+        );
+        // Another model's batches name that model, not the default.
+        let big = cam_det_schema_of(&YOLOX_L_1248, YOLOX_L_1248.sha256);
+        assert_eq!(big.metadata()["model"], "yolox_l-1248");
+        assert_eq!(
+            big.metadata()["input"],
+            "1x3x384x1248, 16-bit weights bgr letterbox-top-left"
+        );
         let r = CamRef {
             seq: 12,
             tov_ns: 34,

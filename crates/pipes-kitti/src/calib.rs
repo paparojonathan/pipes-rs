@@ -102,9 +102,7 @@
 
 use std::path::{Path, PathBuf};
 
-/// Camera-2 (left colour) is the one this project replays, so its `P_rect` and
-/// `S_rect` rows are the ones read.
-const CAM: &str = "02";
+use crate::cam0::Camera;
 
 /// Smallest `w` a box corner may have before the box is refused as straddling
 /// the camera plane, in the same units as `w` (metres along the optical axis,
@@ -118,11 +116,13 @@ const CAM: &str = "02";
 /// the camera, which is the guard that makes the pixel arithmetic total.
 const W_MIN: f64 = 0.1;
 
-/// The collapsed lidar-to-image projection for one KITTI capture date, plus
-/// the rectified image size that projection is valid for.
+/// The collapsed lidar-to-image projection of one camera for one KITTI
+/// capture date, plus the rectified image size that projection is valid for.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Calib {
-    /// `P_rect_02 @ R_rect_00 @ Tr_velo_to_cam`, row-major 3x4.
+    /// Which camera's: the left (`P_rect_02`) unless asked otherwise.
+    pub cam: Camera,
+    /// `P_rect_0x @ R_rect_00 @ Tr_velo_to_cam`, row-major 3x4.
     ///
     /// Public because the only thing that catches a silently-wrong calibration
     /// is a test on these twelve numbers. Every plausible shortcut — omitting
@@ -130,10 +130,28 @@ pub struct Calib {
     /// (2.91 px), zeroing the fourth column (2.91 px) — produces an overlay
     /// that looks right.
     pub m: [[f64; 4]; 3],
-    /// Rectified image width from `S_rect_02`, in pixels.
+    /// Rectified image width from `S_rect_0x`, in pixels.
     pub width: u32,
-    /// Rectified image height from `S_rect_02`, in pixels.
+    /// Rectified image height from `S_rect_0x`, in pixels.
     pub height: u32,
+    /// `P_rect_0x[0][3]`: the camera's offset along the rectified baseline,
+    /// as the projection carries it, in pixel-metres (`-f` times the
+    /// distance from camera 0). A point at depth `Z` lands `baseline_term /
+    /// Z` pixels further along `u` than it would in camera 0, which is what
+    /// [`stereo_range_m`] inverts.
+    pub baseline_term: f64,
+}
+
+/// The depth of a point seen in both colour cameras, from how far apart its
+/// two pixels are: `disparity_px = u_left - u_right`, and `Z =
+/// (left.baseline_term - right.baseline_term) / disparity_px`, 384.4 pixel-
+/// metres on the 2011_09_26 rig (54 cm apart at 721.5 px of focal length),
+/// so 38 px apart is 10 m away. `None` for a disparity that is not positive:
+/// the right camera is to the right, so a real point is always further left
+/// in its image.
+pub fn stereo_range_m(left: &Calib, right: &Calib, disparity_px: f64) -> Option<f64> {
+    let px_m = left.baseline_term - right.baseline_term;
+    (disparity_px > 0.0 && px_m > 0.0).then(|| px_m / disparity_px)
 }
 
 /// A rectangle in the rectified camera-2 image, in pixels, clipped to the
@@ -260,8 +278,10 @@ pub enum CalibError {
     /// per drive rather than hardcoding. A constant 1242x375 would be wrong on
     /// three of the other four dates and wrong *silently*.
     ImageSize {
-        /// File `S_rect_02` came from.
+        /// File `S_rect_0x` came from.
         path: PathBuf,
+        /// Which camera's `S_rect` row.
+        cam: Camera,
         /// What the calibration says.
         calib: (u32, u32),
         /// What the PNG says.
@@ -321,10 +341,16 @@ impl std::fmt::Display for CalibError {
                  passes the first two and fails the third",
                 path.display()
             ),
-            CalibError::ImageSize { path, calib, drive } => write!(
+            CalibError::ImageSize {
+                path,
+                cam,
+                calib,
+                drive,
+            } => write!(
                 f,
-                "{}: S_rect_{CAM} says {}x{} but the drive's images are {}x{}",
+                "{}: S_rect_{} says {}x{} but the drive's images are {}x{}",
                 path.display(),
+                cam.index(),
                 calib.0,
                 calib.1,
                 drive.0,
@@ -470,6 +496,13 @@ impl Calib {
     /// separate `R:` and `T:` rows, and code copied from the odometry
     /// benchmark finds nothing and either errors or silently uses an identity.
     pub fn load(root: &Path, date: &str) -> Result<Calib, CalibError> {
+        Calib::load_camera(root, date, Camera::Left)
+    }
+
+    /// [`Calib::load`] for either colour camera: its own `P_rect` and
+    /// `S_rect` rows, the same `R_rect_00` and the same lidar-to-camera
+    /// transform, which is what KITTI's devkit does for every camera.
+    pub fn load_camera(root: &Path, date: &str, cam: Camera) -> Result<Calib, CalibError> {
         let dir = root.join(date);
         let v2c = RawCalib::read(&dir.join("calib_velo_to_cam.txt"))?;
         let c2c = RawCalib::read(&dir.join("calib_cam_to_cam.txt"))?;
@@ -482,8 +515,8 @@ impl Calib {
         // test cannot resolve at its ±2 px floor. Following the devkit, not
         // having confirmed it.
         let rr = c2c.rotation("R_rect_00")?;
-        let p = c2c.values::<12>(&format!("P_rect_{CAM}"))?;
-        let s = c2c.values::<2>(&format!("S_rect_{CAM}"))?;
+        let p = c2c.values::<12>(&format!("P_rect_{}", cam.index()))?;
+        let s = c2c.values::<2>(&format!("S_rect_{}", cam.index()))?;
 
         // rt = R_rect_00 @ [R | T], a 3x4.
         let mut rt = [[0.0f64; 4]; 3];
@@ -507,9 +540,11 @@ impl Calib {
             }
         }
         Ok(Calib {
+            cam,
             m,
             width: s[0] as u32,
             height: s[1] as u32,
+            baseline_term: p[3],
         })
     }
 
@@ -524,6 +559,7 @@ impl Calib {
         }
         Err(CalibError::ImageSize {
             path: path.to_path_buf(),
+            cam: self.cam,
             calib: (self.width, self.height),
             drive: (w, h),
         })
@@ -635,7 +671,9 @@ corner_dist: 9.950000e-02\n\
 S_rect_00: 1.242000e+03 3.750000e+02\n\
 R_rect_00: 9.999239e-01 9.837760e-03 -7.445048e-03 -9.869795e-03 9.999421e-01 -4.278459e-03 7.402527e-03 4.351614e-03 9.999631e-01\n\
 S_rect_02: 1.242000e+03 3.750000e+02\n\
-P_rect_02: 7.215377e+02 0.000000e+00 6.095593e+02 4.485728e+01 0.000000e+00 7.215377e+02 1.728540e+02 2.163791e-01 0.000000e+00 0.000000e+00 1.000000e+00 2.745884e-03\n";
+P_rect_02: 7.215377e+02 0.000000e+00 6.095593e+02 4.485728e+01 0.000000e+00 7.215377e+02 1.728540e+02 2.163791e-01 0.000000e+00 0.000000e+00 1.000000e+00 2.745884e-03\n\
+S_rect_03: 1.242000e+03 3.750000e+02\n\
+P_rect_03: 7.215377e+02 0.000000e+00 6.095593e+02 -3.395242e+02 0.000000e+00 7.215377e+02 1.728540e+02 2.199936e+00 0.000000e+00 0.000000e+00 1.000000e+00 2.729905e-03\n";
 
     fn write_calib(dir: &Path, v2c: &str, c2c: &str) {
         std::fs::create_dir_all(dir.join("d")).unwrap();
@@ -664,6 +702,48 @@ P_rect_02: 7.215377e+02 0.000000e+00 6.095593e+02 4.485728e+01 0.000000e+00 7.21
         write_calib(&d, VELO_TO_CAM, CAM_TO_CAM);
         let c = Calib::load(&d, "d").unwrap();
         (d, c)
+    }
+
+    /// The right camera is the left one moved 54 cm along the baseline: the
+    /// rotation part of the projection is the same to the bit, the
+    /// translation part differs by `P_rect`'s fourth column, and that
+    /// difference over a point's disparity is its depth.
+    #[test]
+    fn the_right_camera_differs_from_the_left_by_the_baseline_alone() {
+        let d = tmp("right");
+        write_calib(&d, VELO_TO_CAM, CAM_TO_CAM);
+        let l = Calib::load(&d, "d").unwrap();
+        let r = Calib::load_camera(&d, "d", Camera::Right).unwrap();
+        assert_eq!((l.cam, r.cam), (Camera::Left, Camera::Right));
+        assert_eq!((l.width, l.height), (r.width, r.height));
+        for (lr, rr) in l.m.iter().zip(&r.m) {
+            assert_eq!(lr[..3], rr[..3]);
+        }
+        let dx = l.m[0][3] - r.m[0][3];
+        assert!((dx - 384.38148).abs() < 1e-3, "{dx}");
+        assert!((l.baseline_term - 44.85728).abs() < 1e-5);
+        assert!((r.baseline_term + 339.5242).abs() < 1e-4);
+        // 38.4 px of disparity is 10 m of depth, and a disparity that is not
+        // positive is not a point both cameras saw.
+        let z = stereo_range_m(&l, &r, 38.438148).unwrap();
+        assert!((z - 10.0).abs() < 1e-6, "{z}");
+        assert_eq!(stereo_range_m(&l, &r, 0.0), None);
+        assert_eq!(stereo_range_m(&l, &r, -5.0), None);
+        // A point ahead lands further LEFT in the right image, by exactly
+        // that term over its depth, which is the disparity the range inverts.
+        let p = [10.0f32, 0.0, 0.0];
+        let (al, _, wl) = l.homogeneous(p);
+        let (ar, _, wr) = r.homogeneous(p);
+        // The depth row's fourth entries differ by 16 µm between the two
+        // files, which is all the depths differ by.
+        assert!((wl - wr).abs() < 1e-3, "{wl} vs {wr}");
+        let disparity = al / wl - ar / wr;
+        assert!(
+            disparity > 0.0 && (disparity - dx / wl).abs() < 0.01,
+            "{disparity}"
+        );
+        let back = stereo_range_m(&l, &r, disparity).unwrap();
+        assert!((back - wl).abs() < 1e-3, "{back} vs {wl}");
     }
 
     /// All twelve entries, against the matrix the investigation measured with

@@ -56,16 +56,17 @@ use std::time::Duration;
 use arrow::array::RecordBatch;
 use arrow::datatypes::Schema;
 use pipes_core::alloc::{
-    bytes_alloc, set_stage_slot, SLOT_CAMDET, SLOT_DETECT, SLOT_OBJ, SLOT_PROC, SLOT_REDUCE,
-    SLOT_RERUN, SLOT_STATE, SLOT_STATE_SINK, SLOT_TRACK,
+    bytes_alloc, set_stage_slot, SLOT_CAMDET, SLOT_CAMDET_RIGHT, SLOT_DETECT, SLOT_OBJ,
+    SLOT_PILLARS, SLOT_PROC, SLOT_REDUCE, SLOT_RERUN, SLOT_STATE, SLOT_STATE_SINK, SLOT_TRACK,
 };
 use pipes_core::clock::{now, HostTime};
 use pipes_core::evidence::{Evidence, RowCtx};
 use pipes_core::queue::{BoundedQueue, Queued};
 use pipes_core::sample::{payload_bytes, Sample, StreamId};
 use pipes_kitti::calib::{Calib, ImageBox};
+use pipes_kitti::cam0::Camera;
 use pipes_kitti::camdet::{
-    build_cam_det_batch, cam_det_storage_id, cam_det_view, class_name, nms, preprocess, Det, Model,
+    build_cam_det_batch, cam_det_storage_id, cam_det_view, class_name, nms, Det, Model,
     COCO_CLASSES,
 };
 use pipes_kitti::detect::{
@@ -77,21 +78,39 @@ use pipes_kitti::detect::{
 };
 use pipes_kitti::frame::{cam0_dims, cam0_pixels, cam0_storage_id};
 use pipes_kitti::fuse::{
-    camera_only_column, camera_only_rows, FusePlan, Fuser, POPULATION_FUSED, POPULATION_LIDAR_ONLY,
+    camera_only_column, camera_only_rows, FusePlan, Fuser, Stereo, CAMERA_ONLY_LANE_RANGE,
+    POPULATION_FUSED, POPULATION_LIDAR_ONLY, POPULATION_ONE_CAMERA,
 };
 use pipes_kitti::layout::ABSENT_IN_SOURCE;
+use pipes_kitti::name::{agrees, NamePlan, NAME_SCORE_MIN};
+use pipes_kitti::oxts::{oxts_storage_id, read_ego, EgoRates};
+use pipes_kitti::path::Path as EgoPath;
+use pipes_kitti::pillars::{
+    build_pillar_det_batch, class_name as lidar_class_name, pillar_det_rows, pillar_det_storage_id,
+    Candidate, LidarModel, PillarMeta, Pillarizer, Step, View as LidarView,
+};
 use pipes_kitti::state::{
-    build_state_batch, cam_seq as state_cam_seq, candidates as state_candidates,
+    build_state_batch, cam0_pair_outcome as state_cam0_pair_outcome,
+    cam1_pair_outcome as state_cam1_pair_outcome, cam_seq as state_cam_seq,
+    cam_side as state_cam_side, candidates as state_candidates, ego_vf as state_ego_vf,
     fused_count as state_fused_count, has_object as state_has_object,
-    in_frame_count as state_in_frame_count, object_rows, pair_age_ns as state_pair_age_ns,
-    pair_outcome as state_pair_outcome, read_answer, record_is_consistent,
-    source_point_count as state_source_points, source_tracks as state_source_tracks,
-    state_storage_id, state_sweep_seq, Object, StateAnswer, StateMeta,
+    in_frame_count as state_in_frame_count, named_count as state_named_count, object_rows,
+    pair_age_ns as state_pair_age_ns, pair_outcome as state_pair_outcome, read_answer,
+    record_is_consistent, source_point_count as state_source_points,
+    source_tracks as state_source_tracks, state_storage_id, state_sweep_seq, Object, StateAnswer,
+    StateMeta, CORRIDOR_HALF_WIDTH_M,
 };
 use pipes_kitti::track::{
     build_cam_ref_batch,
+    cam0_pair_outcome as track_cam0_pair_outcome,
+    cam1_pair_outcome as track_cam1_pair_outcome,
+    cam1_seq as track_cam1_seq,
     cam_seq as track_cam_seq,
+    cam_side as track_cam_side,
     cam_tov_ns as track_cam_tov_ns,
+    gate_m as track_gate_m,
+    lidar_det_outcome as track_lidar_det_outcome,
+    named_count as track_named_count,
     pair_age_ns as track_pair_age_ns,
     pair_outcome as track_pair_outcome,
     read_cam_ref,
@@ -99,8 +118,11 @@ use pipes_kitti::track::{
     source_point_count as track_source_points,
     source_voxel_count as track_source_voxels,
     track_age_s,
+    track_class,
     track_detection,
+    track_ego,
     track_image_box,
+    track_lidar_class,
     track_observations,
     track_population,
     track_rows,
@@ -109,7 +131,11 @@ use pipes_kitti::track::{
     track_sweep_seq,
     track_trigger_ns,
     CamRef,
+    EgoHalf,
+    EgoOutcome,
+    Naming,
     Pairing,
+    Right,
     TrackMeta,
     // Renamed at the import so the name says what it tracks: `proc` once had
     // a 2D pixel-region tracker of the same name in this file.
@@ -121,11 +147,11 @@ use pipes_kitti::voxel::{
     source_point_count as voxel_source_points, voxel_size_m, VoxelPlan, VoxelSize, Voxelizer,
 };
 use rerun::archetypes::{
-    AnnotationContext, Boxes2D, Boxes3D, Clear, Image, Measurements, Points2D, Points3D, Scalars,
-    TextDocument, TextLog,
+    AnnotationContext, Boxes2D, Boxes3D, Clear, Image, LineStrips3D, Measurements, Points2D,
+    Points3D, Scalars, TextDocument, TextLog,
 };
-use rerun::components::{Color, FillMode, ImageBuffer, MediaType, Radius};
-use rerun::datatypes::{Blob, ChannelDatatype, ColorModel, Rgba32};
+use rerun::components::{Color, FillMode, ImageBuffer, MediaType, Radius, RotationAxisAngle};
+use rerun::datatypes::{Angle, Blob, ChannelDatatype, ColorModel, Rgba32};
 use serde::Serialize;
 
 use crate::admission::Admission;
@@ -217,6 +243,9 @@ const CLASS_FUSED: u16 = 1;
 const CLASS_LIDAR_ONLY: u16 = 2;
 /// See [`CLASS_FUSED`].
 const CLASS_CAMERA_ONLY: u16 = 3;
+/// See [`CLASS_FUSED`]: a track one camera matched and the other did not
+/// confirm, [`POPULATION_ONE_CAMERA`].
+const CLASS_ONE_CAMERA: u16 = 4;
 /// See [`CLASS_FUSED`].
 const CLASS_ANSWER: u16 = 9;
 
@@ -231,6 +260,7 @@ fn population_classes() -> AnnotationContext {
         (CLASS_FUSED, "fused", rgba(C_FUSED)),
         (CLASS_LIDAR_ONLY, "lidar-only", rgba(C_LIDAR_ONLY)),
         (CLASS_CAMERA_ONLY, "camera-only", rgba(C_CAMERA_ONLY)),
+        (CLASS_ONE_CAMERA, "one camera", rgba(C_LIDAR_ONLY)),
         (CLASS_ANSWER, "answer", rgba(C_ANSWER)),
     ])
 }
@@ -264,12 +294,53 @@ const FUSED_OUTLINE_PT: f32 = 1.5;
 const STALE_STROKE_PX: f32 = 3.0;
 
 /// Outline width of the ONE answer box, in UI points: thick at any zoom,
-/// because it is the one rectangle on the picture that is a decision.
+/// because it is the one rectangle on the picture that is the answer.
 const ANSWER_OUTLINE_PT: f32 = 3.5;
 
 /// The answer's 3D wireframe, in UI points: the one box among two hundred
-/// in the lidar view that is a decision, so the heaviest line there.
+/// in the lidar view that is the answer, so the heaviest line there.
 const ANSWER_3D_OUTLINE_PT: f32 = 4.0;
+
+/// The corridor's two lines in the lidar view, in UI points: thinner than
+/// any box there, because they are the ground the boxes are judged against
+/// and not a thing found on it.
+const PATH_OUTLINE_PT: f32 = 1.5;
+
+/// The height the corridor is drawn at, metres in the lidar's frame: the
+/// road under a sensor KITTI mounts 1.73 m above it. A drawing's height and
+/// not a measurement; nothing reads it.
+const PATH_DRAW_Z_M: f32 = -1.73;
+
+/// Spacing of the points the corridor's lines are drawn through, metres
+/// along the path: on an arc of 10 m radius a 1 m chord leaves the circle
+/// by 1.2 cm.
+const PATH_DRAW_STEP_M: f32 = 1.0;
+
+/// The corridor's colour: a grey quieter than any box, so the road ahead is
+/// there without being a finding.
+const C_PATH: [u8; 3] = [150, 150, 155];
+
+/// The corridor as two lines of the ground plane, left edge then right: the
+/// path's centre line moved half the vehicle's width either way, from the
+/// sensor out to the detector's range or to a quarter of a turn, whichever
+/// comes first -- past a quarter turn the arc is heading back.
+fn corridor_strips(path: &EgoPath) -> [Vec<[f32; 3]>; 2] {
+    let reach = match path.radius_m() {
+        Some(r) => RANGE_LIMIT_M.min((r.abs() * std::f64::consts::FRAC_PI_2) as f32),
+        None => RANGE_LIMIT_M,
+    };
+    let steps = (reach / PATH_DRAW_STEP_M).ceil() as usize;
+    let edge = |offset: f32| -> Vec<[f32; 3]> {
+        (0..=steps)
+            .map(|i| {
+                let along = (i as f32 * PATH_DRAW_STEP_M).min(reach);
+                let (x, y) = path.point(along, offset);
+                [x, y, PATH_DRAW_Z_M]
+            })
+            .collect()
+    };
+    [edge(CORRIDOR_HALF_WIDTH_M), edge(-CORRIDOR_HALF_WIDTH_M)]
+}
 
 /// The point that carries the answer's label on the picture, in UI points:
 /// a hair, so the words show and the point does not.
@@ -278,6 +349,21 @@ const ANSWER_LABEL_POINT_PT: f32 = 0.1;
 /// Where the camera status line sits on the image, pixels: the top-left
 /// corner, clear of the road.
 const STATUS_AT: [f32; 2] = [150.0, 16.0];
+
+/// Image pixels a character of the status line takes either side of its
+/// point, at the narrowest the camera view is drawn: the viewer centres a
+/// label on its point, so a longer line needs its point further right or
+/// its first words leave the picture.
+const STATUS_HALF_CHAR_PX: f32 = 4.5;
+
+/// Where the status line `label` sits: [`STATUS_AT`], or as far right of it
+/// as keeps the whole line inside the picture. A line with the lidar
+/// detector's tally on it is three times the length the corner was placed
+/// for, and was cut off at the picture's left edge.
+fn status_at(label: &str) -> [f32; 2] {
+    let half = STATUS_HALF_CHAR_PX * label.chars().count() as f32 + 8.0;
+    [STATUS_AT[0].max(half), STATUS_AT[1]]
+}
 
 /// The status line's colour on a clean pair: a quiet grey.
 const C_STATUS: [u8; 3] = [200, 200, 200];
@@ -293,8 +379,10 @@ const STALE_IMAGE_OPACITY: f32 = 0.35;
 
 /// How the answer's object is moving, in the words its labels and the
 /// headline use: `TTC 3.1 s` while it closes, `receding` while the gap grows,
-/// and `not closing` for a closing speed of exactly zero, which is neither.
-/// `with_speed` puts the closing speed in front of the TTC.
+/// `not closing` for a closing speed of exactly zero, which is neither, and
+/// `closing not established` for a gap that closes on a track too young to
+/// say how fast -- the answer gives it no time to contact, and the label
+/// says why. `with_speed` puts the closing speed in front of the TTC.
 fn answer_motion(a: &StateAnswer, with_speed: bool) -> String {
     if a.ttc_s > 0.0 && a.closing_mps > 0.0 {
         if with_speed {
@@ -302,6 +390,8 @@ fn answer_motion(a: &StateAnswer, with_speed: bool) -> String {
         } else {
             format!("TTC {:.1} s", a.ttc_s)
         }
+    } else if a.closing_mps > 0.0 {
+        "closing not established".to_string()
     } else if a.closing_mps < 0.0 {
         "receding".to_string()
     } else {
@@ -393,7 +483,37 @@ const LABEL_BOTTOM_PX: f32 = 14.0;
 /// photograph. The labels drawn are the fused objects' and the camera-only
 /// detections' -- a handful a frame -- and the answer's.
 fn object_label(o: &Object) -> String {
-    format!("#{} · {:.1} m · {:.1} s", o.id, o.distance_m, o.age_s)
+    format!(
+        "#{} · {:.1} m · {:.1} s{}",
+        o.id,
+        o.distance_m,
+        o.age_s,
+        lidar_lead(o)
+    )
+}
+
+/// What the lidar detector called an object, as a label's tail: ` · lidar
+/// car 0.98`, or nothing when it lay in none of its boxes. A tail rather than
+/// a lead, so a reader meets the camera's word first on a fused object and
+/// the lidar's second, in its own vocabulary (`crate::pillars::CLASSES`).
+fn lidar_lead(o: &Object) -> String {
+    o.lidar_class.map_or_else(String::new, |(k, q)| {
+        format!(" · lidar {} {q:.2}", lidar_class_name(k))
+    })
+}
+
+/// A lidar-only object the lidar detector named, drawn: its class from the
+/// lidar alone, `car 0.98 lidar · 11.4 m · 3.7 m/s · 1.8 s` -- the camera
+/// matched nothing here, and the word says which sensor spoke.
+fn lidar_named_label(o: &Object) -> String {
+    let class = o.lidar_class.map_or_else(
+        || "lidar".to_string(),
+        |(k, q)| format!("{} {q:.2} lidar", lidar_class_name(k)),
+    );
+    format!(
+        "{class} · {:.1} m · {:.1} m/s · {:.1} s",
+        o.distance_m, o.closing_mps, o.age_s
+    )
 }
 
 /// A fused object's label, drawn: what the camera says it is and how sure it
@@ -411,15 +531,79 @@ fn fused_label(o: &Object) -> String {
         |(k, q)| format!("{} {q:.2}", class_name(k)),
     );
     format!(
-        "{class} · {:.1} m · {:.1} m/s · {:.1} s",
-        o.distance_m, o.closing_mps, o.age_s
+        "{class} · {:.1} m · {:.1} m/s · {:.1} s{}",
+        o.distance_m,
+        o.closing_mps,
+        o.age_s,
+        lidar_lead(o)
     )
 }
 
-/// A camera-only detection's label, drawn: its class and score, and the fact
-/// that it has no range -- the one thing a reader must not assume it has.
-fn camera_only_label(class_id: u32, confidence: f32) -> String {
-    format!("{} {confidence:.2} · no range", class_name(class_id))
+/// A one-camera object's label, drawn: [`fused_label`]'s line with a
+/// question mark on the class, `car? 0.62 · 11.4 m · 3.7 m/s · 1.8 s` --
+/// one camera said car and the other did not confirm it, so the answer does
+/// not repeat it, and a reader can see what was said and that it is in
+/// doubt.
+fn one_camera_label(o: &Object) -> String {
+    let class = o.class.map_or_else(
+        || "one camera".to_string(),
+        |(k, q)| format!("{}? {q:.2}", class_name(k)),
+    );
+    format!(
+        "{class} · {:.1} m · {:.1} m/s · {:.1} s{}",
+        o.distance_m,
+        o.closing_mps,
+        o.age_s,
+        lidar_lead(o)
+    )
+}
+
+/// A camera-only detection's label, drawn: its class and score, and its
+/// range -- the two cameras' stereo range when both saw it, else the fact
+/// that it has none, the one thing a reader must not assume it has.
+fn camera_only_label(class_id: u32, confidence: f32, range_m: f32) -> String {
+    if range_m > 0.0 {
+        format!(
+            "{} {confidence:.2} · {range_m:.1} m stereo",
+            class_name(class_id)
+        )
+    } else {
+        format!("{} {confidence:.2} · no range", class_name(class_id))
+    }
+}
+
+/// What the lidar detector called a sweep's tracks, as the status line's
+/// tail: `lidar: 2 cars, 1 cyclist`, over every track it named, those behind
+/// the vehicle and so out of the picture included. A box that names several
+/// fragments of one car is one car: the fragments carry its class and its
+/// score to the bit, and are counted once. So are two boxes of one class
+/// whose scores are equal to the bit, which 16-bit weights make possible now
+/// and then; the line then reads one short. `lidar: no names` when it
+/// looked and named none.
+fn lidar_tally(named: impl Iterator<Item = (u32, f32)>) -> String {
+    let mut boxes: Vec<(u32, u32)> = named.map(|(k, q)| (k, q.to_bits())).collect();
+    boxes.sort_unstable();
+    boxes.dedup();
+    let mut counts = [0usize; 3];
+    for (k, _) in &boxes {
+        if let Some(c) = counts.get_mut(*k as usize) {
+            *c += 1;
+        }
+    }
+    let said: Vec<String> = counts
+        .iter()
+        .enumerate()
+        .filter(|(_, n)| **n > 0)
+        .map(|(k, n)| {
+            let plural = if *n == 1 { "" } else { "s" };
+            format!("{n} {}{plural}", lidar_class_name(k as u32))
+        })
+        .collect();
+    if said.is_empty() {
+        "lidar: no names".to_string()
+    } else {
+        format!("lidar: {}", said.join(", "))
+    }
 }
 
 /// The camera status line: which frame the boxes on the picture were fused
@@ -468,6 +652,15 @@ pub struct CamHalf {
     pub pair_outcome: &'static str,
     /// Its instant minus the sweep's trigger, ns: negative when stale.
     pub pair_age_ns: i64,
+    /// Which camera the frame is (`Camera::name`): `right` when the left's
+    /// frame was lost and the right's stood in for the set.
+    pub side: &'static str,
+    /// Each camera's own pairing (`Pairing::name`): what became of the left
+    /// frame on a set built on the right one, and of the right frame on a
+    /// set built on the left -- `pair_silent` for a camera the fusion had
+    /// declared silent.
+    pub left_outcome: &'static str,
+    pub right_outcome: &'static str,
 }
 
 impl CamHalf {
@@ -477,19 +670,54 @@ impl CamHalf {
             cam_seq: state_cam_seq(payload).unwrap_or(-1),
             pair_outcome: pairing_name(state_pair_outcome(payload)),
             pair_age_ns: state_pair_age_ns(payload).unwrap_or(0),
+            side: side_name(state_cam_side(payload)),
+            left_outcome: pairing_name(state_cam0_pair_outcome(payload)),
+            right_outcome: pairing_name(state_cam1_pair_outcome(payload)),
         }
+    }
+}
+
+/// `Camera::name` as a `&'static str`, on [`pairing_name`]'s terms: a batch
+/// naming neither camera reads as the left, the one every set has.
+fn side_name(s: Option<&str>) -> &'static str {
+    s.and_then(Camera::parse).unwrap_or_default().name()
+}
+
+/// The note an answer's words carry about the second camera: that the set
+/// is the right camera's frame alone (the boxes are in the right image),
+/// and why the left's was not there -- lost for this sweep, or the left
+/// camera declared silent -- or that the right camera was silent, so the
+/// classes are the left camera's alone. `None` on the usual set, the
+/// left's with the right's beside it.
+fn side_note(cam: &CamHalf) -> Option<String> {
+    let silent = Pairing::Silent.name();
+    if cam.side == Camera::Right.name() {
+        Some(if cam.left_outcome == silent {
+            "RIGHT camera, left camera silent".to_string()
+        } else {
+            format!("RIGHT camera, left frame lost ({})", cam.left_outcome)
+        })
+    } else if cam.right_outcome == silent {
+        Some("right camera silent".to_string())
+    } else {
+        None
     }
 }
 
 /// An answer's sentence as the run prints it and `summary.json` keeps it:
 /// the flagged record's words ([`StateAnswer::line`]), led by how stale the
-/// camera was and which frame it was when its half was stale. The class in
-/// that sentence is the older frame's, and a reader who has only the words
-/// must be able to tell; on a clean pair it is the sentence alone.
+/// camera was and which frame it was when its half was stale, and by which
+/// camera it was when it was the right one. The class in that sentence is
+/// the older frame's, and a reader who has only the words must be able to
+/// tell; on a clean pair it is the sentence alone.
 pub fn answer_words(a: &StateAnswer, cam: CamHalf) -> String {
-    match stale_note(cam.pair_outcome, cam.pair_age_ns) {
+    let line = match stale_note(cam.pair_outcome, cam.pair_age_ns) {
         Some(note) => format!("{note} (frame {}): {}", cam.cam_seq, a.line()),
         None => a.line(),
+    };
+    match side_note(&cam) {
+        Some(note) => format!("{note} (frame {}): {line}", cam.cam_seq),
+        None => line,
     }
 }
 
@@ -498,9 +726,10 @@ pub fn answer_words(a: &StateAnswer, cam: CamHalf) -> String {
 /// stale, right beside it -- what the answer holds -- how many
 /// objects, how many of them in the camera frame, how many of those the
 /// camera confirmed, how many detections only the camera holds, how many in
-/// the vehicle's path -- and the flagged record's sentence. The counts go before the
-/// sentence because the panel cuts the end of a long line, and the end of
-/// the sentence is the image rectangle, which the picture beside it shows.
+/// the vehicle's path -- and the flagged record's sentence. The counts go
+/// before the sentence because the panel cuts the end of a long line, and
+/// the end of the
+/// sentence is the image rectangle, which the picture beside it shows.
 ///
 /// Every number is read out of the state batch, the words' own source: the
 /// batch's `source_sweep_seq` is the sweep the whole chain inherited, and the
@@ -510,8 +739,13 @@ fn answer_line(payload: &RecordBatch, a: &StateAnswer) -> String {
     let cam = CamHalf::of_answer(payload);
     let stale = stale_note(cam.pair_outcome, cam.pair_age_ns)
         .map_or_else(String::new, |note| format!(" | {note}"));
+    // The right camera's frame standing in for the left's, when it did.
+    let side = side_note(&cam).map_or_else(String::new, |note| format!(" | {note}"));
+    // The vehicle's own speed, when the run knew it: the closing speeds in
+    // the sentence were computed with it.
+    let ego = state_ego_vf(payload).map_or_else(String::new, |vf| format!(" | ego {vf:.1} m/s"));
     format!(
-        "sweep {} | cam frame {}{stale} | {} tracked, {} in frame, {} fused, {} camera-only, {} in path | {}",
+        "sweep {} | cam frame {}{stale}{side}{ego} | {} tracked, {} in frame, {} fused, {} camera-only, {} in path | {}",
         state_sweep_seq(payload).unwrap_or(-1),
         cam.cam_seq,
         object_rows(payload).len(),
@@ -901,8 +1135,12 @@ fn cam_det_label(d: &Det) -> String {
 
 /// `camdet` stage configuration.
 pub struct CamDetCfg {
+    /// Which camera's frames this stage reads: its slot, its edges, its
+    /// stream and its stage name follow from it ([`Camera`]).
+    pub cam: Camera,
     /// The network, loaded and checked against its pinned sha256 before the
-    /// clock started (D16), and moved here: nothing else runs it.
+    /// clock started (D16), and moved here: this stage's own copy, so two
+    /// cameras' stages never take turns on one session.
     pub model: Model,
     /// [`pipes_kitti::camdet::cam_det_schema`], built once; its metadata
     /// carries the model's name and sha256 on every batch.
@@ -1023,7 +1261,11 @@ impl CamDetReport {
 /// It consumes `cam0->camdet`, a fan-out of the camera frame beside
 /// `cam0->rerun` and in place of `cam0->proc` (`proc` does not run beside
 /// it), and admits one `CAM_DET` batch per frame it
-/// finishes onto `cam_det->track`: the frame's reference (seq, instant,
+/// finishes onto `cam_det->track` -- or, as the right camera's stage
+/// (`CamDetCfg::cam`), consumes `cam1->camdet` and admits `CAM1_DET`
+/// batches onto `cam1_det->track`, with the same model on its own thread,
+/// so the two cameras are looked at at the same time. The frame reference
+/// is the camera's own: (seq, instant,
 /// bounds) and its detections (box, class, confidence). The sample inherits
 /// the frame's `tov` and `due` and names it as its parent, so the fusion pairs
 /// it by the instant the picture was taken, never by when the network got to
@@ -1057,7 +1299,18 @@ pub fn camdet_thread(
     ctx: Arc<RunCtx>,
     cfg: CamDetCfg,
 ) -> CamDetReport {
-    set_stage_slot(SLOT_CAMDET);
+    // Each camera's stage on its own slot, edges and stream: the right
+    // camera's frames are never counted against the left's figures.
+    let slot = match cfg.cam {
+        Camera::Left => SLOT_CAMDET,
+        Camera::Right => SLOT_CAMDET_RIGHT,
+    };
+    let (in_edge, stage, out_edge) = (
+        cfg.cam.camdet_edge(),
+        cfg.cam.camdet_stage(),
+        cfg.cam.det_edge(),
+    );
+    set_stage_slot(slot);
     let rc = ctx.row_ctx();
     let mut report = CamDetReport {
         delivered: 0,
@@ -1097,21 +1350,21 @@ pub fn camdet_thread(
 
         let proc_start = now();
         // Window 1 -- looking at the frame. Megabytes, and meant to be.
-        let b0 = bytes_alloc(SLOT_CAMDET);
-        let pre = preprocess(px, w, h);
-        let pre_bytes = bytes_alloc(SLOT_CAMDET) - b0;
+        let b0 = bytes_alloc(slot);
+        let pre = cfg.model.preprocess(px, w, h);
+        let pre_bytes = bytes_alloc(slot) - b0;
         let t_pre = now();
         let found = pre.and_then(|(tensor, r)| cfg.model.infer(tensor, r, w, h).map(nms));
         let t_inf = now();
-        let frame_bytes = bytes_alloc(SLOT_CAMDET) - b0;
+        let frame_bytes = bytes_alloc(slot) - b0;
         // Window 2 -- building the batch.
-        let b1 = bytes_alloc(SLOT_CAMDET);
+        let b1 = bytes_alloc(slot);
         let built = found.map_err(|e| e.to_string()).and_then(|dets| {
             build_cam_det_batch(frame, &dets, &cfg.schema)
                 .map(|b| (b, dets))
                 .map_err(|e| e.to_string())
         });
-        let build_bytes = bytes_alloc(SLOT_CAMDET) - b1;
+        let build_bytes = bytes_alloc(slot) - b1;
         // The slowed camera, when `--consumer-delay-ms` asks for it: inside
         // the window, after both byte counts, so it is service time and
         // allocates nothing that could be mistaken for the detector's.
@@ -1128,8 +1381,8 @@ pub fn camdet_thread(
         let row = Evidence::delivered(
             &rc,
             s,
-            "cam0->camdet",
-            "camdet",
+            in_edge,
+            stage,
             env.enqueued,
             env.depth_at_push,
             env.depth_after_pop,
@@ -1139,7 +1392,7 @@ pub fn camdet_thread(
             in_storage.unwrap_or(0),
             frame_bytes,
         );
-        sink.send(EvRow::Evidence(row), &ctx, "camdet");
+        sink.send(EvRow::Evidence(row), &ctx, stage);
         report.delivered += 1;
         report.frame_bytes_total += frame_bytes;
         report.preprocess_bytes_total += pre_bytes;
@@ -1154,7 +1407,7 @@ pub fn camdet_thread(
             Err(e) => {
                 // Counted, never silently skipped: `produced + errors ==
                 // delivered` is checked at the end of the run.
-                eprintln!("camdet: frame {}: {e}", s.seq);
+                eprintln!("{stage}: frame {}: {e}", s.seq);
                 report.errors += 1;
                 continue;
             }
@@ -1170,10 +1423,12 @@ pub fn camdet_thread(
 
         // The boxes, on the frame they were found in: the image's own three
         // timelines, so they scrub with it. After `proc_end`, on this stage's
-        // own slot, and costed.
+        // own slot, and costed. The left camera's only: the right camera's
+        // frame is not on the dashboard, so its boxes have no picture to be
+        // drawn on.
         if let Some(rec) = &cfg.rec {
             let t_viz = now();
-            let v0 = bytes_alloc(SLOT_CAMDET);
+            let v0 = bytes_alloc(slot);
             rec.set_timestamp_nanos_since_epoch("sensor_time", frame.tov_ns);
             rec.set_duration_secs("host", (s.arrival - ctx.t0_host) as f64 * 1e-9);
             rec.set_time_sequence("seq", s.seq as i64);
@@ -1219,14 +1474,14 @@ pub fn camdet_thread(
                 report.viz_log_errors += 1;
             }
             rec.send(Subject::of_sample(&rc, s));
-            report.viz_bytes_total += bytes_alloc(SLOT_CAMDET) - v0;
+            report.viz_bytes_total += bytes_alloc(slot) - v0;
             report.viz_ns_total += now() - t_viz;
         }
 
         let out_storage = cam_det_storage_id(&batch).unwrap_or(0);
         report.batches.push(batch.clone());
         let derived = Sample {
-            stream: StreamId::CAM_DET,
+            stream: cfg.cam.det_stream(),
             // The frame's own number, as the bare reference used: a gap on
             // this stream is a frame the detector never saw.
             seq: s.seq,
@@ -1244,12 +1499,414 @@ pub fn camdet_thread(
         // `cam_det->track` is a Drop* edge (`run::CHAIN_POLICY`): this cannot
         // block, so a slow fusion can never back-pressure the camera.
         let admitted = admission.admit(derived);
-        let mut produced_row = Evidence::driver_admitted(&rc, &admitted, "cam_det", "camdet");
+        let mut produced_row = Evidence::driver_admitted(&rc, &admitted, out_edge, stage);
         produced_row.bytes_alloc = build_bytes;
-        sink.send(EvRow::Evidence(produced_row), &ctx, "camdet");
+        sink.send(EvRow::Evidence(produced_row), &ctx, stage);
         report.produced += 1;
         report.out_parent.push((admitted.seq, s.seq));
     }
+    // An ONNX Runtime session is never dropped: two of them released at
+    // once, by the two camera stages ending together, corrupted the heap
+    // in the runtime's CUDA teardown on one run in five ("corrupted
+    // double-linked list", after every artifact was written). The process
+    // is ending; the operating system reclaims the session and the GPU.
+    if cfg.model.backend.is_ort() {
+        std::mem::forget(cfg.model);
+    }
+    report
+}
+
+/// The violet the lidar detector's boxes are drawn in, in 3D: the camera
+/// detector's own ([`C_CAM_DET`]), because the two are the same kind of
+/// thing -- what a frozen network found, before any track vouched for it.
+const C_PILLAR_DET: [u8; 3] = C_CAM_DET;
+
+/// Line weight of a lidar detector's box in 3D.
+const PILLAR_DET_OUTLINE_PT: f32 = 1.5;
+
+/// `pillars` stage configuration.
+pub struct PillarsCfg {
+    /// The loaded network: read, checked and warmed before the clock started.
+    pub model: LidarModel,
+    /// Which way it looks, a pass of the network each: ahead, or ahead and
+    /// behind.
+    pub views: &'static [LidarView],
+    /// [`pipes_kitti::pillars::pillar_det_schema`], built once.
+    pub schema: Arc<Schema>,
+    /// Capacity hint for the per-sample vectors.
+    pub expect: usize,
+    /// `--dashboard` only: draw each sweep's boxes in 3D (`lidar/named`),
+    /// those sure enough to name a track, after the measured window has
+    /// closed. `None` on the default path.
+    pub rec: Option<Canvas>,
+    /// `--lidar-delay-ms`: slept inside the measured window, so it reads as
+    /// service time.
+    pub delay_ms: u64,
+}
+
+/// What the `pillars` stage returns.
+pub struct PillarsReport {
+    /// Sweeps popped off `velo->pillars`.
+    pub delivered: u64,
+    /// Batches admitted onto `pillar_det`.
+    pub produced: u64,
+    /// Sweeps that could not be turned into a batch.
+    pub errors: u64,
+    /// Sweeps whose re-derived buffer address disagreed with the envelope's.
+    pub storage_mismatch: u64,
+    /// `(seq, storage_id re-derived from the payload)` per sweep popped.
+    pub in_by_seq: Vec<(u64, usize)>,
+    /// `(own seq, the sweep's seq)` per batch produced.
+    pub out_parent: Vec<(u64, u64)>,
+    /// Bytes allocated looking at each sweep (the pillars and the network),
+    /// of which the pillars; allocated building each batch; and the Arrow
+    /// bytes carried in (the sweep, read in place) and out.
+    pub sweep_bytes_total: u64,
+    pub pillar_bytes_total: u64,
+    pub build_bytes_total: u64,
+    pub in_payload_bytes_total: u64,
+    pub out_payload_bytes_total: u64,
+    /// Per sweep, ns: the pillars, the network with its decode and NMS, and
+    /// everything the stage did.
+    pub pillarize_ns: Vec<i64>,
+    pub infer_ns: Vec<i64>,
+    pub service_ns: Vec<i64>,
+    /// `infer_ns` in its three parts, over the sweeps the network ran on:
+    /// the network itself (the copy to the GPU, the run, the copy back), the
+    /// decode of its outputs, and the NMS.
+    pub network_ns: Vec<i64>,
+    pub decode_ns: Vec<i64>,
+    pub nms_ns: Vec<i64>,
+    /// Boxes found, by class.
+    pub detections_total: u64,
+    pub class_counts: [u64; 3],
+    /// Points in the sweeps, points inside the range, pillars handed to the
+    /// network, and anchors above the score threshold, summed.
+    pub points_total: u64,
+    pub in_range_total: u64,
+    pub pillars_total: u64,
+    pub candidates_total: u64,
+    /// Sweeps whose pillars were cut at [`pipes_kitti::pillars::MAX_PILLARS`],
+    /// and points past the 32nd of their pillar, which the pillar does not
+    /// keep: what the network did not see.
+    pub capped_sweeps: u64,
+    pub truncated_points_total: u64,
+    /// Every batch produced, in order, for `runs/<name>/pillar_det.arrows`.
+    pub batches: Vec<RecordBatch>,
+    /// `--dashboard` only: bytes drawing the boxes cost, measured on this
+    /// stage's own slot after `proc_end`, and the time, and the drawings the
+    /// viewer would not accept.
+    pub viz_bytes_total: u64,
+    pub viz_ns_total: i64,
+    pub viz_log_errors: u64,
+    /// How often the pillar scratch had to grow, outside the measured
+    /// window, and how big it ended up.
+    pub scratch_growths: u64,
+    pub scratch_bytes: u64,
+}
+
+impl PillarsReport {
+    /// Mean boxes per batch produced.
+    pub fn detections_mean(&self) -> Option<f64> {
+        (self.produced > 0).then(|| self.detections_total as f64 / self.produced as f64)
+    }
+
+    /// Mean Arrow bytes carried out per batch.
+    pub fn out_payload_bytes_mean(&self) -> Option<u64> {
+        (self.produced > 0).then(|| self.out_payload_bytes_total / self.produced)
+    }
+
+    /// Sweeps whose service took longer than `period_ns`.
+    pub fn over_period(&self, period_ns: i64) -> usize {
+        self.service_ns.iter().filter(|&&ns| ns > period_ns).count()
+    }
+
+    /// `(class name, boxes)`, most frequent first.
+    pub fn classes(&self) -> Vec<(&'static str, u64)> {
+        let mut v: Vec<(usize, u64)> = self
+            .class_counts
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(_, n)| *n > 0)
+            .collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        v.into_iter()
+            .map(|(k, n)| (lidar_class_name(k as u32), n))
+            .collect()
+    }
+}
+
+/// Body of the `pillars` thread: the frozen lidar detector, on
+/// [`camdet_thread`]'s terms. It reads the raw sweep where the driver put
+/// it, bins it into the pillars the network reads (the one copy a network
+/// needs), runs the network, decodes its boxes, and admits them as the
+/// sweep's `PILLAR_DET` batch, numbered by the sweep so the fusion pairs it
+/// by number. Its evidence says what it allocated: megabytes a sweep, like
+/// the camera's stage and unlike every other consumer of a shared buffer.
+pub fn pillars_thread(
+    q: Arc<BoundedQueue<Arc<Sample>>>,
+    admission: Arc<Admission>,
+    sink: Arc<EvidenceSink>,
+    ctx: Arc<RunCtx>,
+    cfg: PillarsCfg,
+) -> PillarsReport {
+    set_stage_slot(SLOT_PILLARS);
+    let rc = ctx.row_ctx();
+    let mut report = PillarsReport {
+        delivered: 0,
+        produced: 0,
+        errors: 0,
+        storage_mismatch: 0,
+        in_by_seq: Vec::with_capacity(cfg.expect),
+        out_parent: Vec::with_capacity(cfg.expect),
+        sweep_bytes_total: 0,
+        pillar_bytes_total: 0,
+        build_bytes_total: 0,
+        in_payload_bytes_total: 0,
+        out_payload_bytes_total: 0,
+        pillarize_ns: Vec::with_capacity(cfg.expect),
+        infer_ns: Vec::with_capacity(cfg.expect),
+        service_ns: Vec::with_capacity(cfg.expect),
+        network_ns: Vec::with_capacity(cfg.expect),
+        decode_ns: Vec::with_capacity(cfg.expect),
+        nms_ns: Vec::with_capacity(cfg.expect),
+        detections_total: 0,
+        class_counts: [0; 3],
+        points_total: 0,
+        in_range_total: 0,
+        pillars_total: 0,
+        candidates_total: 0,
+        capped_sweeps: 0,
+        truncated_points_total: 0,
+        batches: Vec::with_capacity(cfg.expect),
+        viz_bytes_total: 0,
+        viz_ns_total: 0,
+        viz_log_errors: 0,
+        scratch_growths: 0,
+        scratch_bytes: 0,
+    };
+    let mut pz = Pillarizer::new();
+    // The decoder's candidates, kept between sweeps so the decode allocates
+    // only when a sweep has more than any before it.
+    let mut scratch: Vec<Candidate> = Vec::new();
+    let mut announced = false;
+    while let Some(env) = q.pop() {
+        let s: &Sample = &env.item;
+        let dequeued = now();
+        // Borrowed, not copied: the driver's point buffer, kept alive by the
+        // `Arc<Sample>` this stage holds.
+        let points = cloud_points(&s.payload);
+        // The point scratch, sized outside the measured window and announced
+        // once; the pillar buffers grow inside it on the first sweeps, which
+        // the bytes below show rather than hide.
+        if pz.reserve(points.len()) {
+            report.scratch_growths += 1;
+            report.scratch_bytes = pz.scratch_bytes() as u64;
+            if !announced {
+                println!(
+                    "pillars scratch = {} bytes for {} points, allocated outside the measured window",
+                    pz.scratch_bytes(),
+                    points.len()
+                );
+                announced = true;
+            }
+        }
+        let trigger_ns = velo_trigger_ns(&s.payload).unwrap_or(0);
+
+        let proc_start = now();
+        // Window 1 -- looking at the sweep: for each view the pillars, the
+        // network and the decode, then one NMS over them all. The moments
+        // between are read here because the detector's crate reads no
+        // clock; each part's time, and the pillars' bytes, are the views'
+        // added.
+        let b0 = bytes_alloc(SLOT_PILLARS);
+        let (mut last, mut last_bytes) = (proc_start, b0);
+        // Pillars, network, decode: ns.
+        let mut parts = [0i64; 3];
+        let mut pillar_bytes = 0;
+        let (plan, found) =
+            cfg.model
+                .infer_views(&mut pz, points, cfg.views, &mut scratch, &mut |step| {
+                    let (t, b) = (now(), bytes_alloc(SLOT_PILLARS));
+                    match step {
+                        Step::Binned => {
+                            parts[0] += t - last;
+                            pillar_bytes += b - last_bytes;
+                        }
+                        Step::Ran => parts[1] += t - last,
+                        Step::Decoded => parts[2] += t - last,
+                    }
+                    (last, last_bytes) = (t, b);
+                });
+        let t_inf = now();
+        let ran = found.is_ok();
+        let sweep_bytes = bytes_alloc(SLOT_PILLARS) - b0;
+        // Window 2 -- building the batch.
+        let b1 = bytes_alloc(SLOT_PILLARS);
+        let built = found.and_then(|dets| {
+            let meta = PillarMeta {
+                trigger_ns,
+                sweep_seq: s.seq as i64,
+                source_points: plan.source_points,
+                in_range: plan.in_range,
+                pillars: plan.pillars,
+                candidates: scratch.len() as u32,
+            };
+            build_pillar_det_batch(&dets, meta, &cfg.schema).map(|(b, sid)| (b, sid, dets))
+        });
+        let build_bytes = bytes_alloc(SLOT_PILLARS) - b1;
+        // The slowed detector, when `--lidar-delay-ms` asks for it: inside
+        // the window, after both byte counts, so it is service time.
+        if cfg.delay_ms > 0 {
+            std::thread::sleep(Duration::from_millis(cfg.delay_ms));
+        }
+        let proc_end = now();
+
+        // Everything below is outside the measured windows.
+        let in_storage = velo_storage_id(&s.payload);
+        if in_storage != Some(s.storage_id) {
+            report.storage_mismatch += 1;
+        }
+        let row = Evidence::delivered(
+            &rc,
+            s,
+            "velo->pillars",
+            "pillars",
+            env.enqueued,
+            env.depth_at_push,
+            env.depth_after_pop,
+            dequeued,
+            proc_start,
+            proc_end,
+            in_storage.unwrap_or(0),
+            sweep_bytes,
+        );
+        sink.send(EvRow::Evidence(row), &ctx, "pillars");
+        report.delivered += 1;
+        report.sweep_bytes_total += sweep_bytes;
+        report.pillar_bytes_total += pillar_bytes;
+        report.in_payload_bytes_total += s.payload_bytes() as u64;
+        report.in_by_seq.push((s.seq, in_storage.unwrap_or(0)));
+        report.pillarize_ns.push(parts[0]);
+        report.infer_ns.push(t_inf - proc_start - parts[0]);
+        if ran {
+            report.network_ns.push(parts[1]);
+            report.decode_ns.push(parts[2]);
+            report.nms_ns.push(t_inf - last);
+        }
+        report.service_ns.push(proc_end - proc_start);
+        report.points_total += u64::from(plan.source_points);
+        report.in_range_total += u64::from(plan.in_range);
+        report.pillars_total += u64::from(plan.pillars);
+        report.capped_sweeps += u64::from(plan.pillars_found > plan.pillars);
+        report.truncated_points_total += u64::from(plan.truncated_points);
+
+        let (batch, out_storage, dets) = match built {
+            Ok(x) => x,
+            Err(e) => {
+                // Counted, never silently skipped: `produced + errors ==
+                // delivered` is checked at the end of the run.
+                eprintln!("pillars: sweep {}: {e}", s.seq);
+                report.errors += 1;
+                continue;
+            }
+        };
+        report.build_bytes_total += build_bytes;
+        report.candidates_total += scratch.len() as u64;
+        report.detections_total += dets.len() as u64;
+        for d in &dets {
+            if let Some(c) = report.class_counts.get_mut(d.class_id as usize) {
+                *c += 1;
+            }
+        }
+        report.out_payload_bytes_total += payload_bytes(&batch) as u64;
+
+        // The boxes, in 3D, on the sweep's own timelines, with their class
+        // on them: what the network found, before any track vouched for it,
+        // beside `lidar/detections`' unnamed clusters. After `proc_end`, on
+        // this stage's own slot, and costed, like every picture here. A
+        // sweep in which it found nothing clears the entity: "looked and saw
+        // nothing" is drawn as nothing.
+        if let Some(rec) = &cfg.rec {
+            let t_viz = now();
+            let v0 = bytes_alloc(SLOT_PILLARS);
+            rec.set_timestamp_nanos_since_epoch("sensor_time", s.tov.start().map_or(0, |t| t.0));
+            rec.set_duration_secs("host", (s.arrival - ctx.t0_host) as f64 * 1e-9);
+            rec.set_time_sequence("seq", s.seq as i64);
+            // Only the boxes sure enough to name a track: at the network's
+            // own threshold three in four of a sweep's boxes are poles and
+            // tree trunks it half-believes are pedestrians, and they buried
+            // the ones it means. Every box is still in `pillar_det.arrows`.
+            let sure = || dets.iter().filter(|d| d.score >= NAME_SCORE_MIN);
+            let logged = if sure().next().is_none() {
+                rec.log(entity::LIDAR_NAMED, &Clear::flat())
+            } else {
+                let color = Color::from_rgb(C_PILLAR_DET[0], C_PILLAR_DET[1], C_PILLAR_DET[2]);
+                let (mut centres, mut halves, mut turns, mut labels) = (
+                    Vec::with_capacity(dets.len()),
+                    Vec::with_capacity(dets.len()),
+                    Vec::with_capacity(dets.len()),
+                    Vec::with_capacity(dets.len()),
+                );
+                for d in sure() {
+                    centres.push([d.x, d.y, d.z]);
+                    halves.push([0.5 * d.dx, 0.5 * d.dy, 0.5 * d.dz]);
+                    turns.push(RotationAxisAngle::new(
+                        [0.0, 0.0, 1.0],
+                        Angle::from_radians(d.yaw),
+                    ));
+                    labels.push(format!("{} {:.2}", lidar_class_name(d.class_id), d.score));
+                }
+                rec.log(
+                    entity::LIDAR_NAMED,
+                    &Boxes3D::from_centers_and_half_sizes(centres, halves)
+                        .with_rotation_axis_angles(turns)
+                        .with_colors([color])
+                        .with_radii([Radius::new_ui_points(PILLAR_DET_OUTLINE_PT)])
+                        .with_fill_mode(FillMode::MajorWireframe)
+                        .with_labels(labels)
+                        .with_show_labels(true),
+                )
+            };
+            if logged.is_err() {
+                report.viz_log_errors += 1;
+            }
+            rec.send(Subject::of_sample(&rc, s));
+            report.viz_bytes_total += bytes_alloc(SLOT_PILLARS) - v0;
+            report.viz_ns_total += now() - t_viz;
+        }
+
+        report.batches.push(batch.clone());
+        let derived = Sample {
+            stream: StreamId::PILLAR_DET,
+            // The sweep's own number: the fusion pairs this batch with the
+            // sweep by it, and a gap on this stream is a sweep the detector
+            // never saw.
+            seq: s.seq,
+            arrival_seq: 0,
+            parent: Some((s.stream, s.seq)),
+            tov: s.tov,
+            epoch: s.epoch,
+            due: s.due,
+            arrival: now(),
+            payload: batch,
+            storage_id: out_storage,
+            decode_ns: 0,
+        };
+        // `pillar_det->track` is a Drop* edge (`run::CHAIN_POLICY`): this
+        // cannot block, so a slow fusion can never back-pressure the lidar.
+        let admitted = admission.admit(derived);
+        let mut produced_row = Evidence::driver_admitted(&rc, &admitted, "pillar_det", "pillars");
+        produced_row.bytes_alloc = build_bytes;
+        sink.send(EvRow::Evidence(produced_row), &ctx, "pillars");
+        report.produced += 1;
+        report.out_parent.push((admitted.seq, s.seq));
+    }
+    // The session is never dropped, for the reason `camdet_thread` gives:
+    // ONNX Runtime's CUDA teardown corrupted the heap once in five runs. The
+    // process is ending; the operating system reclaims it.
+    std::mem::forget(cfg.model);
     report
 }
 
@@ -2737,6 +3394,25 @@ pub struct TrackCfg {
     /// `pair_absent_in_source` without waiting. Empty on every drive whose
     /// camera has a frame for every frame number.
     pub cam_absent: Vec<u64>,
+    /// The `cam1_det->track` edge, or `None` when the run has no right
+    /// camera: the second camera's detections, paired with each sweep on the
+    /// left's terms and read beside the left's.
+    pub cam1_q: Option<Arc<BoundedQueue<Arc<Sample>>>>,
+    /// The frames, ascending, whose right-camera frame is absent in the
+    /// source, on `cam_absent`'s terms.
+    pub cam1_absent: Vec<u64>,
+    /// The right camera's projection, with the right camera: each track's
+    /// box in the right image, for the agreement pass, and the stereo
+    /// baseline with `calib`.
+    pub calib_right: Option<Calib>,
+    /// The `oxts->track` edge, or `None` when the run has no GPS/IMU stream.
+    /// The vehicle's own motion, one row per frame, which the tracker
+    /// subtracts from every track before it matches ([`pair_oxts`]).
+    pub oxts_q: Option<Arc<BoundedQueue<Arc<Sample>>>>,
+    /// The `pillar_det->track` edge, or `None` when the run has no lidar
+    /// detector: the sweep's own boxes, paired by number and waited for on
+    /// the cameras' deadline ([`pair_pillars`]), which name the tracks.
+    pub pillar_q: Option<Arc<BoundedQueue<Arc<Sample>>>>,
     /// How long to wait for a camera frame that has not arrived yet, ns.
     /// `None` means one sweep span, measured from the sweep's own `Tov::Range`
     /// rather than assumed.
@@ -2831,17 +3507,78 @@ pub struct TrackReport {
     /// the measured window, so it is already in `measurement_age_ns`; reported
     /// here so it can be read as its own number too.
     pub wait_ns_total: i64,
-    /// Camera references popped off `cam_det->track`.
-    pub cam_delivered: u64,
-    /// References popped whose payload was not a frame reference.
-    pub cam_bad_format: u64,
-    /// References dropped from this stage's own buffer because it was full.
-    /// Meant to be 0: the buffer is sized for the whole run.
-    pub cam_buffer_overflow: u64,
-    /// `(seq, storage_id re-derived from the batch)` per camera sample popped
-    /// off `cam_det->track`: the detector's batch was read where `camdet`
-    /// built it. 0 for a bare frame reference, which names no buffer.
-    pub cam_by_seq: Vec<(u64, usize)>,
+    /// The left camera's references, off `cam_det->track`: popped,
+    /// unreadable, dropped from this stage's own buffer, and each one's
+    /// storage id.
+    pub cam: CamCounts,
+    /// The right camera's, off `cam1_det->track`; all 0 without one.
+    pub cam1: CamCounts,
+    /// The right camera's pairing per sweep handed to this stage, on the
+    /// terms of the set's own: inside the range, stale under the declared
+    /// window, produced and lost, not arrived, absent in its source. All 0
+    /// without a right camera.
+    pub right_paired: u64,
+    pub right_stale: u64,
+    pub right_dropped: u64,
+    pub right_late: u64,
+    pub right_absent_in_source: u64,
+    /// Sets built on the right camera's frame alone, the left's having been
+    /// lost: answered rather than expired, with every match one camera's.
+    pub sets_from_right: u64,
+    /// Sweeps that expired because the left camera was silent (no frame for
+    /// [`SILENT_AFTER_SWEEPS`] sweeps running, so not waited for) and the
+    /// right camera had no frame either; and sweeps the right camera's
+    /// pairing was `Silent` on.
+    pub pair_silent: u64,
+    pub right_silent: u64,
+    /// Sweeps this stage handled while it had declared each camera silent:
+    /// the run's measure of how long a broken stream was out.
+    pub left_silent_sweeps: u64,
+    pub right_silent_sweeps: u64,
+    /// `(the lidar's distance to the near face, to the box's centre, the
+    /// stereo range)` of every track both cameras confirmed over the
+    /// completed sets: two sensors on one object, for the run to compare.
+    pub stereo_checks: Vec<(f32, f32, f32)>,
+    /// The lidar detector's batches, off `pillar_det->track`: popped,
+    /// unreadable, dropped from this stage's own buffer, and each one's
+    /// storage id. All 0 without a lidar detector.
+    pub pillar: CamCounts,
+    /// How the lidar detector's batch was found, per sweep handed to this
+    /// stage ([`Naming`]): in hand inside the wait, late, lost upstream, or
+    /// not waited for because the detector had gone silent; and the sweeps
+    /// this stage handled while it had declared it silent.
+    pub lidar_named: u64,
+    pub lidar_late: u64,
+    pub lidar_dropped: u64,
+    pub lidar_silent: u64,
+    pub lidar_silent_sweeps: u64,
+    /// Nanoseconds spent waiting for the lidar detector's batch alone, after
+    /// the cameras' pairing, over all sweeps. Inside the measured window.
+    pub lidar_wait_ns_total: i64,
+    /// What naming did over the **completed** sets and the **degraded**
+    /// ones, apart as the fusion's tallies are.
+    pub names_completed: NameTally,
+    pub names_degraded: NameTally,
+    /// Sets whose `named_count` column disagreed with the lanes it counts.
+    /// Meant to be 0.
+    pub name_column_mismatch: u64,
+    /// Sweeps whose tracks were carried through the vehicle's own motion:
+    /// from the OXTS row of their own frame, and from the newest earlier
+    /// one standing in for a row that was not there ([`EgoOutcome`]).
+    pub ego_compensated: u64,
+    pub ego_stale: u64,
+    /// Sweeps the run had a GPS/IMU stream for and no usable row.
+    pub ego_missing: u64,
+    /// OXTS rows popped off `oxts->track`, and any whose payload was not one.
+    pub oxts_delivered: u64,
+    pub oxts_bad_format: u64,
+    /// `(seq, storage_id re-derived from the batch)` per row popped: the
+    /// driver's buffer, read where it was built.
+    pub oxts_by_seq: Vec<(u64, usize)>,
+    /// The fastest the vehicle went and the hardest it turned, over the rows
+    /// the tracker used: the drive's own figures, for the summary.
+    pub ego_speed_mps_max: f64,
+    pub ego_yaw_rate_rps_max: f64,
     /// Bytes reading the inputs cost. Meant to be 0 — both are borrowed.
     pub read_bytes_total: u64,
     /// Bytes building the fused batches cost: one output buffer each.
@@ -2912,8 +3649,9 @@ pub struct TrackReport {
     /// claims about the frame they name: inside the sweep, or before it and
     /// inside the declared stale window. The sweep's trigger rides with them,
     /// because that window is counted back from it and no evidence column
-    /// carries it.
-    pub out_cam: Vec<(u64, i64, Pairing, i64)>,
+    /// carries it. The right camera's frame and pairing ride with it, for
+    /// the same join.
+    pub out_cam: Vec<OutCam>,
     /// `(seq, storage_id re-derived from the batch)` per sample popped.
     pub in_by_seq: Vec<(u64, usize)>,
     /// The same for what it produced.
@@ -2955,6 +3693,48 @@ pub struct TrackReport {
     pub batches: Vec<RecordBatch>,
 }
 
+/// One camera's references at the `track` stage: what was popped off its
+/// edge, what could not be read, what the buffer lost, and the storage id of
+/// each sample popped -- the detector's batch was read where `camdet` built
+/// it (0 for a bare frame reference, which names no buffer).
+#[derive(Clone, Debug, Default)]
+pub struct CamCounts {
+    /// Camera samples popped off the edge.
+    pub delivered: u64,
+    /// Samples popped whose payload was not a frame reference.
+    pub bad_format: u64,
+    /// Samples dropped from this stage's own buffer because it was full.
+    /// Meant to be 0: the buffer is sized for the whole run.
+    pub buffer_overflow: u64,
+    /// `(seq, storage_id re-derived from the batch)` per sample popped.
+    pub by_seq: Vec<(u64, usize)>,
+}
+
+/// The camera half of one produced set's provenance ([`TrackReport::out_cam`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OutCam {
+    /// The set's own seq.
+    pub seq: u64,
+    /// The frame the set is built on, or -1.
+    pub cam_seq: i64,
+    /// How it was paired.
+    pub pairing: Pairing,
+    /// The sweep's trigger, which the stale window is counted back from.
+    pub trigger_ns: i64,
+    /// Which camera `cam_seq` is.
+    pub side: Camera,
+    /// The right camera's frame, or -1; `cam_seq` again when `side` is the
+    /// right.
+    pub cam1_seq: i64,
+    /// How the right camera's pairing went.
+    pub pairing_right: Pairing,
+    /// The lidar detector's batch the set was named from, or -1, and how it
+    /// was found: joined by `run::name_check` against the `pillars` stage's
+    /// own producer rows, on `cam_seq`'s terms.
+    pub lidar_det_seq: i64,
+    pub naming: Naming,
+}
+
 /// What the association did over one population of fused sets.
 ///
 /// Three counts are taken from three different places on purpose, so the run
@@ -2982,6 +3762,27 @@ pub struct FuseTally {
     pub iou: Vec<f32>,
     /// Fused tracks per class id (an index into `COCO_CLASSES`).
     pub classes: Vec<u64>,
+    /// Sets the right camera's frame was associated too, and the detections
+    /// in those frames. 0 without a right camera.
+    pub right_samples: u64,
+    pub right_detections: u64,
+    /// Left-fused tracks the right camera confirmed (these are `fused`), and
+    /// those it did not (`one_camera`, with `right_only`).
+    pub confirmed: u64,
+    pub unconfirmed: u64,
+    /// Tracks the left camera missed and the right one matched.
+    pub right_only: u64,
+    /// Tracks one camera matched and the other did not confirm, counted off
+    /// the population lanes: `unconfirmed + right_only`.
+    pub one_camera: u64,
+    /// Camera-only detections kept with a stereo partner and a range, and
+    /// those dropped for want of one. With one camera every camera-only
+    /// detection is kept, and both are 0.
+    pub stereo_matched: u64,
+    pub camera_only_dropped: u64,
+    /// Sets associated with one camera's frame in a run that has two: every
+    /// match in them is one camera's.
+    pub demoted_sets: u64,
 }
 
 impl FuseTally {
@@ -2992,6 +3793,20 @@ impl FuseTally {
         self.contested += u64::from(plan.contested);
         self.crowded += u64::from(plan.crowded);
         self.camera_only += camera_only as u64;
+        if plan.right_ran {
+            self.right_samples += 1;
+            self.right_detections += u64::from(plan.right_detections);
+        }
+        self.confirmed += u64::from(plan.confirmed);
+        self.unconfirmed += u64::from(plan.unconfirmed);
+        self.right_only += u64::from(plan.right_only);
+        self.stereo_matched += u64::from(plan.stereo_matched);
+        self.camera_only_dropped += u64::from(plan.camera_only_dropped);
+        self.demoted_sets += u64::from(plan.demoted);
+        self.one_camera += rows
+            .iter()
+            .filter(|t| track_population(t) == POPULATION_ONE_CAMERA)
+            .count() as u64;
         if self.classes.is_empty() {
             self.classes = vec![0; COCO_CLASSES.len()];
         }
@@ -3192,6 +4007,13 @@ fn inside_a_fused_object(t: &[f32; TRACK_LANES], rows: &[[f32; TRACK_LANES]], gr
 }
 
 impl TrackReport {
+    /// Whether any sweep's tracks were carried through the vehicle's own
+    /// motion: the run had the OXTS stream and used it, so the velocities
+    /// it reports are over ground.
+    pub fn ego_used(&self) -> bool {
+        self.ego_compensated + self.ego_stale > 0
+    }
+
     /// Arrow bytes per detection batch carried in.
     pub fn in_payload_bytes_mean(&self) -> Option<u64> {
         (self.delivered > 0).then(|| self.in_payload_bytes_total / self.delivered)
@@ -3333,6 +4155,7 @@ fn expiry_words(p: Pairing) -> &'static str {
         Pairing::Late => "camera frame late",
         Pairing::Absent => "no camera frame",
         Pairing::AbsentInSource => "no camera frame in the source",
+        Pairing::Silent => "camera stream silent",
         Pairing::Paired | Pairing::Stale => "answered",
     }
 }
@@ -3359,6 +4182,7 @@ fn log_expired(rec: &Canvas, sweep_seq: i64, pairing: Pairing) -> u64 {
         entity::CAMERA_ANSWER,
         entity::CAMERA_ANSWER_LABEL,
         entity::LIDAR_ANSWER,
+        entity::LIDAR_PATH,
     ] {
         ok(rec.log(path, &Clear::flat()));
     }
@@ -3423,6 +4247,7 @@ pub(crate) fn log_no_sweep(rec: &Canvas, frame: u64) -> Result<(), rerun::Record
         entity::CAMERA_ANSWER,
         entity::CAMERA_ANSWER_LABEL,
         entity::LIDAR_ANSWER,
+        entity::LIDAR_PATH,
     ] {
         rec.log(path, &Clear::flat())?;
     }
@@ -3515,7 +4340,10 @@ fn style_track_entities(rec: &Canvas) -> u64 {
 /// can fail because of *when* an input arrived rather than because the
 /// arithmetic changed. It blocks on `obj->track` — the lidar-derived edge,
 /// which is the one that decides when a fused sample is due — and drains
-/// `cam_det->track` without blocking, because `pop` on the wrong edge would
+/// `cam_det->track` (and `cam1_det->track`, with the right camera: both
+/// cameras are paired by the same rule, on one shared deadline, and a sweep
+/// whose left frame was lost is built on the right frame -- see
+/// `TrackMeta::side`) without blocking, because `pop` on the wrong edge would
 /// deadlock the moment that stream fell silent.
 ///
 /// The pairing rule is containment on the sensor clock: sweep `S` with
@@ -3573,10 +4401,46 @@ pub fn track_thread(
         stale_age_ns_min: None,
         stale_age_ns_max: None,
         wait_ns_total: 0,
-        cam_delivered: 0,
-        cam_bad_format: 0,
-        cam_buffer_overflow: 0,
-        cam_by_seq: Vec::with_capacity(ctx.n_frames + 1),
+        cam: CamCounts {
+            by_seq: Vec::with_capacity(ctx.n_frames + 1),
+            ..CamCounts::default()
+        },
+        cam1: CamCounts {
+            by_seq: Vec::with_capacity(ctx.n_frames + 1),
+            ..CamCounts::default()
+        },
+        right_paired: 0,
+        right_stale: 0,
+        right_dropped: 0,
+        right_late: 0,
+        right_absent_in_source: 0,
+        sets_from_right: 0,
+        pair_silent: 0,
+        right_silent: 0,
+        left_silent_sweeps: 0,
+        right_silent_sweeps: 0,
+        stereo_checks: Vec::with_capacity(cfg.expect),
+        pillar: CamCounts {
+            by_seq: Vec::with_capacity(ctx.n_frames + 1),
+            ..CamCounts::default()
+        },
+        lidar_named: 0,
+        lidar_late: 0,
+        lidar_dropped: 0,
+        lidar_silent: 0,
+        lidar_silent_sweeps: 0,
+        lidar_wait_ns_total: 0,
+        names_completed: NameTally::default(),
+        names_degraded: NameTally::default(),
+        name_column_mismatch: 0,
+        ego_compensated: 0,
+        ego_stale: 0,
+        ego_missing: 0,
+        oxts_delivered: 0,
+        oxts_bad_format: 0,
+        oxts_by_seq: Vec::with_capacity(ctx.n_frames + 1),
+        ego_speed_mps_max: 0.0,
+        ego_yaw_rate_rps_max: 0.0,
         read_bytes_total: 0,
         build_bytes_total: 0,
         in_payload_bytes_total: 0,
@@ -3630,6 +4494,37 @@ pub fn track_thread(
         cams: Vec::with_capacity(ctx.n_frames + 1),
         pending: Vec::with_capacity(ctx.n_frames + 1),
     };
+    // The right camera's, on the same terms; empty for the whole run without
+    // one.
+    let mut buf1 = CamBuf {
+        cams: Vec::with_capacity(ctx.n_frames + 1),
+        pending: Vec::with_capacity(ctx.n_frames + 1),
+    };
+    let right_on = cfg.cam1_q.is_some();
+    // Each camera's health, in a run with two: a camera that has had no
+    // frame to pair for several sweeps is not waited for, so a stream that
+    // broke costs the other nothing (see [`CamHealth`]).
+    let mut health = (CamHealth::default(), CamHealth::default());
+    // The lidar detector's batches, held by sweep number, and its health on
+    // the cameras' terms: a detector that has delivered nothing for several
+    // sweeps is not waited for, until a batch of it arrives.
+    let pillars_on = cfg.pillar_q.is_some();
+    let mut pbuf = PillarBuf {
+        dets: Vec::with_capacity(ctx.n_frames + 1),
+        pending: Vec::with_capacity(ctx.n_frames + 1),
+    };
+    let mut health_lidar = CamHealth::default();
+    // The two cameras' baseline, from their calibrations, once.
+    let stereo = cfg
+        .calib
+        .as_ref()
+        .zip(cfg.calib_right.as_ref())
+        .map(|(l, r)| Stereo::of(l, r));
+    // The vehicle's own rows, on the same terms.
+    let mut obuf = OxtsBuf {
+        rows: Vec::with_capacity(ctx.n_frames + 1),
+        pending: Vec::with_capacity(ctx.n_frames + 1),
+    };
     let mut announced = false;
     // The pairing's series and the lidar's population classes are styled
     // once, on first sight, for the reason the dashboard styles on first
@@ -3667,17 +4562,110 @@ pub fn track_thread(
         let end = s.tov.end().map_or(0, |t| t.0);
         let wait_ns = cfg.pair_wait_ns.unwrap_or(end - start).max(0);
         let t_wait = now();
-        let (pairing, paired) = pair_camera(
-            &cfg,
+        // One deadline for both cameras: the right's wait is whatever the
+        // left's left of it, so two cameras never cost two waits. A camera
+        // declared silent is not waited for at all.
+        let deadline = (wait_ns > 0).then(|| t_wait + wait_ns);
+        let (left_silent, right_silent) =
+            (right_on && health.0.silent(), right_on && health.1.silent());
+        // The newest frame of each camera before this sweep's drains: a
+        // newer one afterwards is a frame that arrived, paired or not.
+        let newest = |b: &CamBuf| b.cams.last().map(|c| c.0.tov_ns);
+        let (newest_left, newest_right) = (newest(&buf), newest(&buf1));
+        let sweep = (start, end, trigger_ns);
+        let (pairing_left, paired_left) = pair_camera(
+            CamLane {
+                q: cfg.cam_q.as_deref(),
+                absent: &cfg.cam_absent,
+            },
             &mut buf,
-            &mut report,
-            (start, end, trigger_ns),
+            &mut report.cam,
+            sweep,
             sweep_seq,
-            wait_ns,
+            deadline.filter(|_| !left_silent),
+            cfg.pair_stale_ns,
         );
-        let cam = paired.as_ref().map(|(r, _)| *r);
+        let (pairing_right, paired_right) = pair_camera(
+            CamLane {
+                q: cfg.cam1_q.as_deref(),
+                absent: &cfg.cam1_absent,
+            },
+            &mut buf1,
+            &mut report.cam1,
+            sweep,
+            sweep_seq,
+            deadline.filter(|_| !right_silent),
+            cfg.pair_stale_ns,
+        );
         report.wait_ns_total += now() - t_wait;
-        let plan = tracker.plan(dets, sweep_seq, trigger_ns, cfg.voxel_size, RANGE_LIMIT_M);
+        // A frame of a silent camera brings it back; a miss of a camera that
+        // is silent is named as such, because it was not waited for.
+        if right_on {
+            health.0.observe(pairing_left, newest(&buf) != newest_left);
+            health
+                .1
+                .observe(pairing_right, newest(&buf1) != newest_right);
+        }
+        let pairing_left = if left_silent && !pairing_left.produces() {
+            Pairing::Silent
+        } else {
+            pairing_left
+        };
+        let pairing_right = if right_silent && !pairing_right.produces() {
+            Pairing::Silent
+        } else {
+            pairing_right
+        };
+        // The lidar detector's batch for this very sweep, on the cameras'
+        // deadline: what is left of it after the cameras, so three streams
+        // never cost three waits. Not waited for at all once the detector
+        // has gone silent; a batch arriving brings it back.
+        let lidar_silent = pillars_on && health_lidar.silent();
+        let t_lidar = now();
+        let (naming, pillar_sample) = pair_pillars(
+            cfg.pillar_q.as_deref(),
+            &mut pbuf,
+            &mut report.pillar,
+            s.seq,
+            deadline.filter(|_| !lidar_silent),
+        );
+        report.lidar_wait_ns_total += now() - t_lidar;
+        // A batch popped this sweep -- held in `pending` until the rows are
+        // written below -- is a sign of life, paired or not.
+        if pillars_on {
+            health_lidar.observe_ok(naming == Naming::Named, !pbuf.pending.is_empty());
+        }
+        let naming = if lidar_silent && naming != Naming::Named {
+            Naming::Silent
+        } else {
+            naming
+        };
+        // The set is the left camera's, as every set was; when the left's
+        // frame was lost and the right's is in, the right's stands in for
+        // the whole set -- answered, with every match one camera's -- and
+        // the set says so. With neither, it expires for the left's reason.
+        let (side, pairing, paired) = if pairing_left.produces() || !right_on {
+            (Camera::Left, pairing_left, paired_left)
+        } else if pairing_right.produces() {
+            (Camera::Right, pairing_right, paired_right.clone())
+        } else {
+            (Camera::Left, pairing_left, None)
+        };
+        let cam = paired.as_ref().map(|(r, _)| *r);
+        let cam_right = paired_right.as_ref().map(|(r, _)| *r);
+        // The vehicle's own motion over the interval, which the tracker
+        // subtracts before it matches. No wait: the row of a sweep's frame
+        // arrives 35 ms before the sweep ends on this dataset, and an older
+        // one stands in rather than holding the chain for a tiny payload.
+        let ego = pair_oxts(&cfg, &mut obuf, &mut report, sweep_seq);
+        let plan = tracker.plan(
+            dets,
+            sweep_seq,
+            trigger_ns,
+            cfg.voxel_size,
+            RANGE_LIMIT_M,
+            ego.rates(),
+        );
         let read_bytes = bytes_alloc(SLOT_TRACK) - b0;
         // The paired frame's detections, borrowed where `camdet` built them
         // (`None` for `proc`'s bare reference, which carries none), and the
@@ -3692,6 +4680,22 @@ pub fn track_thread(
                 report.fuse_scratch_bytes = fuser.scratch_bytes() as u64;
             }
         }
+        // The right camera's detections beside the left's, when the set is
+        // the left's and the right's frame is in; the second pass's scratch
+        // sized on the same terms.
+        let right_dets = (side == Camera::Left && right_on)
+            .then(|| {
+                paired_right
+                    .as_ref()
+                    .and_then(|(_, cs)| cam_det_view(&cs.payload))
+            })
+            .flatten();
+        if let (Some(d), Some(rd)) = (&cam_dets, &right_dets) {
+            if fuser.reserve_right(plan.emitted as usize, d.len(), rd.len()) {
+                report.fuse_scratch_growths += 1;
+                report.fuse_scratch_bytes = fuser.scratch_bytes() as u64;
+            }
+        }
         // Window 2 — building the result, when there is one to build: the
         // tracks, projected, and associated with those detections.
         let b1 = bytes_alloc(SLOT_TRACK);
@@ -3702,17 +4706,55 @@ pub fn track_thread(
             source_points: detect_source_points(&s.payload).unwrap_or(0),
             cam,
             pairing,
+            ego,
+            side,
+            cam_right,
+            pairing_right,
+            pairing_left,
+            naming,
+            lidar_det_seq: pillar_sample.as_ref().map_or(-1, |b| b.seq as i64),
+        };
+        // The second camera's part: its frame beside the left's, or, in a
+        // run that has it, the fact that this sweep has none -- which makes
+        // every match one camera's.
+        // With the other camera declared silent, the set is one camera's as
+        // a run with one camera makes it -- the classes trusted, the record
+        // saying which camera was silent -- rather than every match demoted
+        // for a sensor that has evidently failed.
+        let other_silent = match side {
+            Camera::Left => right_silent,
+            Camera::Right => left_silent,
+        };
+        let right = match (right_on, &right_dets, cfg.calib_right.as_ref(), stereo) {
+            (false, _, _, _) => Right::Off,
+            (true, Some(dets), Some(calib), Some(stereo)) => Right::Frame {
+                dets,
+                calib,
+                stereo,
+            },
+            (true, _, _, _) if other_silent => Right::Off,
+            (true, _, _, _) => Right::Missing,
+        };
+        // The tracks are projected into the frame the set is built on.
+        let projection = match side {
+            Camera::Left => cfg.calib.as_ref(),
+            Camera::Right => cfg.calib_right.as_ref(),
         };
         // **The refusal.** A set that could not be paired produces no sample
         // at all; the tracker has still been advanced, because the lidar half
         // did not fail and pretending it did would break every track for a
         // camera's reason.
+        // The lidar detector's boxes, borrowed where `pillars` built them,
+        // when this sweep's batch is in hand.
+        let named = pillar_sample.as_ref().map(|b| pillar_det_rows(&b.payload));
         let built = pairing.produces().then(|| {
             tracker.build_fused(
                 &plan,
                 &meta,
-                cfg.calib.as_ref(),
+                projection,
                 cam_dets.as_ref().map(|d| (d, &mut fuser)),
+                right,
+                named,
                 &cfg.schema,
             )
         });
@@ -3720,8 +4762,31 @@ pub fn track_thread(
         let proc_end = now();
 
         // Everything below is outside the measured windows, including the
-        // camera rows this sweep's drain has been holding.
-        flush_cam(&mut buf, &mut report, &sink, &ctx, &rc);
+        // camera and OXTS rows this sweep's drains have been holding.
+        flush_cam(&mut buf, &mut report.cam, Camera::Left, &sink, &ctx, &rc);
+        flush_cam(&mut buf1, &mut report.cam1, Camera::Right, &sink, &ctx, &rc);
+        flush_oxts(&mut obuf, &mut report, &sink, &ctx, &rc);
+        flush_pillars(&mut pbuf, &mut report.pillar, &sink, &ctx, &rc);
+        if pillars_on {
+            match naming {
+                Naming::Named => report.lidar_named += 1,
+                Naming::Late => report.lidar_late += 1,
+                Naming::Dropped => report.lidar_dropped += 1,
+                Naming::Silent => report.lidar_silent += 1,
+                Naming::Off => {}
+            }
+            report.lidar_silent_sweeps += u64::from(lidar_silent);
+        }
+        match ego.outcome {
+            EgoOutcome::Compensated => report.ego_compensated += 1,
+            EgoOutcome::Stale => report.ego_stale += 1,
+            EgoOutcome::Missing => report.ego_missing += 1,
+            EgoOutcome::Unavailable => {}
+        }
+        if let Some(r) = ego.rates() {
+            report.ego_speed_mps_max = report.ego_speed_mps_max.max(r.speed());
+            report.ego_yaw_rate_rps_max = report.ego_yaw_rate_rps_max.max(r.yaw_rate.abs());
+        }
         let in_storage = detect_storage_id(&s.payload);
         let row = Evidence::delivered(
             &rc,
@@ -3785,6 +4850,26 @@ pub fn track_thread(
             Pairing::AbsentInSource => report
                 .pair_absent_in_source
                 .push(u64::try_from(sweep_seq).unwrap_or(0)),
+            Pairing::Silent => report.pair_silent += 1,
+        }
+        // The right camera's own pairing, whichever frame the set is built
+        // on, the sets the right camera alone answered, and the sweeps each
+        // camera was silent for.
+        if right_on {
+            match pairing_right {
+                Pairing::Paired => report.right_paired += 1,
+                Pairing::Stale => report.right_stale += 1,
+                Pairing::Dropped => report.right_dropped += 1,
+                Pairing::Late => report.right_late += 1,
+                Pairing::Absent => {}
+                Pairing::AbsentInSource => report.right_absent_in_source += 1,
+                Pairing::Silent => report.right_silent += 1,
+            }
+            if side == Camera::Right {
+                report.sets_from_right += 1;
+            }
+            report.left_silent_sweeps += u64::from(left_silent);
+            report.right_silent_sweeps += u64::from(right_silent);
         }
 
         // The pairing, on the dashboard, for EVERY sweep -- one that expires
@@ -3829,8 +4914,8 @@ pub fn track_thread(
             report.viz_ns_total += now() - t_viz;
         }
 
-        let (batch, out_storage, in_frame, fuse) = match built {
-            Some(Ok(b)) => (b.batch, b.storage_id, b.in_frame, b.fuse),
+        let (batch, out_storage, in_frame, fuse, names) = match built {
+            Some(Ok(b)) => (b.batch, b.storage_id, b.in_frame, b.fuse, b.names),
             Some(Err(e)) => {
                 eprintln!("track: detections {}: {e}", s.seq);
                 report.errors += 1;
@@ -3883,8 +4968,32 @@ pub fn track_thread(
                     _ => {
                         report.fuse_completed.add(&fuse, rows, camera_only);
                         report.shape.add_sample(rows, cfg.voxel_size.metres());
+                        // Two sensors on each confirmed object, for the
+                        // run to compare: only when the second pass ran
+                        // this sweep, or the scratch holds the last one's.
+                        if fuse.right_ran {
+                            report
+                                .stereo_checks
+                                .extend_from_slice(fuser.stereo_checks());
+                        }
                     }
                 }
+            }
+        }
+        // The naming's result, read back out of the batch on the same terms:
+        // the lanes against the column, and the tally by how the set was
+        // paired.
+        if names.ran {
+            let rows = track_rows(&batch);
+            let lanes_named = rows
+                .iter()
+                .filter(|t| track_lidar_class(t).is_some())
+                .count() as u64;
+            report.name_column_mismatch +=
+                u64::from(track_named_count(&batch).map(u64::from) != Some(lanes_named));
+            match pairing {
+                Pairing::Stale => report.names_degraded.add(&names, rows),
+                _ => report.names_completed.add(&names, rows),
             }
         }
         report.batches.push(batch.clone());
@@ -4008,20 +5117,40 @@ pub fn track_thread(
         report.produced += 1;
         report.out_by_seq.push((admitted.seq, out_storage));
         report.out_parent.push((admitted.seq, s.seq));
-        report.out_cam.push((
-            admitted.seq,
-            cam.map_or(-1, |c| c.seq as i64),
+        report.out_cam.push(OutCam {
+            seq: admitted.seq,
+            cam_seq: cam.map_or(-1, |c| c.seq as i64),
             pairing,
             trigger_ns,
-        ));
+            side,
+            cam1_seq: cam_right.map_or(-1, |c| c.seq as i64),
+            pairing_right,
+            lidar_det_seq: meta.lidar_det_seq,
+            naming,
+        });
     }
-    // The camera edge's producer stopped before this one did (the shutdown
+    // The camera edges' producers stopped before this one did (the shutdown
     // order guarantees it), so anything still queued is drained here rather
     // than left unaccounted: `INVARIANT rows edge=cam_det->track` requires one
     // row per admitted sample, and a reference this stage never looked at
     // still owes one.
-    drain_cam(&cfg, &mut buf, &mut report);
-    flush_cam(&mut buf, &mut report, &sink, &ctx, &rc);
+    if let Some(q) = &cfg.cam_q {
+        drain_cam(q, &mut buf, &mut report.cam);
+    }
+    flush_cam(&mut buf, &mut report.cam, Camera::Left, &sink, &ctx, &rc);
+    if let Some(q) = &cfg.cam1_q {
+        drain_cam(q, &mut buf1, &mut report.cam1);
+    }
+    flush_cam(&mut buf1, &mut report.cam1, Camera::Right, &sink, &ctx, &rc);
+    drain_oxts(&cfg, &mut obuf, &mut report);
+    flush_oxts(&mut obuf, &mut report, &sink, &ctx, &rc);
+    // And the lidar detector's, on the same terms: `pillars` stopped before
+    // this stage did, so a batch still queued is drained here rather than
+    // left unaccounted.
+    if let Some(q) = &cfg.pillar_q {
+        drain_pillars(q, &mut pbuf, &mut report.pillar);
+    }
+    flush_pillars(&mut pbuf, &mut report.pillar, &sink, &ctx, &rc);
     report
 }
 
@@ -4050,18 +5179,81 @@ struct CamBuf {
     pending: Vec<(Queued<Arc<Sample>>, HostTime, usize)>,
 }
 
-/// Pops everything waiting on `cam_det->track`. Never blocks, never allocates,
-/// and writes no evidence -- see [`CamBuf`].
-fn drain_cam(cfg: &TrackCfg, buf: &mut CamBuf, report: &mut TrackReport) {
-    let Some(q) = &cfg.cam_q else { return };
+/// How many sweeps running a camera may fail to pair -- no frame inside the
+/// range by the deadline, one produced and lost, or none in its source --
+/// before the fusion declares it silent. Three: one sweep is a dropped
+/// frame, two a hiccup, three a stream that is not coming.
+pub const SILENT_AFTER_SWEEPS: u32 = 3;
+
+/// One camera's health at the fusion, in a run with two cameras: a camera
+/// from which nothing has arrived for [`SILENT_AFTER_SWEEPS`] sweeps
+/// running, none of them pairing, is **silent**, and the fusion stops
+/// waiting for it -- the other camera's set is built at once, on one
+/// camera's terms -- until a frame of it arrives or pairs again. Without it
+/// a stream that broke mid-run cost every later sweep the whole pair wait,
+/// and the lidar chain behind it, for a frame that was never coming. In a
+/// run with one camera the fusion waits as it always did: there is no other
+/// camera to carry on with, and a late frame is still worth waiting for.
+///
+/// Arrivals count, not only pairings, because a camera that is late by less
+/// than the wait is alive: its frames keep coming, and waited for they pair.
+/// Counted by pairings alone, the GPU detector's first frame -- a third of
+/// a second, the runtime's own warm-up -- made both cameras silent on the
+/// first three sweeps, and silent they were never waited for, so their
+/// frames, 50 ms late every sweep, never paired again and every sweep of
+/// the run expired.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct CamHealth {
+    /// Sweeps running on which this camera neither paired nor delivered a
+    /// frame.
+    misses: u32,
+}
+
+impl CamHealth {
+    /// Whether the camera is silent: not to be waited for this sweep.
+    fn silent(&self) -> bool {
+        self.misses >= SILENT_AFTER_SWEEPS
+    }
+
+    /// Files one sweep of this camera: a frame that paired, inside the sweep
+    /// or stale, or any frame that arrived since the last sweep, brings the
+    /// count to zero; a sweep with neither is a miss.
+    fn observe(&mut self, pairing: Pairing, arrived: bool) {
+        self.observe_ok(pairing.produces(), arrived);
+    }
+
+    /// The same rule for any stream the fusion waits for: `produced` is
+    /// whether this sweep got the stream's sample, `arrived` whether any
+    /// sample of it came since the last sweep. The lidar detector's batches
+    /// are filed through this one ([`pair_pillars`]).
+    fn observe_ok(&mut self, produced: bool, arrived: bool) {
+        if produced || arrived {
+            self.misses = 0;
+        } else {
+            self.misses = self.misses.saturating_add(1);
+        }
+    }
+}
+
+/// One camera's edge into the fusion, and the frames its source lacks: what
+/// [`pair_camera`] pairs a sweep from. `q` is `None` for a camera the run
+/// does not have.
+struct CamLane<'a> {
+    q: Option<&'a BoundedQueue<Arc<Sample>>>,
+    absent: &'a [u64],
+}
+
+/// Pops everything waiting on a camera's edge. Never blocks, never
+/// allocates, and writes no evidence -- see [`CamBuf`].
+fn drain_cam(q: &BoundedQueue<Arc<Sample>>, buf: &mut CamBuf, counts: &mut CamCounts) {
     while let Some(env) = q.try_pop() {
-        take_cam(env, buf, report);
+        take_cam(env, buf, counts);
     }
 }
 
 /// One popped camera reference: its place in the buffer, and its envelope held
 /// for the row that will be written outside the measured window.
-fn take_cam(env: Queued<Arc<Sample>>, buf: &mut CamBuf, report: &mut TrackReport) {
+fn take_cam(env: Queued<Arc<Sample>>, buf: &mut CamBuf, counts: &mut CamCounts) {
     let t = now();
     // Read, not copied: the address of the buffer the batch arrived in.
     let storage = cam_det_storage_id(&env.item.payload).unwrap_or(0);
@@ -4071,20 +5263,22 @@ fn take_cam(env: Queued<Arc<Sample>>, buf: &mut CamBuf, report: &mut TrackReport
                 // Sized for the whole run, so this is unreachable rather than
                 // unlikely -- counted anyway, because an unreachable case that
                 // silently drops evidence is how a measurement becomes wrong.
-                report.cam_buffer_overflow += 1;
+                counts.buffer_overflow += 1;
                 buf.cams.remove(0);
             }
             buf.cams.push((r, Arc::clone(&env.item)));
         }
-        None => report.cam_bad_format += 1,
+        None => counts.bad_format += 1,
     }
     buf.pending.push((env, t, storage));
 }
 
-/// Writes the held camera rows. **Call outside the measured window.**
+/// Writes the held camera rows of one camera, on its own edge. **Call
+/// outside the measured window.**
 fn flush_cam(
     buf: &mut CamBuf,
-    report: &mut TrackReport,
+    counts: &mut CamCounts,
+    cam: Camera,
     sink: &Arc<EvidenceSink>,
     ctx: &Arc<RunCtx>,
     rc: &RowCtx,
@@ -4097,7 +5291,7 @@ fn flush_cam(
         let row = Evidence::delivered(
             rc,
             &env.item,
-            "cam_det->track",
+            cam.track_edge(),
             "track",
             env.enqueued,
             env.depth_at_push,
@@ -4109,36 +5303,40 @@ fn flush_cam(
             0,
         );
         sink.send(EvRow::Evidence(row), ctx, "track");
-        report.cam_delivered += 1;
-        report.cam_by_seq.push((env.item.seq, storage));
+        counts.delivered += 1;
+        counts.by_seq.push((env.item.seq, storage));
     }
 }
 
-/// The pairing rule, with its bounded wait and its four failures. Returns
-/// the paired camera sample itself beside its reference -- an `Arc` clone,
-/// so handing it over allocates nothing.
+/// The pairing rule, with its bounded wait and its four failures, for one
+/// camera. Returns the paired camera sample itself beside its reference --
+/// an `Arc` clone, so handing it over allocates nothing.
 ///
 /// `sweep` is the sweep's range and its trigger: the range decides a
-/// completed pair, and the declared stale window is counted back from the
-/// trigger (see [`TrackCfg::pair_stale_ns`]). `sweep_frame` is its frame
-/// number, which names why nothing is inside the range when the camera's
-/// source has no frame of that number ([`Pairing::AbsentInSource`]).
+/// completed pair, and the declared stale window `stale_ns` is counted back
+/// from the trigger (see [`TrackCfg::pair_stale_ns`]). `sweep_frame` is its
+/// frame number, which names why nothing is inside the range when the
+/// camera's source has no frame of that number
+/// ([`Pairing::AbsentInSource`]). `deadline` is how long a frame that has
+/// not arrived is waited for -- an instant, not a span, so two cameras can
+/// share one wait -- or `None` to refuse at once.
 fn pair_camera(
-    cfg: &TrackCfg,
+    lane: CamLane<'_>,
     buf: &mut CamBuf,
-    report: &mut TrackReport,
+    counts: &mut CamCounts,
     sweep: (i64, i64, i64),
     sweep_frame: i64,
-    wait_ns: i64,
+    deadline: Option<HostTime>,
+    stale_ns: i64,
 ) -> (Pairing, Option<(CamRef, Arc<Sample>)>) {
     // A trigger outside the range -- only a payload without one, read as 0 --
     // is held to the range, so a missing trigger can narrow the window to the
     // range's start but never widen it to every older frame.
     let (start, end, trigger) = (sweep.0, sweep.1, sweep.2.max(sweep.0).min(sweep.1));
-    let Some(q) = &cfg.cam_q else {
+    let Some(q) = lane.q else {
         return (Pairing::Absent, None);
     };
-    drain_cam(cfg, buf, report);
+    drain_cam(q, buf, counts);
     let cams = &buf.cams;
     // Half-open containment; see `track_thread`'s docs.
     let inside = |c: &&(CamRef, Arc<Sample>)| c.0.tov_ns >= start && c.0.tov_ns < end;
@@ -4154,11 +5352,10 @@ fn pair_camera(
     // And a frame the camera's source never had is not coming at all: the
     // wait is skipped for it too, for the same reason.
     let absent_in_source =
-        u64::try_from(sweep_frame).is_ok_and(|f| cfg.cam_absent.binary_search(&f).is_ok());
-    if !straddled && !absent_in_source && wait_ns > 0 {
-        let deadline = now() + wait_ns;
+        u64::try_from(sweep_frame).is_ok_and(|f| lane.absent.binary_search(&f).is_ok());
+    if let (false, false, Some(deadline)) = (straddled, absent_in_source, deadline) {
         while let Some(env) = q.pop_by(deadline) {
-            take_cam(env, buf, report);
+            take_cam(env, buf, counts);
             if let Some((r, s)) = buf.cams.iter().find(inside) {
                 return (Pairing::Paired, Some((*r, Arc::clone(s))));
             }
@@ -4172,10 +5369,10 @@ fn pair_camera(
     // A declared stale window, or nothing: the freshest frame that is still
     // too old -- before the range, and no further before the TRIGGER than the
     // window, so its `pair_age_ns` is never staler than the window declared.
-    if cfg.pair_stale_ns > 0 {
+    if stale_ns > 0 {
         if let Some((r, s)) = cams
             .iter()
-            .filter(|c| c.0.tov_ns < start && trigger - c.0.tov_ns <= cfg.pair_stale_ns)
+            .filter(|c| c.0.tov_ns < start && trigger - c.0.tov_ns <= stale_ns)
             .max_by_key(|c| c.0.tov_ns)
         {
             return (Pairing::Stale, Some((*r, Arc::clone(s))));
@@ -4187,6 +5384,335 @@ fn pair_camera(
         (Pairing::Dropped, None)
     } else {
         (Pairing::Late, None)
+    }
+}
+
+/// The `track` stage's buffer of the vehicle's own rows, on the terms of
+/// [`CamBuf`]: every row popped off `oxts->track`, with its motion read out
+/// once, and the envelopes held for the rows written outside the measured
+/// window. A row is 30 numbers, so the whole drive's fit in a few kilobytes
+/// and the buffer is sized for it up front.
+struct OxtsBuf {
+    /// `(frame, what the vehicle was doing)`, in frame order: rows arrive in
+    /// it, so pushing keeps it sorted.
+    rows: Vec<(u64, EgoRates)>,
+    /// Each held envelope, when it was popped, and the storage id re-derived
+    /// from its payload then.
+    pending: Vec<(Queued<Arc<Sample>>, HostTime, usize)>,
+}
+
+/// How many frames older than the sweep an OXTS row may be and still stand
+/// in for the sweep's own ([`EgoOutcome::Stale`]). Two: the vehicle's speed
+/// and yaw rate change little in 0.2 s, and a row older than that is a
+/// claim about a different moment.
+const EGO_STALE_FRAMES: i64 = 2;
+
+/// Pops everything waiting on `oxts->track`. Never blocks, never allocates,
+/// writes no evidence.
+fn drain_oxts(cfg: &TrackCfg, buf: &mut OxtsBuf, report: &mut TrackReport) {
+    let Some(q) = &cfg.oxts_q else { return };
+    while let Some(env) = q.try_pop() {
+        let t = now();
+        let storage = oxts_storage_id(&env.item.payload).unwrap_or(0);
+        match read_ego(&env.item.payload) {
+            Some(r) => buf.rows.push((env.item.seq, r)),
+            None => report.oxts_bad_format += 1,
+        }
+        buf.pending.push((env, t, storage));
+    }
+}
+
+/// Writes the held OXTS rows. **Call outside the measured window.**
+fn flush_oxts(
+    buf: &mut OxtsBuf,
+    report: &mut TrackReport,
+    sink: &Arc<EvidenceSink>,
+    ctx: &Arc<RunCtx>,
+    rc: &RowCtx,
+) {
+    for (env, t, storage) in buf.pending.drain(..) {
+        // Delivered whether or not a sweep used it, as the camera's rows
+        // are: `INVARIANT rows edge=oxts->track` requires one per sample.
+        let row = Evidence::delivered(
+            rc,
+            &env.item,
+            "oxts->track",
+            "track",
+            env.enqueued,
+            env.depth_at_push,
+            env.depth_after_pop,
+            t,
+            t,
+            t,
+            storage,
+            0,
+        );
+        sink.send(EvRow::Evidence(row), ctx, "track");
+        report.oxts_delivered += 1;
+        report.oxts_by_seq.push((env.item.seq, storage));
+    }
+}
+
+/// The vehicle's own motion for the sweep of frame `sweep_frame`: the OXTS
+/// row of that number, or the newest earlier one within
+/// [`EGO_STALE_FRAMES`], named as a substitute, or nothing. No wait, and no
+/// allocation: the buffer is sized for the run.
+///
+/// By frame number rather than by instant, because KITTI's synced drives
+/// stamp exactly one row per frame, 17 ms after the lidar's trigger on
+/// drive 0005: the row of the sweep's number is the row of its moment.
+fn pair_oxts(
+    cfg: &TrackCfg,
+    buf: &mut OxtsBuf,
+    report: &mut TrackReport,
+    sweep_frame: i64,
+) -> EgoHalf {
+    if cfg.oxts_q.is_none() {
+        return EgoHalf::default();
+    }
+    drain_oxts(cfg, buf, report);
+    let frame_of = |seq: u64| i64::try_from(seq).unwrap_or(i64::MAX);
+    if let Some(&(seq, rates)) = buf
+        .rows
+        .iter()
+        .rev()
+        .find(|(s, _)| frame_of(*s) == sweep_frame)
+    {
+        return EgoHalf {
+            outcome: EgoOutcome::Compensated,
+            seq: frame_of(seq),
+            rates,
+        };
+    }
+    let stand_in = buf
+        .rows
+        .iter()
+        .rev()
+        .find(|(s, _)| (sweep_frame - EGO_STALE_FRAMES..sweep_frame).contains(&frame_of(*s)));
+    match stand_in {
+        Some(&(seq, rates)) => EgoHalf {
+            outcome: EgoOutcome::Stale,
+            seq: frame_of(seq),
+            rates,
+        },
+        None => EgoHalf {
+            outcome: EgoOutcome::Missing,
+            seq: -1,
+            rates: EgoRates::default(),
+        },
+    }
+}
+
+/// What naming did over one population of sets, summed from each set's
+/// [`NamePlan`] and read off the finished lanes: the boxes, the fresh tracks
+/// that could take a class, the tracks that did, the boxes that named
+/// something and those that named nothing -- and, against the cameras'
+/// classes on the same records, how often the two sensors agreed.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NameTally {
+    /// Sets that had a batch of boxes to name from.
+    pub samples: u64,
+    /// Boxes in those batches, and of them the ones scoring under the
+    /// naming's bar ([`pipes_kitti::name::NAME_SCORE_MIN`]), which name
+    /// nothing.
+    pub detections: u64,
+    pub below_score: u64,
+    /// Fresh tracks in those sets.
+    pub candidates: u64,
+    /// Tracks that took a class from a box, counted off lane 26.
+    pub named: u64,
+    /// Boxes that named at least one track, and those that named none.
+    pub used: u64,
+    pub unused: u64,
+    /// Boxes that named more than one track: fragments of one object.
+    pub shared: u64,
+    /// Tracks whose centroid lay in more than one box.
+    pub contested: u64,
+    /// Named tracks by lidar class id.
+    pub classes: [u64; 3],
+    /// Named tracks a camera also gave a class (fused or one camera's), and
+    /// of those the ones where the two vocabularies agree ([`agrees`]) and
+    /// where they do not; and named tracks no camera matched.
+    pub both_named: u64,
+    pub agree: u64,
+    pub conflict: u64,
+    pub lidar_only_named: u64,
+}
+
+impl NameTally {
+    fn add(&mut self, plan: &NamePlan, rows: &[[f32; TRACK_LANES]]) {
+        self.samples += 1;
+        self.detections += u64::from(plan.detections);
+        self.below_score += u64::from(plan.below_score);
+        self.candidates += u64::from(plan.candidates);
+        self.used += u64::from(plan.used);
+        self.unused += u64::from(plan.unused);
+        self.shared += u64::from(plan.shared);
+        self.contested += u64::from(plan.contested);
+        for t in rows {
+            let Some((lidar, _)) = track_lidar_class(t) else {
+                continue;
+            };
+            self.named += 1;
+            if let Some(c) = self.classes.get_mut(lidar as usize) {
+                *c += 1;
+            }
+            match track_class(t) {
+                Some((camera, _)) => {
+                    self.both_named += 1;
+                    if agrees(camera, lidar) {
+                        self.agree += 1;
+                    } else {
+                        self.conflict += 1;
+                    }
+                }
+                None => self.lidar_only_named += 1,
+            }
+        }
+    }
+
+    /// Named tracks over the fresh tracks that could have been.
+    pub fn named_fraction_of_candidates(&self) -> Option<f64> {
+        (self.candidates > 0).then(|| self.named as f64 / self.candidates as f64)
+    }
+
+    /// `(class name, named tracks)`, most frequent first, ties by class id.
+    pub fn class_counts(&self) -> Vec<(&'static str, u64)> {
+        let mut v: Vec<(usize, u64)> = self
+            .classes
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(_, n)| *n > 0)
+            .collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        v.into_iter()
+            .map(|(k, n)| (lidar_class_name(k as u32), n))
+            .collect()
+    }
+}
+
+/// The `track` stage's buffer of the lidar detector's batches, on
+/// [`CamBuf`]'s terms: every batch popped off `pillar_det->track`, held (an
+/// `Arc` clone) until the sweep of its number has been built, and the
+/// envelopes held for the rows written outside the measured window. A
+/// sweep's batch carries the sweep's own seq, so there is no instant to
+/// search by: the pairing is by number.
+struct PillarBuf {
+    /// `(sweep seq, the batch)`, in arrival order, which is sweep order.
+    dets: Vec<(u64, Arc<Sample>)>,
+    /// Each held envelope, when it was popped, and the storage id re-derived
+    /// from its payload then.
+    pending: Vec<(Queued<Arc<Sample>>, HostTime, usize)>,
+}
+
+/// Pops everything waiting on `pillar_det->track`. Never blocks, never
+/// allocates beyond the buffers' capacity, writes no evidence.
+fn drain_pillars(q: &BoundedQueue<Arc<Sample>>, buf: &mut PillarBuf, counts: &mut CamCounts) {
+    while let Some(env) = q.try_pop() {
+        take_pillar(env, buf, counts);
+    }
+}
+
+/// One popped batch: its place in the buffer, and its envelope held for the
+/// row that will be written outside the measured window.
+fn take_pillar(env: Queued<Arc<Sample>>, buf: &mut PillarBuf, counts: &mut CamCounts) {
+    let t = now();
+    // Read, not copied: the address of the buffer the batch arrived in.
+    match pillar_det_storage_id(&env.item.payload) {
+        Some(storage) => {
+            if buf.dets.len() == buf.dets.capacity() {
+                counts.buffer_overflow += 1;
+                buf.dets.remove(0);
+            }
+            buf.dets.push((env.item.seq, Arc::clone(&env.item)));
+            buf.pending.push((env, t, storage));
+        }
+        None => {
+            counts.bad_format += 1;
+            buf.pending.push((env, t, 0));
+        }
+    }
+}
+
+/// Writes the held rows, on `pillar_det->track`. **Call outside the
+/// measured window.**
+fn flush_pillars(
+    buf: &mut PillarBuf,
+    counts: &mut CamCounts,
+    sink: &Arc<EvidenceSink>,
+    ctx: &Arc<RunCtx>,
+    rc: &RowCtx,
+) {
+    for (env, t, storage) in buf.pending.drain(..) {
+        // Delivered whether or not a sweep used it, as the cameras' rows
+        // are: `INVARIANT rows edge=pillar_det->track` requires one per
+        // sample.
+        let row = Evidence::delivered(
+            rc,
+            &env.item,
+            "pillar_det->track",
+            "track",
+            env.enqueued,
+            env.depth_at_push,
+            env.depth_after_pop,
+            t,
+            t,
+            t,
+            storage,
+            0,
+        );
+        sink.send(EvRow::Evidence(row), ctx, "track");
+        counts.delivered += 1;
+        counts.by_seq.push((env.item.seq, storage));
+    }
+}
+
+/// The lidar detector's batch for the sweep numbered `sweep`, with a
+/// bounded wait, on [`pair_camera`]'s terms: the batch in hand, or waited
+/// for until `deadline` (`None`: not waited for) unless a batch for a LATER
+/// sweep has already arrived -- batches come in sweep order, so the one
+/// wanted was produced and lost, or the stage failed on it, and waiting
+/// would charge the fusion for an upstream loss. Batches older than the
+/// sweep are let go: the chain only moves forward.
+fn pair_pillars(
+    q: Option<&BoundedQueue<Arc<Sample>>>,
+    buf: &mut PillarBuf,
+    counts: &mut CamCounts,
+    sweep: u64,
+    deadline: Option<HostTime>,
+) -> (Naming, Option<Arc<Sample>>) {
+    let Some(q) = q else {
+        return (Naming::Off, None);
+    };
+    drain_pillars(q, buf, counts);
+    buf.dets.retain(|(s, _)| *s >= sweep);
+    let find = |buf: &PillarBuf| {
+        buf.dets
+            .iter()
+            .find(|(s, _)| *s == sweep)
+            .map(|(_, b)| Arc::clone(b))
+    };
+    if let Some(b) = find(buf) {
+        return (Naming::Named, Some(b));
+    }
+    let mut newer = buf.dets.iter().any(|(s, _)| *s > sweep);
+    if let (false, Some(deadline)) = (newer, deadline) {
+        while let Some(env) = q.pop_by(deadline) {
+            take_pillar(env, buf, counts);
+            if let Some(b) = find(buf) {
+                return (Naming::Named, Some(b));
+            }
+            if buf.dets.iter().any(|(s, _)| *s > sweep) {
+                newer = true;
+                break;
+            }
+        }
+    }
+    if newer {
+        (Naming::Dropped, None)
+    } else {
+        (Naming::Late, None)
     }
 }
 
@@ -4362,7 +5888,20 @@ pub fn state_thread(
         // Window 1 — reading the tracks in place. Expected to be 0.
         let b0 = bytes_alloc(SLOT_STATE);
         let rows = track_rows(&s.payload);
-        let answer = StateAnswer::of(rows);
+        // The vehicle's own half, as the tracker spelled it: with it the
+        // velocities are over ground, and the closing speed needs the
+        // vehicle's forward speed to come back out of them.
+        let ego = track_ego(&s.payload).unwrap_or_default();
+        let ego_vf = ego.rates().map(|r| r.vf as f32);
+        // The path the vehicle is on, from the same rates: what "in the
+        // way" is measured against.
+        let path = EgoPath::of(ego.rates());
+        // The tracker's own gate for this sweep: what one association could
+        // have moved a centroid by, so what a young track's velocity cannot
+        // rule out of its time to contact. A batch without it establishes
+        // nothing.
+        let gate_m = track_gate_m(&s.payload).unwrap_or(f32::INFINITY);
+        let answer = StateAnswer::of_on(rows, ego_vf, &path, gate_m);
         let read_bytes = bytes_alloc(SLOT_STATE) - b0;
         // Window 2 — one record per track, the nearest in the path flagged.
         let b1 = bytes_alloc(SLOT_STATE);
@@ -4378,6 +5917,17 @@ pub fn state_thread(
             // read.
             pair_outcome: pairing_name(track_pair_outcome(&s.payload)),
             pair_age_ns: track_pair_age_ns(&s.payload).unwrap_or(0),
+            ego_outcome: ego.outcome.name(),
+            ego_vf,
+            // The second camera's half, carried through on the same terms.
+            cam_side: track_cam_side(&s.payload).unwrap_or_default().name(),
+            cam1_seq: track_cam1_seq(&s.payload).unwrap_or(-1),
+            cam1_pair_outcome: pairing_name(track_cam1_pair_outcome(&s.payload)),
+            cam0_pair_outcome: pairing_name(track_cam0_pair_outcome(&s.payload)),
+            // The lidar detector's half, carried through on the same terms.
+            lidar_det_outcome: naming_name(track_lidar_det_outcome(&s.payload)),
+            path,
+            gate_m,
         };
         // The camera's unmatched detections, handed on as the track batch
         // holds them: an `Arc` clone of the column, not a copy of it.
@@ -4431,6 +5981,9 @@ pub fn state_thread(
                             cam_seq: meta.cam_seq,
                             pair_outcome: meta.pair_outcome,
                             pair_age_ns: meta.pair_age_ns,
+                            side: meta.cam_side,
+                            left_outcome: meta.cam0_pair_outcome,
+                            right_outcome: meta.cam1_pair_outcome,
                         },
                     ));
                 }
@@ -4513,6 +6066,19 @@ pub fn state_thread(
                 None => rec.log(entity::LIDAR_ANSWER, &Clear::flat()),
             };
             if logged.is_err() {
+                report.viz_log_errors += 1;
+            }
+            // The corridor the answer was measured against, on the same
+            // sweep: where "in the path" is.
+            if rec
+                .log(
+                    entity::LIDAR_PATH,
+                    &LineStrips3D::new(corridor_strips(&path))
+                        .with_colors([Color::from_rgb(C_PATH[0], C_PATH[1], C_PATH[2])])
+                        .with_radii([Radius::new_ui_points(PATH_OUTLINE_PT)]),
+                )
+                .is_err()
+            {
                 report.viz_log_errors += 1;
             }
             // Then on the picture, on the paired frame's own timelines, so a
@@ -4616,6 +6182,41 @@ pub fn state_thread(
                             classes.push(CLASS_FUSED);
                             hover.push(format!("{label}{suffix}"));
                         }
+                    } else if o.population == POPULATION_ONE_CAMERA {
+                        // One camera's match, which the other did not
+                        // confirm: the lidar's teal, and the class in the
+                        // label with a question mark, so a reader sees what
+                        // one camera said and that the answer does not
+                        // trust it.
+                        let label = one_camera_label(&o);
+                        colors.push(rgba(C_LIDAR_ONLY, LABELLED_ALPHA));
+                        radii.push(TRACK_OUTLINE_PT);
+                        classes.push(CLASS_ONE_CAMERA);
+                        hover.push(label.clone());
+                        let foot = [b.x0 + 0.5 * b.w(), b.y1];
+                        let drawn = format!("{label}{suffix}");
+                        if !o.nearest_in_path && !gives_way(foot, &drawn) {
+                            feet.push(foot);
+                            label_colors.push(rgba(C_LIDAR_ONLY, LABELLED_ALPHA));
+                            labels.push(drawn);
+                        }
+                    } else if o.lidar_class.is_some() {
+                        // The camera matched nothing here and the lidar
+                        // detector did: the lidar's teal, and the class
+                        // drawn with the word `lidar` on it, so a reader
+                        // sees which sensor spoke. A handful a frame, so
+                        // the labels fit where forty lidar-only ones did not.
+                        let label = lidar_named_label(&o);
+                        colors.push(rgba(C_LIDAR_ONLY, LABELLED_ALPHA));
+                        radii.push(TRACK_OUTLINE_PT);
+                        classes.push(CLASS_LIDAR_ONLY);
+                        hover.push(label.clone());
+                        let foot = [b.x0 + 0.5 * b.w(), b.y1];
+                        if !o.nearest_in_path && !gives_way(foot, &label) {
+                            feet.push(foot);
+                            label_colors.push(rgba(C_LIDAR_ONLY, LABELLED_ALPHA));
+                            labels.push(label);
+                        }
                     } else {
                         let alpha = if o.since_seen_s > 0.0 {
                             COASTED_OUTLINE_ALPHA
@@ -4635,7 +6236,7 @@ pub fn state_thread(
                 // a detection no track matched has no track's class to
                 // corrupt.
                 for c in camera_only {
-                    let label = camera_only_label(c[1] as u32, c[2]);
+                    let label = camera_only_label(c[1] as u32, c[2], c[CAMERA_ONLY_LANE_RANGE]);
                     mins.push([c[3], c[4]]);
                     sizes.push([c[5] - c[3], c[6] - c[4]]);
                     colors.push(rgba(C_CAMERA_ONLY, LABELLED_ALPHA));
@@ -4677,14 +6278,56 @@ pub fn state_thread(
                 }
                 // Which frame all of that was fused with, and how old it was,
                 // in the picture's own corner: grey on a clean pair, amber on
-                // a stale one.
-                let status_rgb = if stale { C_ATTENTION } else { C_STATUS };
+                // a stale one -- and amber, saying so, on a set built on the
+                // right camera's frame, whose boxes are in the right image
+                // and sit a few pixels off on the left picture under them.
+                let right_side = meta.cam_side == Camera::Right.name();
+                let left_silent = meta.cam0_pair_outcome == Pairing::Silent.name();
+                let right_silent = meta.cam1_pair_outcome == Pairing::Silent.name();
+                // And the lidar detector's: a set built without its boxes,
+                // in a run that has it, says so in the same corner, amber.
+                let lidar_note = match Naming::parse(meta.lidar_det_outcome) {
+                    Some(Naming::Late) => Some("lidar detector late"),
+                    Some(Naming::Dropped) => Some("lidar detector lost"),
+                    Some(Naming::Silent) => Some("lidar detector silent"),
+                    _ => None,
+                };
+                let status_rgb = if stale || right_side || right_silent || lidar_note.is_some() {
+                    C_ATTENTION
+                } else {
+                    C_STATUS
+                };
+                let status = camera_status(cs, meta.pair_age_ns, stale);
+                let status = if right_side && left_silent {
+                    format!("RIGHT camera, left silent · {status}")
+                } else if right_side {
+                    format!("RIGHT camera · {status}")
+                } else if right_silent {
+                    format!("right camera silent · {status}")
+                } else {
+                    status
+                };
+                let status = match lidar_note {
+                    Some(note) => format!("{note} · {status}"),
+                    None => status,
+                };
+                // And what the lidar detector called this sweep's tracks,
+                // wherever round the vehicle they are: the picture shows
+                // only the ones ahead.
+                let status = if meta.lidar_det_outcome == Naming::Named.name() {
+                    let named = records
+                        .iter()
+                        .filter_map(|r| Object::from_lanes(r).lidar_class);
+                    format!("{status} · {}", lidar_tally(named))
+                } else {
+                    status
+                };
                 let logged = rec.log(
                     entity::CAMERA_STATUS,
-                    &Points2D::new([STATUS_AT])
+                    &Points2D::new([status_at(&status)])
                         .with_colors([Color::from_rgb(status_rgb[0], status_rgb[1], status_rgb[2])])
                         .with_radii([Radius::new_ui_points(0.1)])
-                        .with_labels([camera_status(cs, meta.pair_age_ns, stale)])
+                        .with_labels([status])
                         .with_show_labels(true),
                 );
                 if logged.is_err() {
@@ -4787,12 +6430,20 @@ fn pairing_name(s: Option<&str>) -> &'static str {
         Pairing::Late,
         Pairing::Absent,
         Pairing::AbsentInSource,
+        Pairing::Silent,
     ] {
         if s == Some(p.name()) {
             return p.name();
         }
     }
     "pair_unknown"
+}
+
+/// The `lidar_det_outcome` string as a `&'static str`, on [`pairing_name`]'s
+/// terms: one of [`Naming::name`]'s five, or `lidar_unknown`.
+fn naming_name(s: Option<&str>) -> &'static str {
+    s.and_then(Naming::parse)
+        .map_or("lidar_unknown", Naming::name)
 }
 
 /// `state-sink` configuration.
@@ -4860,9 +6511,11 @@ pub struct StateSinkReport {
     /// rebuild of the batch and reached the consumer that acts on it.
     pub stale: u64,
     /// Records by population, read off lane 16 at the far end: fused with a
-    /// camera detection, lidar-only while a detector ran, and unfused
-    /// (`--detector off`).
+    /// camera detection, matched by one camera and not confirmed by the
+    /// other, lidar-only while a detector ran, and unfused (`--detector
+    /// off`).
     pub fused_total: u64,
+    pub one_camera_total: u64,
     pub lidar_only_total: u64,
     pub unfused_total: u64,
     /// The camera's detections that matched no track, read off the answer's
@@ -4871,6 +6524,18 @@ pub struct StateSinkReport {
     /// Answers whose `fused_count` column disagrees with the records it
     /// counts. Meant to be 0; per answer, for the reason `flag_mismatch` is.
     pub fused_mismatch: u64,
+    /// Records carrying a class from the lidar detector (lanes 17-18), read
+    /// at the far end; of those, records a camera also named (fused or one
+    /// camera's), split by whether the two agree ([`agrees`]); and records
+    /// the lidar named that no camera matched.
+    pub named_total: u64,
+    pub both_named_total: u64,
+    pub agree_total: u64,
+    pub conflict_total: u64,
+    pub lidar_named_only_total: u64,
+    /// Answers whose `named_count` column disagrees with the records it
+    /// counts. Meant to be 0, per answer.
+    pub named_mismatch: u64,
     /// The last answer that arrived, in words ([`answer_words`]: led by how
     /// stale the camera was when it was).
     pub last_line: Option<String>,
@@ -4937,13 +6602,19 @@ fn fused_fraction(fused: u32, unconfirmed: u32) -> Option<f64> {
 /// a stale answer with a class and a closing speed ran past one line at
 /// 1600x900 and lost its last words. The answer's age (`age_ms`, how long
 /// after the sweep was due the answer reached the end of the chain) follows
-/// when the run was paced, and a stale camera half ends it: `STALE camera
-/// 93 ms`.
-pub fn headline(a: &StateAnswer, cam: CamHalf, age_ms: Option<f64>) -> String {
+/// when the run was paced, then the vehicle's own speed when the run knew
+/// it (`ego 5.2 m/s`), and a stale camera half ends it: `STALE camera 93
+/// ms`.
+pub fn headline(a: &StateAnswer, cam: CamHalf, age_ms: Option<f64>, ego_vf: Option<f32>) -> String {
     let mut parts: Vec<String> = Vec::new();
     if a.has_object {
         if let Some((k, q)) = a.class {
             parts.push(format!("{} {q:.2}", class_name(k)));
+        }
+        // The lidar detector's word, in its own vocabulary, beside the
+        // camera's or alone: `lidar car 0.98`.
+        if let Some((k, q)) = a.lidar_class {
+            parts.push(format!("lidar {} {q:.2}", lidar_class_name(k)));
         }
         parts.push(format!("{:.1} m ahead", a.distance_m));
         if a.ttc_s > 0.0 && a.closing_mps > 0.0 {
@@ -4960,7 +6631,13 @@ pub fn headline(a: &StateAnswer, cam: CamHalf, age_ms: Option<f64>) -> String {
     if let Some(ms) = age_ms {
         parts.push(format!("answer {ms:.0} ms old"));
     }
+    if let Some(vf) = ego_vf {
+        parts.push(format!("ego {vf:.1} m/s"));
+    }
     if let Some(note) = stale_note(cam.pair_outcome, cam.pair_age_ns) {
+        parts.push(note);
+    }
+    if let Some(note) = side_note(&cam) {
         parts.push(note);
     }
     // Wide separators, as the layout was designed with, while the line fits
@@ -5021,10 +6698,17 @@ pub fn state_sink_thread(
         paired: 0,
         stale: 0,
         fused_total: 0,
+        one_camera_total: 0,
         lidar_only_total: 0,
         unfused_total: 0,
         camera_only_total: 0,
         fused_mismatch: 0,
+        named_total: 0,
+        both_named_total: 0,
+        agree_total: 0,
+        conflict_total: 0,
+        lidar_named_only_total: 0,
+        named_mismatch: 0,
         last_line: None,
         parent_by_seq: Vec::with_capacity(cfg.expect),
         by_seq: Vec::with_capacity(cfg.expect),
@@ -5060,6 +6744,7 @@ pub fn state_sink_thread(
         let records = object_rows(&s.payload);
         let mut flags = 0u64;
         let mut fused = 0u64;
+        let mut named = 0u64;
         for r in records {
             let o = Object::from_lanes(r);
             report.in_frame_total += u64::from(r[7] == 1.0);
@@ -5067,13 +6752,33 @@ pub fn state_sink_thread(
             report.inconsistent_total += u64::from(!record_is_consistent(r));
             match o.population {
                 POPULATION_FUSED => fused += 1,
+                POPULATION_ONE_CAMERA => report.one_camera_total += 1,
                 POPULATION_LIDAR_ONLY => report.lidar_only_total += 1,
                 _ => report.unfused_total += 1,
+            }
+            // The lidar detector's word against the camera's, record by
+            // record, at the far end: two sensors naming one object.
+            if let Some((lidar, _)) = o.lidar_class {
+                named += 1;
+                match o.class {
+                    Some((camera, _)) => {
+                        report.both_named_total += 1;
+                        if agrees(camera, lidar) {
+                            report.agree_total += 1;
+                        } else {
+                            report.conflict_total += 1;
+                        }
+                    }
+                    None => report.lidar_named_only_total += 1,
+                }
             }
         }
         report.fused_total += fused;
         report.fused_mismatch +=
             u64::from(state_fused_count(&s.payload).map(u64::from) != Some(fused));
+        report.named_total += named;
+        report.named_mismatch +=
+            u64::from(state_named_count(&s.payload).map(u64::from) != Some(named));
         report.camera_only_total += camera_only_rows(&s.payload).len() as u64;
         report.objects_total += records.len() as u64;
         report.flagged_total += flags;
@@ -5169,6 +6874,8 @@ pub fn state_sink_thread(
             // The fusion's populations in the frame, off the records' own
             // lanes and the answer's `camera_only` column: what the camera
             // half contributed to this answer, on every answer.
+            // A one-camera track counts as lidar-only here: a lidar track
+            // the cameras did not confirm, drawn in the lidar's teal.
             let (mut fused, mut lidar_only) = (0u32, 0u32);
             for r in object_rows(&s.payload) {
                 if r[7] == 1.0 {
@@ -5198,9 +6905,12 @@ pub fn state_sink_thread(
             // The share of the lidar's tracks in the frame the camera
             // confirmed, and of the camera's detections the lidar did: 0 to
             // 1 each, and a gap on a frame with none of that sensor's in it.
-            // Every detection is fused or camera-only, so those two are all
-            // of the camera's. A stale camera moves both down, which the
-            // Fusion tab shows under the pairing lane that says why.
+            // A one-camera track is a lidar track the cameras did not
+            // confirm. Every detection is fused or camera-only, so those two
+            // are all of the camera's (with two cameras, the camera-only
+            // ones are those with a stereo partner). A stale camera moves
+            // both down, which the Fusion tab shows under the pairing lane
+            // that says why.
             for (path, unconfirmed) in [
                 (entity::TRACKS_FUSED_FRACTION, lidar_only),
                 (entity::TRACKS_CAMERA_FUSED_FRACTION, camera_only as u32),
@@ -5219,8 +6929,13 @@ pub fn state_sink_thread(
             if rec
                 .log(
                     entity::ANSWER_HEADLINE,
-                    &TextDocument::new(headline(&a, CamHalf::of_answer(&s.payload), age_ms))
-                        .with_media_type(MediaType::markdown()),
+                    &TextDocument::new(headline(
+                        &a,
+                        CamHalf::of_answer(&s.payload),
+                        age_ms,
+                        state_ego_vf(&s.payload),
+                    ))
+                    .with_media_type(MediaType::markdown()),
                 )
                 .is_err()
             {
@@ -5423,7 +7138,13 @@ mod tests {
         };
         let lead = |s: &str| s.split(" · ").next().unwrap_or_default().to_string();
         assert_eq!(lead(&fused_label(&o)), lead(&answer_label(&a)));
-        assert_eq!(camera_only_label(2, 0.624), "car 0.62 · no range");
+        assert_eq!(camera_only_label(2, 0.624, 0.0), "car 0.62 · no range");
+        // With a stereo partner, its range, and the word for where it came
+        // from.
+        assert_eq!(
+            camera_only_label(2, 0.624, 14.26),
+            "car 0.62 · 14.3 m stereo"
+        );
         // The status line: which frame, and how its instant sat against the
         // sweep's trigger, positive when paired and negative when stale.
         assert_eq!(
@@ -5434,6 +7155,19 @@ mod tests {
             camera_status(75, -92_790_000, true),
             "STALE · cam 75 · -93 ms"
         );
+        // And its tail, what the lidar detector called the sweep's tracks:
+        // boxes by class, a box that named three fragments counted once.
+        let named = [(0, 0.91), (0, 0.91), (0, 0.91), (0, 0.55), (2, 0.4)];
+        assert_eq!(lidar_tally(named.into_iter()), "lidar: 2 cars, 1 cyclist");
+        assert_eq!(lidar_tally([(1, 0.6)].into_iter()), "lidar: 1 pedestrian");
+        assert_eq!(lidar_tally(std::iter::empty()), "lidar: no names");
+        // The short line sits where it always did; one with the tally on it
+        // is anchored further right, so its first words stay in the picture.
+        assert_eq!(status_at("cam 76 · paired +11 ms"), STATUS_AT);
+        let long = "cam 100 · paired +11 ms · lidar: 2 cars, 2 pedestrians, 2 cyclists";
+        let at = status_at(long);
+        assert!(at[0] > 2.0 * STATUS_AT[0] && at[0] < 400.0, "{at:?}");
+        assert_eq!(at[1], STATUS_AT[1]);
     }
 
     #[test]
@@ -5452,6 +7186,7 @@ mod tests {
             bearing_deg: 2.96,
             image: None,
             class: None,
+            lidar_class: None,
             candidates: 2,
         };
         assert_eq!(
@@ -5535,6 +7270,81 @@ mod tests {
         }
     }
 
+    /// A camera goes silent after three sweeps without a frame, whatever the
+    /// miss was, and comes back the moment a frame of it pairs, clean or
+    /// stale -- or merely arrives: a late camera is alive, and waited for.
+    #[test]
+    fn a_camera_is_silent_after_three_misses_and_back_on_a_frame() {
+        let mut h = CamHealth::default();
+        for miss in [Pairing::Late, Pairing::Dropped] {
+            h.observe(miss, false);
+            assert!(!h.silent(), "{h:?}");
+        }
+        h.observe(Pairing::AbsentInSource, false);
+        assert!(h.silent());
+        h.observe(Pairing::Silent, false);
+        assert!(h.silent(), "a miss while silent keeps it silent");
+        h.observe(Pairing::Stale, false);
+        assert!(!h.silent(), "a stale frame is a frame");
+        for _ in 0..SILENT_AFTER_SWEEPS {
+            h.observe(Pairing::Late, false);
+        }
+        assert!(h.silent());
+        h.observe(Pairing::Paired, false);
+        assert_eq!(h, CamHealth::default());
+        // A frame that arrived too late to pair still says the camera lives.
+        for _ in 0..SILENT_AFTER_SWEEPS {
+            h.observe(Pairing::Late, true);
+            assert!(!h.silent(), "{h:?}");
+        }
+        for _ in 0..SILENT_AFTER_SWEEPS {
+            h.observe(Pairing::Late, false);
+        }
+        assert!(h.silent());
+        h.observe(Pairing::Silent, true);
+        assert!(!h.silent(), "an arrival while silent brings it back");
+    }
+
+    /// The words an answer carries about the second camera: none on the
+    /// usual set, which camera and why on the others.
+    #[test]
+    fn the_side_note_names_the_camera_and_why() {
+        let usual = CamHalf {
+            cam_seq: 7,
+            pair_outcome: "paired",
+            pair_age_ns: 0,
+            side: "left",
+            left_outcome: "paired",
+            right_outcome: "paired",
+        };
+        assert_eq!(side_note(&usual), None);
+        let from_right = CamHalf {
+            side: "right",
+            left_outcome: "pair_dropped",
+            ..usual
+        };
+        assert_eq!(
+            side_note(&from_right).as_deref(),
+            Some("RIGHT camera, left frame lost (pair_dropped)")
+        );
+        let left_silent = CamHalf {
+            left_outcome: "pair_silent",
+            ..from_right
+        };
+        assert_eq!(
+            side_note(&left_silent).as_deref(),
+            Some("RIGHT camera, left camera silent")
+        );
+        let right_silent = CamHalf {
+            right_outcome: "pair_silent",
+            ..usual
+        };
+        assert_eq!(
+            side_note(&right_silent).as_deref(),
+            Some("right camera silent")
+        );
+    }
+
     #[test]
     fn the_pairing_window_is_the_sweep_s_range_and_a_stale_frame_falls_below_it() {
         // Drive 0005's shape: a 103.3 ms sweep, its trigger 51.6 ms in, and
@@ -5572,6 +7382,9 @@ mod tests {
             cam_seq: 76,
             pair_outcome: Pairing::Paired.name(),
             pair_age_ns: 10_503_000,
+            side: "left",
+            left_outcome: "paired",
+            right_outcome: "pair_absent",
         };
         let a = StateAnswer {
             has_object: true,
@@ -5582,7 +7395,7 @@ mod tests {
             ..StateAnswer::default()
         };
         assert_eq!(
-            headline(&a, clean, Some(25.6)),
+            headline(&a, clean, Some(25.6), None),
             "## 11.4 m ahead   ·   closing 3.7 m/s   ·   TTC 3.1 s   ·   answer 26 ms old"
         );
         // Receding: no TTC, and never a TTC of 0.
@@ -5592,7 +7405,7 @@ mod tests {
             ..a
         };
         assert_eq!(
-            headline(&away, clean, Some(16.0)),
+            headline(&away, clean, Some(16.0), None),
             "## 11.4 m ahead   ·   receding   ·   answer 16 ms old"
         );
         // Fused, the camera's class leads; stale, the staleness ends it.
@@ -5600,12 +7413,15 @@ mod tests {
             cam_seq: 75,
             pair_outcome: Pairing::Stale.name(),
             pair_age_ns: -92_790_000,
+            side: "left",
+            left_outcome: "stale",
+            right_outcome: "pair_absent",
         };
         let car = StateAnswer {
             class: Some((2, 0.914)),
             ..a
         };
-        let h = headline(&car, stale, Some(20.0));
+        let h = headline(&car, stale, Some(20.0), None);
         assert_eq!(
             h,
             "## car 0.91   ·   11.4 m ahead   ·   TTC 3.1 s   ·   answer 20 ms old   ·   STALE camera 93 ms"
@@ -5613,18 +7429,51 @@ mod tests {
         // Without a class the closing speed stays, and the line is too long
         // for wide separators: narrow ones keep it on one line.
         assert_eq!(
-            headline(&a, stale, Some(20.0)),
+            headline(&a, stale, Some(20.0), None),
             "## 11.4 m ahead · closing 3.7 m/s · TTC 3.1 s · answer 20 ms old · STALE camera 93 ms"
         );
         // Nothing flagged; and an unpaced run has no age to give.
         assert_eq!(
-            headline(&StateAnswer::default(), clean, None),
+            headline(&StateAnswer::default(), clean, None, None),
             "## no object in the corridor"
         );
+        // The vehicle's own speed follows the age when the run knew it.
+        assert_eq!(
+            headline(&a, clean, Some(25.6), Some(5.23)),
+            headline(&a, clean, Some(25.6), None)
+                .replace("answer 26 ms old", "answer 26 ms old   ·   ego 5.2 m/s")
+        );
         // One heading line, no id.
-        for h in [headline(&a, clean, Some(1.0)), h] {
+        for h in [headline(&a, clean, Some(1.0), None), h] {
             assert!(h.starts_with("## ") && !h.contains('\n') && !h.contains("597"));
         }
+    }
+
+    #[test]
+    fn the_corridor_is_drawn_half_a_vehicle_either_side_of_the_path() {
+        // Straight: out to the detector's range, a point a metre.
+        let [left, right] = corridor_strips(&EgoPath::STRAIGHT);
+        assert_eq!((left.len(), right.len()), (31, 31));
+        assert_eq!(left[0], [0.0, CORRIDOR_HALF_WIDTH_M, PATH_DRAW_Z_M]);
+        assert_eq!(
+            right[30],
+            [RANGE_LIMIT_M, -CORRIDOR_HALF_WIDTH_M, PATH_DRAW_Z_M]
+        );
+        // A left turn of 10 m radius: a quarter of the circle and no
+        // further, the inner edge ending 9.09 m ahead and 10 m to the left.
+        let [left, right] = corridor_strips(&EgoPath::from_curvature(0.1));
+        assert_eq!(left.len(), 17);
+        let (end, outer) = (left[16], right[16]);
+        assert!(
+            (end[0] - 9.09).abs() < 1e-3 && (end[1] - 10.0).abs() < 1e-3,
+            "{end:?}"
+        );
+        assert!(
+            (outer[0] - 10.91).abs() < 1e-3 && (outer[1] - 10.0).abs() < 1e-3,
+            "{outer:?}"
+        );
+        // Grey, not the answer's gold.
+        assert_ne!(C_PATH, C_ANSWER);
     }
 
     #[test]
@@ -5647,6 +7496,52 @@ mod tests {
         for p in [Pairing::Dropped, Pairing::Late, Pairing::Absent] {
             assert!(!p.produces());
         }
+    }
+
+    #[test]
+    fn a_gap_that_closes_on_a_track_too_young_to_say_how_fast_is_labelled_so() {
+        let clean = CamHalf {
+            cam_seq: 76,
+            pair_outcome: Pairing::Paired.name(),
+            pair_age_ns: 10_503_000,
+            side: "left",
+            left_outcome: "paired",
+            right_outcome: "pair_absent",
+        };
+        // Closing at 15 m/s as measured, one sweep old: the answer gives it
+        // no time to contact, and neither the labels nor the headline call
+        // that "not closing".
+        let young = StateAnswer {
+            has_object: true,
+            object_id: 1940,
+            distance_m: 10.47,
+            closing_mps: 15.05,
+            ttc_s: 0.0,
+            ..StateAnswer::default()
+        };
+        assert_eq!(answer_motion(&young, true), "closing not established");
+        assert_eq!(answer_label_3d(&young), "10.5 m · closing not established");
+        assert_eq!(
+            headline(&young, clean, None, None),
+            "## 10.5 m ahead   ·   closing not established"
+        );
+        assert_eq!(ttc_point(&young), None);
+        // The other three, unchanged.
+        let still = StateAnswer {
+            closing_mps: 0.0,
+            ..young
+        };
+        assert_eq!(answer_motion(&still, false), "not closing");
+        let away = StateAnswer {
+            closing_mps: -0.4,
+            ..young
+        };
+        assert_eq!(answer_motion(&away, false), "receding");
+        let closing = StateAnswer {
+            ttc_s: 3.1,
+            ..young
+        };
+        assert_eq!(answer_motion(&closing, false), "TTC 3.1 s");
     }
 
     #[test]
@@ -5718,7 +7613,7 @@ mod tests {
         t[9..12].copy_from_slice(&[9.5, -0.9, -1.7]);
         t[12..15].copy_from_slice(&[13.5, 0.9, 0.0]);
         t[19] = 0.2;
-        let a = StateAnswer::of(&[t]);
+        let a = StateAnswer::of(&[t], None);
         assert!(a.has_object && a.object_id == 244, "{a:?}");
         let meta = StateMeta {
             trigger_ns: 1_000,
@@ -5729,6 +7624,15 @@ mod tests {
             cam_seq: 72,
             pair_outcome: Pairing::Paired.name(),
             pair_age_ns: 10_503_000,
+            ego_outcome: "unavailable",
+            ego_vf: None,
+            cam_side: "left",
+            cam1_seq: -1,
+            cam1_pair_outcome: "pair_absent",
+            cam0_pair_outcome: "paired",
+            lidar_det_outcome: "lidar_off",
+            path: EgoPath::STRAIGHT,
+            gate_m: 0.0,
         };
         let (batch, _) =
             build_state_batch(&[t], &a, &meta, None, &pipes_kitti::state::state_schema()).unwrap();
@@ -5754,6 +7658,7 @@ mod tests {
             cam_seq: 71,
             pair_outcome: Pairing::Stale.name(),
             pair_age_ns: -92_790_000,
+            cam0_pair_outcome: Pairing::Stale.name(),
             ..meta
         };
         let (stale, _) = build_state_batch(
@@ -5776,7 +7681,10 @@ mod tests {
             CamHalf {
                 cam_seq: 71,
                 pair_outcome: "stale",
-                pair_age_ns: -92_790_000
+                pair_age_ns: -92_790_000,
+                side: "left",
+                left_outcome: "stale",
+                right_outcome: "pair_absent",
             }
         );
         assert_eq!(

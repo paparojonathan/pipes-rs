@@ -1,5 +1,5 @@
-//! What `--help` offers: two commands, and the eleven flags of `run` a reader
-//! needs to see the pipeline or make it fail on purpose. The experiment's
+//! What `--help` offers: four commands, and the sixteen flags of `run` a
+//! reader needs to see the pipeline or make it fail on purpose. The experiment's
 //! knobs are still accepted (`hide = true`), and that is pinned too, because
 //! a hidden flag that stopped parsing would fail every test that uses it in
 //! a way that reads as a pipeline failure.
@@ -31,7 +31,7 @@ fn long_flags(help: &str) -> Vec<String> {
 }
 
 #[test]
-fn the_top_level_help_offers_run_and_drives_and_nothing_else() {
+fn the_top_level_help_offers_run_drives_and_the_two_benches_and_nothing_else() {
     let h = help(&["--help"]);
     let commands: Vec<&str> = h
         .lines()
@@ -40,11 +40,15 @@ fn the_top_level_help_offers_run_and_drives_and_nothing_else() {
         .take_while(|l| !l.trim().is_empty())
         .filter_map(|l| l.split_whitespace().next())
         .collect();
-    assert_eq!(commands, ["drives", "run"], "{h}");
+    assert_eq!(
+        commands,
+        ["drives", "run", "bench-detector", "bench-lidar"],
+        "{h}"
+    );
 }
 
 #[test]
-fn run_help_offers_the_eleven_core_flags_and_no_knob() {
+fn run_help_offers_the_sixteen_core_flags_and_no_knob() {
     let h = help(&["run", "--help"]);
     let mut flags = long_flags(&h);
     flags.retain(|f| f != "help");
@@ -56,6 +60,11 @@ fn run_help_offers_the_eleven_core_flags_and_no_knob() {
         "consumer-delay-ms",
         "track",
         "detector",
+        "detector-model",
+        "detector-backend",
+        "right-camera",
+        "lidar-detector",
+        "lidar-backend",
         "pair-wait-ms",
         "pair-stale-ms",
         "rerun",
@@ -83,9 +92,19 @@ fn run_help_offers_the_eleven_core_flags_and_no_knob() {
         h.matches("[default: on]").count() == 3,
         "expected --track, --detector and --dashboard all to default to on:\n{h}"
     );
-    // The detector's help names the download, in a form PowerShell runs.
+    // The lidar detector is the one stage a plain run leaves out: its
+    // network is a GPU's job, and a plain run needs none.
     assert!(
-        h.contains(r"scripts\fetch_model.ps1"),
+        flag_help(&h, "--lidar-detector").contains("[default: off]"),
+        "--lidar-detector is not off by default:\n{h}"
+    );
+    assert!(
+        flag_help(&h, "--lidar-backend").contains("[default: cuda]"),
+        "--lidar-backend does not default to the GPU:\n{h}"
+    );
+    // The detector's help says where its weights come from.
+    assert!(
+        flag_help(&h, "--detector").contains("the file `--detector-model` names"),
         "--detector does not say where its model comes from:\n{h}"
     );
 }
@@ -178,6 +197,17 @@ fn the_hidden_knobs_still_parse() {
         "3",
         "--viewer-delay-ms",
         "1",
+        "--right-delay-ms",
+        "1",
+        "--detector-threads",
+        "2",
+        "--cuda-search",
+        "default",
+        "--cuda-tf32",
+        "--lidar-threads",
+        "2",
+        "--lidar-delay-ms",
+        "1",
         "--help",
     ]);
     let offered = long_flags(&h);
@@ -195,6 +225,12 @@ fn the_hidden_knobs_still_parse() {
         "--rerun-host",
         "--panic-at-frame",
         "--viewer-delay-ms",
+        "--right-delay-ms",
+        "--detector-threads",
+        "--cuda-search",
+        "--cuda-tf32",
+        "--lidar-threads",
+        "--lidar-delay-ms",
     ] {
         // By whole flag name: `--detect` is a prefix of the visible
         // `--detector`, so a substring test cannot tell them apart.

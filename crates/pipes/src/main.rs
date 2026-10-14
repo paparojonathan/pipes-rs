@@ -1,9 +1,10 @@
 #![deny(clippy::unwrap_used)]
 #![deny(clippy::expect_used)]
 #![forbid(unsafe_code)]
-//! `pipes`: single-stream zero-copy pipeline experiments (sprint 1).
+//! `pipes`: sensor fusion on replayed KITTI drives.
 
 mod admission; // M4 two-step admit (D8)
+mod bench; // `pipes bench-detector`: the detector alone, timed
 mod cli; // clap types
 mod consumers; // M4 proc + rerun threads
 mod dashboard; // the recording's entity tree
@@ -19,6 +20,8 @@ fn main() {
     let result = match cli::Cli::parse().cmd {
         cli::Cmd::Drives(a) => drives::main(a),
         cli::Cmd::Run(a) => run::main(a),
+        cli::Cmd::BenchDetector(a) => bench::main(a),
+        cli::Cmd::BenchLidar(a) => bench::lidar(a),
     };
     let Err(e) = result else { return };
 

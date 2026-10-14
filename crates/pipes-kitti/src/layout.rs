@@ -236,7 +236,7 @@ pub enum LayoutError {
 
 /// The tail every layout error ends with: what helps.
 const LAYOUT_HELP: &str = "Re-extract the sensor's directory from the drive's zip; \
-     `cargo run --release -- drives` checks every drive the same way";
+     `pipes drives` checks every drive the same way";
 
 /// The layout every message is judged against, in the words it uses.
 const KITTI_LAYOUT: &str = "KITTI writes one timestamp line per frame -- line N is \

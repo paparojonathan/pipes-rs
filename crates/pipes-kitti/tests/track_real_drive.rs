@@ -69,6 +69,7 @@
 use std::path::{Path, PathBuf};
 
 use pipes_kitti::calib::Calib;
+use pipes_kitti::cam0::Camera;
 use pipes_kitti::detect::{
     cloud_points, detect_schema, detection_rows, DetectPlan, Detector, GroundPlane,
     MIN_CLUSTER_VOXELS, RANGE_LIMIT_M,
@@ -78,8 +79,8 @@ use pipes_kitti::state::{
     CORRIDOR_HALF_WIDTH_M, OBJECT_BYTES,
 };
 use pipes_kitti::track::{
-    association_gate_m, track_age_s, track_observations, track_rows, track_schema, CamRef, Pairing,
-    TrackMeta, Tracker, TRACK_BYTES,
+    association_gate_m, track_age_s, track_observations, track_rows, track_schema, CamRef, EgoHalf,
+    Naming, Pairing, TrackMeta, Tracker, TRACK_BYTES,
 };
 use pipes_kitti::velo::{build_velo_batch, read_sweep, sweep_file_name, velo_dir, velo_schema};
 use pipes_kitti::voxel::{voxel_schema, VoxelSize, Voxelizer};
@@ -345,7 +346,7 @@ fn the_answer_agrees_with_the_raw_cloud_and_not_with_a_displaced_control() {
 
         let dets = detection_rows(&dbatch);
         tk.reserve(dets.len());
-        let tplan = tk.plan(dets, i as i64, triggers[i].0, v, RANGE_LIMIT_M);
+        let tplan = tk.plan(dets, i as i64, triggers[i].0, v, RANGE_LIMIT_M, None);
         ambiguous_total += u64::from(tplan.ambiguous);
         let meta = TrackMeta {
             trigger_ns: triggers[i].0,
@@ -359,6 +360,13 @@ fn the_answer_agrees_with_the_raw_cloud_and_not_with_a_displaced_control() {
                 height: calib.height,
             }),
             pairing: Pairing::Paired,
+            ego: EgoHalf::default(),
+            side: Camera::Left,
+            cam_right: None,
+            pairing_right: Pairing::Absent,
+            pairing_left: Pairing::Paired,
+            naming: Naming::Off,
+            lidar_det_seq: -1,
         };
         let (tbatch, _, in_frame) = tk
             .build(&tplan, &meta, Some(&calib), &ts_schema)
@@ -380,7 +388,7 @@ fn the_answer_agrees_with_the_raw_cloud_and_not_with_a_displaced_control() {
             coasted_rows += u64::from(gap > 0);
             worst_gap = worst_gap.max(gap);
         }
-        let answer = StateAnswer::of(rows);
+        let answer = StateAnswer::of(rows, None);
         // The answer as the pipeline builds it: every track a record, the
         // nearest in the path flagged. The flagged record must BE the answer
         // this harness checks against the raw cloud below, on every sweep,
@@ -394,6 +402,18 @@ fn the_answer_agrees_with_the_raw_cloud_and_not_with_a_displaced_control() {
             cam_seq: i as i64,
             pair_outcome: Pairing::Paired.name(),
             pair_age_ns: cam_t - triggers[i].0,
+            ego_outcome: "unavailable",
+            ego_vf: None,
+            cam_side: "left",
+            cam1_seq: -1,
+            cam1_pair_outcome: "pair_absent",
+            cam0_pair_outcome: "paired",
+            lidar_det_outcome: "lidar_off",
+            // The whole closing speed is taken as established: this harness
+            // checks distances, and its times to contact are the plain ones.
+            gate_m: 0.0,
+            // No vehicle motion in this harness: the path is straight ahead.
+            path: pipes_kitti::path::Path::STRAIGHT,
         };
         let (sbatch, _) = build_state_batch(rows, &answer, &smeta, None, &state_schema())
             .unwrap_or_else(|e| panic!("{e}"));
@@ -490,7 +510,7 @@ fn the_answer_agrees_with_the_raw_cloud_and_not_with_a_displaced_control() {
     );
     println!(
         "gate        {:.3} m at dt = {:.1} ms",
-        association_gate_m(0.10327, v, RANGE_LIMIT_M),
+        association_gate_m(0.10327, v, RANGE_LIMIT_M, false),
         103.27
     );
     println!(

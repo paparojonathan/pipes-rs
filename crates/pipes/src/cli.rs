@@ -70,7 +70,7 @@ fn parse_drive(s: &str) -> Result<String, String> {
 }
 
 /// Default KITTI data root: relative to the repository root, because the
-/// dataset sits *beside* the checkout rather than inside it (README, "Setup"). It was
+/// dataset sits *beside* the checkout rather than inside it outside Docker. It was
 /// an absolute path into one developer's home directory, so every documented
 /// command failed on any other machine - including CI - with a confusing
 /// "path not found" instead of "tell me where the dataset is". Override per
@@ -81,8 +81,8 @@ pub const DEFAULT_KITTI_ROOT: &str = "../data/kitti";
 #[command(
     name = "pipes",
     version,
-    about = "Single-stream zero-copy pipeline experiments",
-    // Two commands, and `--help` lists exactly those two.
+    about = "Sensor fusion on replayed KITTI drives",
+    // Four commands, and `--help` lists exactly those four.
     disable_help_subcommand = true
 )]
 pub struct Cli {
@@ -96,6 +96,269 @@ pub enum Cmd {
     Drives(DrivesArgs),
     /// Replay a KITTI drive through one admission and the stages behind it.
     Run(RunArgs),
+    /// Time the camera detector on a drive's frames: one model on one backend.
+    BenchDetector(BenchArgs),
+    /// Time the lidar detector on a drive's sweeps: PointPillars on one backend.
+    BenchLidar(BenchLidarArgs),
+}
+
+/// Which network `--detector-model` runs. Each is the published YOLOX file
+/// with its declared input at the size `pipes` feeds (see
+/// `scripts/prepare_models.py`), and each has its own pinned sha256.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+pub enum DetectorModelArg {
+    /// YOLOX-Nano at 640x192, 0.9 M parameters: the default; `pipes-gpu` alone runs YOLOX-L.
+    #[default]
+    #[value(name = "yolox_nano")]
+    YoloxNano,
+    /// YOLOX-S at 640x192, 9 M parameters.
+    #[value(name = "yolox_s")]
+    YoloxS,
+    /// YOLOX-S at 1024x320: the same network at four fifths of the frame's resolution.
+    #[value(name = "yolox_s-1024")]
+    YoloxS1024,
+    /// YOLOX-M at 1024x320, 25 M parameters.
+    #[value(name = "yolox_m-1024")]
+    YoloxM1024,
+    /// YOLOX-L at 1248x384, the frame's own resolution, 54 M parameters, 16-bit weights: for the GPU.
+    #[value(name = "yolox_l-1248")]
+    YoloxL1248,
+    /// YOLOX-X at 1248x384, 99 M parameters, 16-bit weights: the biggest, for the GPU.
+    #[value(name = "yolox_x-1248")]
+    YoloxX1248,
+}
+
+impl DetectorModelArg {
+    /// The model's spec: file, hash, input size.
+    pub fn spec(self) -> &'static pipes_kitti::camdet::ModelSpec {
+        use pipes_kitti::camdet::{
+            YOLOX_L_1248, YOLOX_M_1024, YOLOX_NANO, YOLOX_S, YOLOX_S_1024, YOLOX_X_1248,
+        };
+        match self {
+            DetectorModelArg::YoloxNano => &YOLOX_NANO,
+            DetectorModelArg::YoloxS => &YOLOX_S,
+            DetectorModelArg::YoloxS1024 => &YOLOX_S_1024,
+            DetectorModelArg::YoloxM1024 => &YOLOX_M_1024,
+            DetectorModelArg::YoloxL1248 => &YOLOX_L_1248,
+            DetectorModelArg::YoloxX1248 => &YOLOX_X_1248,
+        }
+    }
+}
+
+/// Which runtime `--detector-backend` runs the network on.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+pub enum DetectorBackendArg {
+    /// tract, pure Rust, one thread: the same bytes on every run and every machine. The default.
+    #[default]
+    Tract,
+    /// ONNX Runtime on the CPU, four threads per stage; needs libonnxruntime.so (ORT_DYLIB_PATH).
+    Ort,
+    /// ONNX Runtime's CUDA provider: the network on the GPU; needs the GPU image, `docker compose run --rm pipes-gpu`.
+    Cuda,
+}
+
+impl DetectorBackendArg {
+    /// The backend as the detector module names it.
+    pub fn backend(self) -> pipes_kitti::camdet::Backend {
+        use pipes_kitti::camdet::Backend;
+        match self {
+            DetectorBackendArg::Tract => Backend::Tract,
+            DetectorBackendArg::Ort => Backend::Ort,
+            DetectorBackendArg::Cuda => Backend::Cuda,
+        }
+    }
+}
+
+/// Arguments of `pipes bench-detector`: the detector alone, over the first
+/// frames of a drive, so a model and a backend can be chosen by measurement
+/// before a run commits to them. Decoding the PNGs is outside the timing;
+/// the letterbox, the network and the decode are inside it, as they are in a
+/// run's `camdet` stage.
+#[derive(Args, Debug)]
+pub struct BenchArgs {
+    /// KITTI data root (holds `<date>/<drive>/image_02`).
+    #[arg(long, env = "PIPES_KITTI_ROOT", default_value = DEFAULT_KITTI_ROOT)]
+    pub kitti_root: PathBuf,
+    /// The drive whose frames are timed.
+    #[arg(long, default_value = "2011_09_26_drive_0005_sync", value_parser = parse_drive)]
+    pub drive: String,
+    /// How many frames, from the first.
+    #[arg(long, default_value_t = 40)]
+    pub frames: usize,
+    /// The model.
+    #[arg(long, value_enum, default_value_t = DetectorModelArg::YoloxNano)]
+    pub model: DetectorModelArg,
+    /// The runtime.
+    #[arg(long, value_enum, default_value_t = DetectorBackendArg::Tract)]
+    pub backend: DetectorBackendArg,
+    /// CPU threads for the `ort` backend.
+    #[arg(long, default_value_t = 4)]
+    pub threads: usize,
+    /// Which camera's frames.
+    #[arg(long, default_value = "left")]
+    pub camera: String,
+    /// How the `cuda` backend picks cuDNN's convolution algorithms: `heuristic`
+    /// (by rule, repeatable), `default` (one algorithm for every shape,
+    /// repeatable) or `exhaustive` (timed, can differ from run to run).
+    #[arg(long, value_enum, default_value_t = CudaSearchArg::Heuristic)]
+    pub cuda_search: CudaSearchArg,
+    /// Let the `cuda` backend round matmul inputs to TF32 on the tensor cores.
+    #[arg(long)]
+    pub tf32: bool,
+}
+
+/// [`pipes_kitti::camdet::CudaSearch`] on the command line.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+pub enum CudaSearchArg {
+    /// cuDNN's ranking by shape; no timing, repeatable.
+    #[default]
+    Heuristic,
+    /// cuDNN's default algorithm for every shape.
+    Default,
+    /// Every algorithm timed on the first frame, the fastest kept.
+    Exhaustive,
+}
+
+impl CudaSearchArg {
+    /// The choice as the detector module names it.
+    pub fn search(self) -> pipes_kitti::camdet::CudaSearch {
+        use pipes_kitti::camdet::CudaSearch;
+        match self {
+            CudaSearchArg::Heuristic => CudaSearch::Heuristic,
+            CudaSearchArg::Default => CudaSearch::Default,
+            CudaSearchArg::Exhaustive => CudaSearch::Exhaustive,
+        }
+    }
+
+    /// The `cuda` backend's knobs, with `tf32`.
+    pub fn options(self, tf32: bool) -> pipes_kitti::camdet::CudaOptions {
+        pipes_kitti::camdet::CudaOptions {
+            search: self.search(),
+            tf32,
+        }
+    }
+}
+
+/// `--lidar-detector`: whether the frozen lidar detector runs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+pub enum LidarDetectorArg {
+    /// Run PointPillars on every sweep in a `pillars` stage and name the tracks it finds cars, pedestrians and cyclists.
+    On,
+    /// No lidar detector: structures tracked, named by the cameras alone. The default.
+    #[default]
+    Off,
+}
+
+impl LidarDetectorArg {
+    /// The `run.json` spelling.
+    pub fn name(self) -> &'static str {
+        match self {
+            LidarDetectorArg::On => "on",
+            LidarDetectorArg::Off => "off",
+        }
+    }
+}
+
+/// Which runtime `--lidar-backend` runs the lidar detector on. No `tract`:
+/// the network is 70 GFLOP a sweep, which is a GPU's job or, slowly, a
+/// thread pool's.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+pub enum LidarBackendArg {
+    /// ONNX Runtime's CUDA provider: the network on the GPU. The default; needs the GPU image, `pipes-gpu`.
+    #[default]
+    Cuda,
+    /// ONNX Runtime on the CPU, four threads: about 240 ms a sweep, so a real-time run drops more than half of them; for a machine without a GPU, or a slowed replay.
+    Ort,
+}
+
+impl LidarBackendArg {
+    /// The backend as the detector modules name it.
+    pub fn backend(self) -> pipes_kitti::camdet::Backend {
+        use pipes_kitti::camdet::Backend;
+        match self {
+            LidarBackendArg::Cuda => Backend::Cuda,
+            LidarBackendArg::Ort => Backend::Ort,
+        }
+    }
+}
+
+/// `--lidar-views`: which way the lidar detector looks.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+pub enum LidarViewsArg {
+    /// All the way round on `cuda`, ahead on `ort`. The default.
+    #[default]
+    Auto,
+    /// One pass a sweep, over the 69 m ahead: what the network was trained on.
+    Ahead,
+    /// Two passes a sweep: ahead, and the sweep turned half round, for the 69 m behind.
+    Around,
+}
+
+impl LidarViewsArg {
+    /// The views a backend's run takes. `auto` looks behind as well where
+    /// a second pass fits inside a sweep, which is the GPU; on the CPU one
+    /// pass already takes longer than a sweep lasts.
+    pub fn views(
+        self,
+        backend: pipes_kitti::camdet::Backend,
+    ) -> &'static [pipes_kitti::pillars::View] {
+        use pipes_kitti::camdet::Backend;
+        use pipes_kitti::pillars::View;
+        let around = match self {
+            LidarViewsArg::Auto => backend == Backend::Cuda,
+            LidarViewsArg::Ahead => false,
+            LidarViewsArg::Around => true,
+        };
+        if around {
+            &View::AROUND
+        } else {
+            &[View::Ahead]
+        }
+    }
+}
+
+/// Arguments of `pipes bench-lidar`: the lidar detector alone, over the
+/// first sweeps of a drive, on `bench-detector`'s terms. Reading the sweeps
+/// is outside the timing; the pillars, the network and the decode are
+/// inside it, as they are in a run's `pillars` stage.
+#[derive(Args, Debug)]
+pub struct BenchLidarArgs {
+    /// KITTI data root (holds `<date>/<drive>/velodyne_points`).
+    #[arg(long, env = "PIPES_KITTI_ROOT", default_value = DEFAULT_KITTI_ROOT)]
+    pub kitti_root: PathBuf,
+    /// The drive whose sweeps are timed.
+    #[arg(long, default_value = "2011_09_26_drive_0005_sync", value_parser = parse_drive)]
+    pub drive: String,
+    /// How many sweeps, from the first.
+    #[arg(long, default_value_t = 40)]
+    pub sweeps: usize,
+    /// The runtime.
+    #[arg(long, value_enum, default_value_t = LidarBackendArg::Cuda)]
+    pub backend: LidarBackendArg,
+    /// Which way the network looks: `ahead` (one pass a sweep), `around`
+    /// (a second pass over the sweep turned half round, for what is behind)
+    /// or `auto`: `around` on `cuda`, `ahead` on `ort`.
+    #[arg(long, value_enum, default_value_t = LidarViewsArg::Auto)]
+    pub views: LidarViewsArg,
+    /// CPU threads for the `ort` backend.
+    #[arg(long, default_value_t = 4)]
+    pub threads: usize,
+    /// How the `cuda` backend picks cuDNN's convolution algorithms.
+    #[arg(long, value_enum, default_value_t = CudaSearchArg::Heuristic)]
+    pub cuda_search: CudaSearchArg,
+    /// Let the `cuda` backend round matmul inputs to TF32 on the tensor cores.
+    #[arg(long)]
+    pub tf32: bool,
+    /// Also print the boxes found in this sweep (its frame number), one a
+    /// line: class, score, centre, size and heading.
+    #[arg(long)]
+    pub show: Option<usize>,
+    /// Start each sweep this many ms after the one before, instead of back
+    /// to back: at the lidar's 103 the GPU idles between sweeps, as it does
+    /// in a run, and a sweep costs what it costs there. 0 (the default) runs
+    /// them back to back.
+    #[arg(long, default_value_t = 0)]
+    pub period_ms: u64,
 }
 
 /// Arguments of `pipes drives`.
@@ -106,8 +369,8 @@ pub enum Cmd {
 /// override, and nothing else it does not need.
 #[derive(Args, Debug)]
 pub struct DrivesArgs {
-    /// KITTI data root (holds `<date>/<drive>/image_02`). `PIPES_KITTI_ROOT`
-    /// is the one-time override for a checkout whose dataset is elsewhere.
+    /// KITTI data root (holds `<date>/<drive>/image_02`). Docker sets it;
+    /// `KITTI_DATA=<path>` in `.env` mounts a folder you already have.
     #[arg(long, env = "PIPES_KITTI_ROOT", default_value = DEFAULT_KITTI_ROOT)]
     pub kitti_root: PathBuf,
     /// Print a JSON array instead of the aligned table.
@@ -155,6 +418,66 @@ impl LidarArg {
             LidarArg::Auto => "auto",
             LidarArg::On => "on",
             LidarArg::Off => "off",
+        }
+    }
+}
+
+/// Whether to replay the drive's OXTS rows -- the GPS/IMU unit, the
+/// vehicle's own speed and turn rate -- as a third producer, for the fusion
+/// to subtract from every track.
+///
+/// `auto` replays them exactly when the drive has an `oxts/` directory and
+/// the fusion runs, which is their only consumer; `on` makes a drive without
+/// one an error; `off` ignores one that is there, which is how a run shows
+/// what the turning problem looked like before the stream existed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+pub enum OxtsArg {
+    /// Replay the GPS/IMU rows exactly when the drive has an `oxts/` directory and the fusion runs.
+    #[default]
+    Auto,
+    /// Require the GPS/IMU rows; a drive without them is an error.
+    On,
+    /// Never replay them, even when the drive has them.
+    Off,
+}
+
+impl OxtsArg {
+    /// The CLI / `run.json` spelling.
+    pub fn name(self) -> &'static str {
+        match self {
+            OxtsArg::Auto => "auto",
+            OxtsArg::On => "on",
+            OxtsArg::Off => "off",
+        }
+    }
+}
+
+/// Whether to replay the drive's right colour camera (`image_03`) as a
+/// fourth producer, with its own detector stage, for the fusion to read
+/// beside the left one.
+///
+/// `auto` replays it exactly when the drive has an `image_03/` directory and
+/// the detector runs, which is its only consumer; `on` makes a drive without
+/// one an error; `off` ignores one that is there, which is how a run shows
+/// what one camera alone makes of the same drive.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+pub enum RightCameraArg {
+    /// Replay the right camera exactly when the drive has an `image_03/` directory and the detector runs.
+    #[default]
+    Auto,
+    /// Require the right camera; a drive without it is an error.
+    On,
+    /// Never replay it, even when the drive has it.
+    Off,
+}
+
+impl RightCameraArg {
+    /// The CLI / `run.json` spelling.
+    pub fn name(self) -> &'static str {
+        match self {
+            RightCameraArg::Auto => "auto",
+            RightCameraArg::On => "on",
+            RightCameraArg::Off => "off",
         }
     }
 }
@@ -233,7 +556,7 @@ pub enum TrackArg {
     /// Track the detections, pair each sweep with its camera frame, and answer.
     #[default]
     On,
-    /// Stop the chain at the detections, as M13 left it.
+    /// Stop the chain at the detections: no answer.
     Off,
 }
 
@@ -263,7 +586,7 @@ pub enum DetectorArg {
     /// Run the frozen detector on every camera frame and send its detections.
     #[default]
     On,
-    /// Send `proc`'s bare frame reference, as before the detector existed.
+    /// Send `proc`'s bare frame reference: no class from the cameras.
     Off,
 }
 
@@ -316,9 +639,10 @@ fn parse_rerun_host(s: &str) -> Result<String, String> {
 
 /// Where the `rerun` consumer sends frames.
 ///
-/// `grpc` by default: the run opens the viewer itself (or joins one already
-/// listening on port 9876) and streams into it, so seeing the pipeline is one
-/// command. `rrd` writes the same recording to a file for later.
+/// `grpc` by default: the run streams to the viewer listening on port 9876,
+/// the one open on the host under Docker; outside Docker it opens one itself
+/// when none is listening. `rrd` writes the same recording to a file for
+/// later.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
 pub enum RerunArg {
     /// No rerun consumer and no `cam0->rerun` edge.
@@ -329,7 +653,7 @@ pub enum RerunArg {
     Null,
     /// Write `runs/<name>/cam0.rrd`.
     Rrd,
-    /// Stream to the Rerun viewer, starting one if none is listening.
+    /// Stream to the Rerun viewer, which must be open on the host.
     #[default]
     Grpc,
 }
@@ -359,7 +683,7 @@ impl DashboardArg {
 
 /// Arguments of `pipes run`.
 ///
-/// Two tiers. The eleven `--help` shows are what a reader needs to see the
+/// Two tiers. The sixteen `--help` shows are what a reader needs to see the
 /// pipeline and to make it fail on purpose: `--cap` and `--consumer-delay-ms`
 /// act on the camera stage whose output reaches the answer, so slowing the
 /// camera reaches the fusion whichever stage that is. The rest (`hide = true`)
@@ -368,8 +692,8 @@ impl DashboardArg {
 /// `run.json`, but not an invitation on the first screen.
 #[derive(Args, Debug, Clone)]
 pub struct RunArgs {
-    /// KITTI data root (holds `<date>/<drive>/image_02`). `PIPES_KITTI_ROOT`
-    /// is the one-time override for a checkout whose dataset is elsewhere.
+    /// KITTI data root (holds `<date>/<drive>/image_02`). Docker sets it;
+    /// `KITTI_DATA=<path>` in `.env` mounts a folder you already have.
     #[arg(long, env = "PIPES_KITTI_ROOT", default_value = DEFAULT_KITTI_ROOT)]
     pub kitti_root: PathBuf,
     /// The drive to replay, under `<kitti-root>/<its first 10 characters>/`.
@@ -385,15 +709,16 @@ pub struct RunArgs {
     /// reaches the answer, 1..=65535 (see `parse_cap` for why the ends are
     /// refused): `cam0->camdet`, the detector's, when the detector runs, and
     /// `cam0->proc` when it does not (`--detector off`, or no fusion for it
-    /// to feed). The other stage does not run.
+    /// to feed). The other stage does not run. The right camera's
+    /// `cam1->camdet` is sized the same.
     ///
-    /// Omitted, it is 1 on `cam0->camdet` and 4 on `cam0->proc`, as each was
-    /// before `--cap` could reach the detector. The detector's 1 is chosen. At
-    /// 70 to 90 ms a frame against the camera's 103 ms period, a healthy
-    /// real-time run rarely has a frame waiting: depths 1 and 4 both
-    /// delivered all 154 frames of drive_0005, to the same bytes. Once the
-    /// detector is slower than the camera, a deeper queue delivers no more
-    /// frames, only older ones: at `--consumer-delay-ms 60 --pair-wait-ms
+    /// Omitted, it is 1 on `cam0->camdet` and 4 on `cam0->proc`. The
+    /// detector's 1 is chosen. At about 41 ms a frame against the camera's
+    /// 103 ms period, a healthy real-time run rarely has a frame waiting:
+    /// depths 1 and 4 both delivered all 154 frames of drive_0005, to the
+    /// same bytes. Once the detector is slower than the camera, a deeper
+    /// queue delivers no more frames, only older ones: when the detector
+    /// took 70 to 90 ms a frame, at `--consumer-delay-ms 60 --pair-wait-ms
     /// 300`, depths 1, 2 and 4 ran on 102, 101 and 104 frames, finished a
     /// median 208, 311 and 517 ms after each was due, and at depth 4 the
     /// fusion, waiting on them, lost 40 sweeps on the lidar side (one run
@@ -422,14 +747,13 @@ pub struct RunArgs {
     /// not -- either way the stage whose output reaches the answer.
     ///
     /// Slept inside the stage's measured window, so the evidence shows it as
-    /// service time. With the detector on, `--consumer-delay-ms 100 --cap 1
-    /// --pair-wait-ms 300` makes the camera lose about half of drive_0005's
-    /// frames (71 to 84 of 154 on the runs of 2026-09-27), and the fusion
-    /// expires exactly those sweeps, each one `pair_dropped`, on every run
-    /// tried. At 200 ms that held on 3 runs of 7; on the other 4 the detector
-    /// took about three periods a frame, the fusion fell behind the lidar
-    /// waiting on it, and `obj->track` evicted sweeps as well (4 to 15), so
-    /// use 100 ms.
+    /// service time. It slows the left camera only. With `--right-camera
+    /// off`, `--consumer-delay-ms 100 --cap 1 --pair-wait-ms 300` makes the
+    /// camera lose about a quarter of drive_0005's frames (38 of 154 on one
+    /// run), and the fusion expires exactly those sweeps, each one
+    /// `pair_dropped`. With the right camera on they are answered from its
+    /// frame instead, all 154; at 2000 ms the left camera is declared silent
+    /// and the right one answers alone.
     #[arg(long, default_value_t = 0)]
     pub consumer_delay_ms: u64,
     /// `proc` reuses one output buffer instead of allocating one per frame.
@@ -438,10 +762,19 @@ pub struct RunArgs {
     /// Replay the drive's Velodyne sweeps as a second producer through the
     /// same admission. `auto` (the default) does it exactly when the drive has
     /// a `velodyne_points/` directory; `on` makes a drive without one an
-    /// error; `off` ignores one that is there. See `cargo run --release -- drives` for which
+    /// error; `off` ignores one that is there. See `pipes drives` for which
     /// drives carry lidar.
     #[arg(long, value_enum, default_value_t = LidarArg::Auto, hide = true)]
     pub lidar: LidarArg,
+    /// Replay the drive's OXTS rows -- the GPS/IMU unit: the vehicle's own
+    /// speed and turn rate, one row per frame -- as a third producer through
+    /// the same admission, for the fusion to subtract from every track so a
+    /// stationary object stays put in a turn and velocities are over ground.
+    /// `auto` (the default) does it exactly when the drive has an `oxts/`
+    /// directory and `--track` is on; `on` makes a drive without one an
+    /// error; `off` ignores one that is there.
+    #[arg(long, value_enum, default_value_t = OxtsArg::Auto, hide = true)]
+    pub oxts: OxtsArg,
     /// Reduce each sweep to a voxel grid in a `reduce` stage and hand the
     /// result to a second consumer as its own derived stream. This is the
     /// project's only stage-to-stage Arrow hand-off; `off` replays the lidar
@@ -460,43 +793,132 @@ pub struct RunArgs {
     #[arg(long, value_enum, default_value_t = DetectArg::On, hide = true)]
     pub detect: DetectArg,
     /// Track the detections across sweeps, pair each sweep with the camera
-    /// frame whose instant falls inside it, and answer with every track: its
-    /// distance, closing speed, age and place in the camera image, the
-    /// nearest one in the vehicle's path flagged.
+    /// frame whose instant falls inside it, and answer with every track
+    /// (distance, closing speed, time to contact, age, image box), the
+    /// nearest in the path flagged.
     ///
     /// No effect on a drive without lidar.
     #[arg(long, value_enum, default_value_t = TrackArg::On)]
     pub track: TrackArg,
-    /// Run a frozen, pretrained camera detector (YOLOX-Nano, 80 COCO
-    /// classes) on the camera frames in a `camdet` stage of its own, and fuse
-    /// what it found: each pair's camera half is the frame's detections --
-    /// box, class, confidence -- instead of a bare frame reference.
+    /// Run a frozen, pretrained camera detector (YOLOX, 80 COCO classes) on
+    /// each camera's frames in a stage of its own, `camdet` and
+    /// `camdet-right`, and fuse what it found: each pair's camera half is the
+    /// frame's detections -- box, class, confidence -- instead of a bare
+    /// frame reference.
     ///
-    /// Visible, and the eleventh flag on this page, because it decides
-    /// whether the camera contributes anything to the answer. The weights
-    /// are `models\yolox_nano.onnx`, checked against a pinned sha256; a
-    /// missing file stops the run with the command that downloads it,
-    /// `powershell -ExecutionPolicy Bypass -File scripts\fetch_model.ps1`.
-    /// The stage reads its own queue, `cam0->camdet`, and with the detector
-    /// on that is the queue `--cap` sizes and the stage `--consumer-delay-ms`
-    /// slows. No effect without `--track on`.
+    /// Visible, one of the sixteen flags on this page, because it decides
+    /// whether the cameras contribute anything to the answer. The weights
+    /// are the file `--detector-model` names, in the image's `models/`,
+    /// checked against a pinned sha256; a missing file stops the run. The
+    /// left camera's stage reads its own queue, `cam0->camdet`, and with the
+    /// detector on that is the queue `--cap` sizes and the stage
+    /// `--consumer-delay-ms` slows. No effect without `--track on`.
     #[arg(long, value_enum, default_value_t = DetectorArg::On)]
     pub detector: DetectorArg,
+    /// Which network the detector runs: YOLOX-Nano at 640x192 (the default,
+    /// 0.9 M parameters), YOLOX-S at 640x192 or at 1024x320, YOLOX-M at
+    /// 1024x320 (25 M), or YOLOX-L (54 M) or YOLOX-X (99 M) at 1248x384, the
+    /// frame's own resolution; the last two have 16-bit weights and are for
+    /// `--detector-backend cuda`. Each is a file under `models/` with its
+    /// own pinned sha256, derived from the published weights by
+    /// `scripts/prepare_models.py`; a missing one stops the run naming it.
+    /// `pipes bench-detector` times them.
+    #[arg(long, value_enum, default_value_t = DetectorModelArg::YoloxNano)]
+    pub detector_model: DetectorModelArg,
+    /// Which runtime runs it: `tract` (pure Rust, one thread, the same bytes
+    /// on every machine), `ort` (ONNX Runtime on the CPU, four threads per
+    /// detector stage) or `cuda` (ONNX Runtime on the GPU). The last two load
+    /// the library `ORT_DYLIB_PATH` names, which the Docker images carry;
+    /// `cuda` needs the GPU image (`docker compose run --rm pipes-gpu ...`).
+    #[arg(long, value_enum, default_value_t = DetectorBackendArg::Tract)]
+    pub detector_backend: DetectorBackendArg,
+    /// CPU threads of the `ort` backend's pool, per detector stage. Hidden:
+    /// four is the measured sweet spot on the development host, and a run
+    /// records what it used.
+    #[arg(long, default_value_t = 4, hide = true)]
+    pub detector_threads: usize,
+    /// How the `cuda` backend picks cuDNN's convolution algorithms:
+    /// `heuristic` (the default: by rule, the same every run), `default`
+    /// (cuDNN's one algorithm for every shape, also repeatable, and faster
+    /// for YOLOX-M on the development host) or `exhaustive` (timed on the
+    /// first frame; can differ from run to run). Hidden; recorded in
+    /// run.json.
+    #[arg(long, value_enum, default_value_t = CudaSearchArg::Heuristic, hide = true)]
+    pub cuda_search: CudaSearchArg,
+    /// Let the `cuda` backend round matmul inputs to TF32 on the tensor
+    /// cores: faster, repeatable on one machine, and no longer the CPU's
+    /// arithmetic. Hidden; recorded in run.json.
+    #[arg(long, hide = true)]
+    pub cuda_tf32: bool,
+    /// Replay the drive's right colour camera (`image_03`) as a fourth
+    /// producer, run the detector on its frames in a second stage,
+    /// `camdet-right`, on its own thread, and fuse both cameras: a track
+    /// keeps its class only when both cameras match it with the same class
+    /// (one camera's match is recorded as `one_camera`, which the answer does
+    /// not trust), a detection no track matched is kept only when both
+    /// cameras see it and gets a range from how far apart their boxes are,
+    /// every confirmed track's lidar distance is checked against that range,
+    /// and a sweep whose left frame was lost is answered from the right one.
+    /// `auto` (the default) does it exactly when the drive has an `image_03/`
+    /// directory and the detector runs; `on` makes a drive without one an
+    /// error; `off` ignores one that is there. No effect without `--track
+    /// on --detector on`.
+    #[arg(long, value_enum, default_value_t = RightCameraArg::Auto)]
+    pub right_camera: RightCameraArg,
+    /// Run a frozen, pretrained lidar detector (PointPillars, trained on
+    /// KITTI's cars, pedestrians and cyclists) on every raw sweep in a
+    /// `pillars` stage of its own, and name the tracks from it: a track
+    /// whose centroid lies in one of its boxes takes the box's class, beside
+    /// whatever the cameras said. `off` is the default; a bare `pipes-gpu`
+    /// passes `on`. On the GPU it runs twice a sweep, the second time on the sweep
+    /// turned half round, so it names what is behind the vehicle as well.
+    /// The weights are `models/pointpillars-kitti-fp16.onnx` on the GPU and
+    /// `models/pointpillars-kitti.onnx` on the CPU, each checked against a
+    /// pinned sha256; the Docker build derives them. Needs `--track on`.
+    /// The network is a GPU's job (`--lidar-backend`).
+    #[arg(long, value_enum, default_value_t = LidarDetectorArg::Off)]
+    pub lidar_detector: LidarDetectorArg,
+    /// Which runtime runs it: `cuda` (ONNX Runtime's CUDA provider on the
+    /// GPU, the default; `docker compose run --rm pipes-gpu`) or `ort` (ONNX
+    /// Runtime on the CPU: about 240 ms a sweep, longer than a sweep lasts
+    /// and longer than the fusion waits, so at real time it drops more than
+    /// half the sweeps and the boxes of the rest come late; the fusion goes
+    /// on without their names and says so).
+    #[arg(long, value_enum, default_value_t = LidarBackendArg::Cuda)]
+    pub lidar_backend: LidarBackendArg,
+    /// Which way the lidar detector looks: `ahead` (one pass a sweep, over
+    /// the 69 m ahead), `around` (a second pass over the sweep turned half
+    /// round, for the 69 m behind) or `auto`, the default: `around` on
+    /// `cuda`, `ahead` on `ort`, where one pass already takes longer than a
+    /// sweep. Hidden; recorded in run.json.
+    #[arg(long, value_enum, default_value_t = LidarViewsArg::Auto, hide = true)]
+    pub lidar_views: LidarViewsArg,
+    /// CPU threads of the lidar detector's `ort` pool. Hidden; recorded in
+    /// run.json.
+    #[arg(long, default_value_t = 4, hide = true)]
+    pub lidar_threads: usize,
+    /// Test hook: an artificial per-sweep delay, in ms, in the `pillars`
+    /// stage, on `--consumer-delay-ms`'s terms. A delay of seconds breaks
+    /// the lidar detector on purpose, so a run can show the fusion carrying
+    /// on without its names. Hidden from `--help`; used by
+    /// `tests/lidar_detector.rs`.
+    #[arg(long, hide = true, default_value_t = 0)]
+    pub lidar_delay_ms: u64,
     /// How long the fusion waits for a camera frame that has not arrived yet,
     /// in ms. Omitted means **one sweep span**, taken from the sweep's own
-    /// `Tov::Range` rather than assumed; `0` refuses immediately.
+    /// `Tov::Range` rather than assumed; `0` refuses immediately. The lidar
+    /// detector's boxes are waited for inside the same deadline.
     ///
-    /// `0` is the negative control and it is worth running: with the
-    /// detector on (the default) -- 70 to 90 ms a frame on the development
-    /// host, uncertified, and printed on each run's `camdet ms/frame` line --
-    /// the camera path dropped NOTHING at real time, and every frame still
-    /// reached the fusion after the sweep it belongs to, so a fusion that
-    /// refuses to wait reported all 154 sets expired (`pair_late`) on runs
-    /// where nothing was lost; the default wait completed all 154. The
-    /// detector's margin under the 103 ms period is small, so a busier host
-    /// can drop frames at `cam0->camdet` as well. With `--detector off` the same was
-    /// measured at `--consumer-delay-ms 100 --cap 16`, and at 50 ms the camera
-    /// was mostly in time: 0 or 9 of 154 expired on two runs.
+    /// `0` is the negative control and it is worth running, as
+    /// `--pair-wait-ms 0 --consumer-delay-ms 50 --right-camera off`: the
+    /// detector -- about 41 ms a frame on the development host, uncertified,
+    /// and printed on each run's `camdet ms/frame` line -- then finishes each
+    /// frame after its sweep has been processed. The camera path drops
+    /// NOTHING, yet a fusion that refuses to wait reports all 154 sets
+    /// expired (`pair_late`), and there is no answer. With `--detector off`
+    /// the same was measured at `--consumer-delay-ms 100 --cap 16`, and at
+    /// 50 ms the camera was mostly in time: 0 or 9 of 154 expired on two
+    /// runs.
     #[arg(long)]
     pub pair_wait_ms: Option<u64>,
     /// Permit the fusion to pair a sweep with a camera frame OLDER than its
@@ -526,9 +948,9 @@ pub struct RunArgs {
     /// scene.
     #[arg(long, default_value_t = VoxelSize::default(), value_parser = parse_voxel_size, hide = true)]
     pub voxel_size_m: VoxelSize,
-    /// Where the recording goes: `grpc` streams it to the Rerun viewer,
-    /// starting one if none is listening; `rrd` writes `runs/<name>/cam0.rrd`
-    /// to open later with `rerun runs/<name>/cam0.rrd`.
+    /// Where the recording goes: `grpc` streams it to the Rerun viewer, which
+    /// must be open on the host; `rrd` writes `runs/<name>/cam0.rrd` to open
+    /// later with `rerun runs/<name>/cam0.rrd`.
     #[arg(long, value_enum, default_value_t = RerunArg::Grpc)]
     pub rerun: RerunArg,
     /// The port `--rerun grpc` looks for a viewer on, and starts one at when
@@ -555,6 +977,14 @@ pub struct RunArgs {
     /// `panic_in_proc_shuts_down_cleanly_and_exits_3`.
     #[arg(long, hide = true)]
     pub panic_at_frame: Option<u64>,
+    /// Test hook: an artificial per-frame delay, in ms, in the RIGHT
+    /// camera's detector stage, on `--consumer-delay-ms`'s terms (slept
+    /// inside its measured window). A delay of seconds breaks the right
+    /// stream on purpose, so a run can show the left camera carrying on
+    /// alone; `--consumer-delay-ms` does the same to the left. Hidden from
+    /// `--help`; used by `tests/right_camera.rs`.
+    #[arg(long, hide = true, default_value_t = 0)]
+    pub right_delay_ms: u64,
     /// Test hook: the recording takes nothing for this many ms from the
     /// moment the clock starts, as a viewer frozen that long does, and the
     /// Rerun SDK buffers 256 KiB instead of 100 MiB, so the stall reaches
@@ -565,11 +995,10 @@ pub struct RunArgs {
     pub viewer_delay_ms: u64,
     /// Draw the whole chain on the recording, in one layout sent ahead of the
     /// first frame: the answer as a headline and on the camera image with
-    /// the tracks by source, the lidar in 3D, the time to collision, the
-    /// pairing and the tracks in frame, and the auditor's pages (queues,
-    /// latency, fusion, bytes, log). `off` keeps the raw camera frames only.
-    /// With `--rerun null|off` the drawing goes to
-    /// `runs/<name>/dashboard.rrd`.
+    /// the tracks by source, the lidar in 3D, and four tabs: Demo (the time
+    /// to collision and the pairing), Fusion, Pipeline and Log. `off` keeps
+    /// the raw camera frames only. With `--rerun null|off` the drawing goes
+    /// to `runs/<name>/dashboard.rrd`.
     #[arg(long, value_enum, default_value_t = DashboardArg::On)]
     pub dashboard: DashboardArg,
 }

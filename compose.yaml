@@ -15,12 +15,19 @@
 # need the data):
 #   docker compose run --rm test
 #
+# A run's detectors scored against the drive's labels:
+#   docker compose run --rm score runs/<name> 2011_09_26_drive_0005_sync
+#
 # Results land in runs/<name>/ in this checkout. The KITTI data lives in the
 # `kitti` volume; to use a folder you already have, put KITTI_DATA=<path> in
-# a .env file beside this one (for the README's layout, ../data/kitti).
+# a .env file beside this one (for example ../data/kitti).
 services:
   pipes:
-    build: .
+    # The plain runtime, by name: the Dockerfile's last stage is the GPU one,
+    # and a build with no target takes the last.
+    build:
+      context: .
+      target: runtime
     image: pipes-rs:sprint-1
     # A real PID 1, so Ctrl+C stops the run.
     init: true
@@ -39,6 +46,41 @@ services:
       - ./runs:/work/pipes-rs/runs
       - ${KITTI_DATA:-kitti}:/work/data/kitti:ro
 
+  # The same run on the GPU: the image built on NVIDIA's CUDA runtime, with
+  # ONNX Runtime's CUDA provider, and the GPU handed to the container. Needs
+  # the NVIDIA container runtime (`docker run --gpus all` works). Its default
+  # command runs the lidar detector, looking ahead and behind, and YOLOX-L on
+  # both cameras at the frame's own resolution, all on the GPU
+  # (docs/measurements.md, "The biggest models"):
+  #
+  #   docker compose run --rm pipes-gpu
+  #   docker compose run --rm pipes-gpu run --lidar-detector on --detector-backend cuda --detector-model yolox_x-1248
+  #   docker compose run --rm pipes-gpu run --lidar-detector on --detector-backend ort
+  #   docker compose run --rm pipes-gpu run --detector-model yolox_s-1024 --detector-backend cuda
+  #   docker compose run --rm pipes-gpu bench-lidar
+  #   docker compose run --rm pipes-gpu bench-detector --model yolox_l-1248 --backend cuda
+  pipes-gpu:
+    build:
+      context: .
+      target: gpu
+    image: pipes-rs:gpu
+    init: true
+    user: "${PIPES_UID:-1000}:${PIPES_GID:-1000}"
+    environment:
+      PIPES_RERUN_HOST: host.docker.internal
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./runs:/work/pipes-rs/runs
+      - ${KITTI_DATA:-kitti}:/work/data/kitti:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
   fetch:
     build:
       context: .
@@ -47,6 +89,21 @@ services:
     user: "${PIPES_UID:-1000}:${PIPES_GID:-1000}"
     volumes:
       - ${KITTI_DATA:-kitti}:/data/kitti
+
+  # A run's two detectors against KITTI's own labels for the drive, which
+  # `fetch` downloads beside it (docs/measurements.md, "The biggest models"). Several runs
+  # are scored together:
+  #
+  #   docker compose run --rm score runs/<name> 2011_09_26_drive_0005_sync
+  score:
+    build:
+      context: .
+      target: score
+    image: pipes-rs:score
+    user: "${PIPES_UID:-1000}:${PIPES_GID:-1000}"
+    volumes:
+      - ./runs:/work/pipes-rs/runs:ro
+      - ${KITTI_DATA:-kitti}:/work/data/kitti:ro
 
   test:
     build:

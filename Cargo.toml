@@ -32,6 +32,14 @@ tempfile = "3"
 tract-onnx = { version = "=0.23.8", default-features = false }
 # The model file's sha256, checked at load: "frozen" is a claim about bytes.
 sha2 = "0.10"
+# The second runtime, behind `--detector-backend ort|cuda`: ONNX Runtime,
+# Microsoft's C++ engine, loaded at run time from the library
+# `ORT_DYLIB_PATH` names (`load-dynamic`: nothing is downloaded or linked at
+# build time, and a machine without the library still builds and runs the
+# default). `cuda` compiles the CUDA execution provider's options in; the
+# provider itself lives in the library. Pinned exactly, as tract is, and the
+# library must be ONNX Runtime 1.22.0, the version this crate binds.
+ort = { version = "=2.0.0-rc.10", default-features = false, features = ["std", "load-dynamic", "cuda"] }
 pipes-core = { path = "crates/pipes-core" }
 pipes-kitti = { path = "crates/pipes-kitti" }
 

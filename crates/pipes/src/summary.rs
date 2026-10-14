@@ -7,19 +7,28 @@ use std::collections::BTreeMap;
 use pipes_core::evidence::{Evidence, Outcome};
 use pipes_core::sample::StreamId;
 use pipes_core::stats::{percentile, percentile_sorted};
-use pipes_kitti::camdet::{MODEL_FILE, MODEL_NAME};
 use pipes_kitti::detect::{
     detect_params_note, MIN_CLUSTER_VOXELS, PERSISTENCE_GATE_M, RANGE_LIMIT_M,
 };
-use pipes_kitti::fuse::FUSION_RULE;
+use pipes_kitti::fuse::{FUSION_RULE, STEREO_RULE};
 use pipes_kitti::layout::ABSENT_IN_SOURCE;
+use pipes_kitti::name::{NAME_SCORE_MIN, NAMING_RULE};
+use pipes_kitti::pillars::{
+    MODEL_NAME as LIDAR_MODEL_NAME, NMS_IOU as LIDAR_NMS_IOU, PARAMS_M as LIDAR_PARAMS_M,
+    SCORE_THRESHOLD as LIDAR_SCORE_THRESHOLD,
+};
 use pipes_kitti::state::{CORRIDOR_HALF_WIDTH_M, OBJECT_BYTES};
 use pipes_kitti::track::gate_note;
 use pipes_kitti::voxel::VOXEL_SIZE_RATIONALE;
 use serde::Serialize;
 
-use crate::consumers::{answer_words, Extent, FuseTally, ShapeRow};
-use crate::run::{BeforeTrack, RunReport, SourceGapPairs, StorageCheck, VeloStorageCheck};
+use pipes_kitti::camdet::Backend;
+
+use crate::consumers::{answer_words, Extent, FuseTally, NameTally, ShapeRow};
+use crate::run::{
+    BeforeTrack, Cam1Run, CamDetRun, NameCheck, PillarsRun, RunReport, SourceGapPairs,
+    StorageCheck, VeloStorageCheck,
+};
 use crate::viewer::{VIEWER_CAP, VIEWER_EDGE, VIEWER_POLICY};
 
 /// What every `bytes/frame` figure means (spec I.4 wording, verbatim).
@@ -129,10 +138,18 @@ impl StageSummary {
 #[derive(Clone, Debug, Serialize)]
 pub struct CamDetSummary {
     /// Name, file and sha256 of the weights that ran -- the pinned file, or
-    /// the run would have refused to start.
+    /// the run would have refused to start -- its input shape, and the
+    /// runtime it ran on with the CPU threads the `ort` one was given.
     pub model: &'static str,
     pub model_file: &'static str,
     pub model_sha256: String,
+    pub model_params_m: f32,
+    pub input: String,
+    pub backend: &'static str,
+    pub threads: usize,
+    /// The `cuda` backend's knobs; `null` on the others.
+    pub cuda_search: Option<&'static str>,
+    pub cuda_tf32: Option<bool>,
     /// What loading and optimising the model cost, before the clock started.
     pub model_load_ms: f64,
     /// Frames routed onto `cam0->camdet`, frames the stage ran on, batches it
@@ -176,6 +193,172 @@ pub struct CamDetSummary {
     /// `cam_det.arrows` under the run directory: every batch, in order, and
     /// a stream with no batch in it when the stage produced none.
     pub batches_file: Option<String>,
+}
+
+/// The frozen lidar detector's stage, for `summary.json`, on
+/// [`CamDetSummary`]'s terms: the model and its runtime, the sweeps it ran on
+/// and lost, its time a sweep, what it read and what it found.
+#[derive(Clone, Debug, Serialize)]
+pub struct LidarDetSummary {
+    pub model: &'static str,
+    pub model_file: &'static str,
+    pub model_sha256: String,
+    pub model_params_m: f32,
+    pub backend: &'static str,
+    pub threads: usize,
+    /// The `cuda` backend's knobs; `null` on `ort`.
+    pub cuda_search: Option<&'static str>,
+    pub cuda_tf32: Option<bool>,
+    pub score_threshold: f32,
+    pub nms_iou: f32,
+    pub model_load_ms: f64,
+    /// Which way the network looked, a pass a sweep each: `ahead`, or
+    /// `ahead` and `behind`. Every time and count below is the views' added.
+    pub views: Vec<&'static str>,
+    /// Sweeps routed onto `velo->pillars`, sweeps the stage ran on, batches
+    /// it admitted, sweeps it could not turn into one, and sweeps lost at
+    /// admission because the stage had not finished the one before.
+    pub admitted: u64,
+    pub delivered: u64,
+    pub produced: u64,
+    pub errors: u64,
+    pub dropped: u64,
+    pub delivered_fraction: Option<f64>,
+    pub delivered_hz: Option<f64>,
+    /// The lidar's period as replayed, the stage's budget; `null` unpaced.
+    pub period_ms: Option<f64>,
+    /// Per sweep, microseconds: everything the stage did, the pillars, and
+    /// the network with its decode and NMS.
+    pub service_us: Pct,
+    pub pillarize_us: Pct,
+    pub infer_us: Pct,
+    /// `infer_us` in its three parts: the network, the decode, the NMS.
+    pub network_us: Pct,
+    pub decode_us: Pct,
+    pub nms_us: Pct,
+    pub sweeps_over_period: Option<u64>,
+    /// `--lidar-delay-ms`, slept inside the service time; 0 on a plain run.
+    pub delay_ms: u64,
+    /// What it read, per sweep: points, points inside the range, pillars;
+    /// and what it did not: points past a pillar's 32nd, over the run, and
+    /// sweeps cut at the pillar cap.
+    pub points_per_sweep: f64,
+    pub points_in_range_per_sweep: f64,
+    pub pillars_per_sweep: f64,
+    pub truncated_points: u64,
+    pub capped_sweeps: u64,
+    /// What it found: boxes, per sweep, by class, and the anchors above the
+    /// score threshold they were suppressed down from.
+    pub detections: u64,
+    pub detections_per_sweep: Option<f64>,
+    pub candidates_per_sweep: f64,
+    pub classes: BTreeMap<&'static str, u64>,
+    /// Allocated looking at each sweep, of which the pillars; allocated
+    /// building each batch; and the Arrow bytes carried in and out.
+    pub sweep_bytes_per_sweep: u64,
+    pub pillar_bytes_per_sweep: u64,
+    pub build_bytes_per_batch: u64,
+    pub in_payload_bytes_per_sweep: u64,
+    pub out_payload_bytes_per_batch: Option<u64>,
+    /// The sweep was read where the velodyne driver put it.
+    pub input_storage_id_equal: bool,
+    /// `pillar_det.arrows` under the run directory.
+    pub batches_file: Option<String>,
+}
+
+/// What the fusion made of the lidar detector's boxes, for `summary.json`:
+/// how each sweep's batch was found, and what naming the tracks did.
+#[derive(Clone, Debug, Serialize)]
+pub struct NamingSummary {
+    /// Whether the lidar detector's batches reached the fusion. `false`
+    /// under `--lidar-detector off`, where every count below is 0.
+    pub lidar_detector: bool,
+    /// The rule, in one line, and the score a box needs to name a track.
+    pub rule: Option<&'static str>,
+    pub score_min: Option<f32>,
+    /// Sweeps whose batch was in hand inside the wait, late, lost upstream,
+    /// and not waited for because the detector had gone silent; the sweeps
+    /// the fusion handled while it had declared it silent; and the wait the
+    /// batch alone cost, per sweep, after the cameras'.
+    pub named_sweeps: u64,
+    pub late_sweeps: u64,
+    pub dropped_sweeps: u64,
+    pub silent: u64,
+    pub silent_sweeps: u64,
+    pub wait_ms_per_sweep: f64,
+    /// Batches popped off `pillar_det->track`, and any unreadable.
+    pub delivered: u64,
+    pub bad_format: u64,
+    /// The naming over completed sets and over degraded ones, apart.
+    pub completed: NameTallySummary,
+    pub degraded: NameTallySummary,
+    /// Records at the far end carrying a lidar class; of them, records a
+    /// camera named too, split by whether the two agree; and records the
+    /// lidar alone named.
+    pub down_named: u64,
+    pub down_both_named: u64,
+    pub down_agree: u64,
+    pub down_conflict: u64,
+    pub down_lidar_only_named: u64,
+    /// Sets whose `named_count` disagreed with their lanes, in the fusion's
+    /// batches and again at the far end. Both meant to be 0.
+    pub column_mismatch: u64,
+    pub down_named_mismatch: u64,
+    /// `pillars` -> `track`: the batches were read where they were built,
+    /// and every named set names its own sweep's batch.
+    pub input_storage_id_equal: Option<bool>,
+    pub join: NameCheck,
+}
+
+/// One population of sets' naming, as `summary.json` records it.
+#[derive(Clone, Debug, Serialize)]
+pub struct NameTallySummary {
+    pub samples: u64,
+    /// Boxes in the sets' batches, and of them the ones under the naming's
+    /// score, which name nothing.
+    pub detections: u64,
+    pub boxes_below_score: u64,
+    /// Fresh tracks: the ones that could be named.
+    pub candidates: u64,
+    pub named: u64,
+    pub named_fraction_of_candidates: Option<f64>,
+    /// Boxes that named a track, several tracks (fragments of one object),
+    /// and none.
+    pub boxes_used: u64,
+    pub boxes_shared: u64,
+    pub boxes_unused: u64,
+    /// Tracks whose centroid lay in more than one box.
+    pub contested: u64,
+    /// Named tracks by lidar class, most first.
+    pub classes: Vec<(&'static str, u64)>,
+    /// Named tracks a camera named too, and of them where the two agree and
+    /// differ; and named tracks no camera matched.
+    pub both_named: u64,
+    pub agree: u64,
+    pub conflict: u64,
+    pub lidar_only_named: u64,
+}
+
+impl NameTallySummary {
+    fn of(n: &NameTally) -> NameTallySummary {
+        NameTallySummary {
+            samples: n.samples,
+            detections: n.detections,
+            boxes_below_score: n.below_score,
+            candidates: n.candidates,
+            named: n.named,
+            named_fraction_of_candidates: n.named_fraction_of_candidates(),
+            boxes_used: n.used,
+            boxes_shared: n.shared,
+            boxes_unused: n.unused,
+            contested: n.contested,
+            classes: n.class_counts(),
+            both_named: n.both_named,
+            agree: n.agree,
+            conflict: n.conflict,
+            lidar_only_named: n.lidar_only_named,
+        }
+    }
 }
 
 /// The lidar half of `summary.json`; absent entirely on a camera-only run.
@@ -245,6 +428,164 @@ pub struct LidarSummary {
     pub pacing_us: Pct,
     /// The derived chain hanging off these sweeps; absent under `--reduce off`.
     pub reduce: Option<ReduceSummary>,
+}
+
+/// The GPS/IMU half of a run: the vehicle's own motion, one row per frame,
+/// as `summary.json` records it. What it was used for is in
+/// [`TrackSummary`] (`ego_compensated` and its neighbours), beside the
+/// tracks it was subtracted from.
+#[derive(Clone, Debug, Serialize)]
+pub struct OxtsSummary {
+    /// Rows the drive holds (`OxtsDriver::len`).
+    pub n_rows: usize,
+    /// Frame slots the replay accounted for: the rows, and the frames whose
+    /// row is absent in the source. `admitted + missing == frames`.
+    pub frames: usize,
+    /// The frames with no row in the source, ascending.
+    pub absent_in_source: Vec<u64>,
+    /// Rows the driver admitted, and the frame slots it never produced.
+    pub admitted: u64,
+    pub missing: u64,
+    /// Rows that reached the fusion on `oxts->track`.
+    pub delivered: u64,
+    /// **Carried**: Arrow bytes per delivered row, a few hundred.
+    pub payload_bytes_per_row: Option<u64>,
+    /// The driver's pacing error, `arrival - due`, in µs; its own figure, on
+    /// the terms the lidar's is.
+    pub pacing_us: Pct,
+}
+
+/// The right camera's half of `summary.json`; absent on a run without it.
+/// On the GPS/IMU's terms: the driver's own figures, apart from the left
+/// camera's, which every run-level figure above is.
+#[derive(Clone, Debug, Serialize)]
+pub struct Cam1Summary {
+    /// PNGs the drive holds for the right camera.
+    pub n_frames: usize,
+    /// Frame slots the replay accounted for. `admitted + missing == frames`.
+    pub frames: usize,
+    /// The frames with no PNG in the right camera's source, ascending.
+    pub absent_in_source: Vec<u64>,
+    /// Frames the driver admitted, and the frame slots it never produced.
+    pub admitted: u64,
+    pub missing: u64,
+    /// Frames routed onto `cam1->camdet`, and frames the right camera's
+    /// detections reached the fusion on `cam1_det->track`.
+    pub routed: u64,
+    pub delivered: u64,
+    /// The driver's pacing error, `arrival - due`, in µs, and its decode
+    /// time, its own figures on the left camera's terms.
+    pub pacing_us: Pct,
+    pub decode_ms_p50: Option<f64>,
+}
+
+impl Cam1Summary {
+    fn of(
+        c: &Cam1Run,
+        report: &RunReport,
+        by_edge: &BTreeMap<&'static str, Vec<&Evidence>>,
+    ) -> Self {
+        let delivered_rows = |edge: &str| -> Vec<&Evidence> {
+            by_edge
+                .get(edge)
+                .map(|rows| {
+                    rows.iter()
+                        .copied()
+                        .filter(|r| r.outcome == Outcome::Delivered)
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let driver = delivered_rows("cam1");
+        let mut pacing_us: Vec<i64> = driver
+            .iter()
+            .filter_map(|r| r.due_ns.map(|d| (r.arrival_ns - d) / 1000))
+            .collect();
+        let mut decode_ns: Vec<i64> = driver.iter().map(|r| r.decode_ns).collect();
+        Cam1Summary {
+            n_frames: c.n_frames,
+            frames: c.frames,
+            absent_in_source: c.absent_in_source.clone(),
+            admitted: c.totals.admitted,
+            missing: c.totals.missing,
+            routed: report.edge("cam1->camdet").map_or(0, |e| e.admitted),
+            delivered: delivered_rows("cam1_det->track").len() as u64,
+            pacing_us: Pct::of(&mut pacing_us),
+            decode_ms_p50: percentile(&mut decode_ns, 50.0).map(|ns| ns as f64 / 1e6),
+        }
+    }
+}
+
+/// The stereo check, for `summary.json` and the run's own line: every track
+/// both cameras confirmed over the completed sets, measured by two sensors
+/// -- the lidar's distance to its near face and to its box's centre, and
+/// the cameras' stereo range -- and how far apart the two are. Against both
+/// lidar figures, because the stereo range of a silhouette's box is the
+/// object's middle rather than its nearest point.
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct StereoCheckSummary {
+    /// Tracks measured by both.
+    pub tracks: usize,
+    /// Median of `|stereo - near face|`, metres.
+    pub median_abs_diff_m: f64,
+    /// Median of `stereo / near face`: 1 when the two sensors agree.
+    pub median_ratio: f64,
+    /// Share of the tracks on which the stereo range is within 1 m or 10 %
+    /// of the near face, whichever is the larger.
+    pub within_fraction: f64,
+    /// The same three against the lidar box's centre.
+    pub median_abs_diff_centre_m: f64,
+    pub median_ratio_centre: f64,
+    pub within_fraction_centre: f64,
+}
+
+impl StereoCheckSummary {
+    /// Over `checks`, `(near face, centre, stereo)` triples; `None` over
+    /// none.
+    pub fn of(checks: &[(f32, f32, f32)]) -> Option<Self> {
+        if checks.is_empty() {
+            return None;
+        }
+        let median = |mut v: Vec<f64>| -> f64 {
+            v.sort_by(f64::total_cmp);
+            v.get(v.len() / 2).copied().unwrap_or(0.0)
+        };
+        let against = |lidar: fn(&(f32, f32, f32)) -> f32| -> (f64, f64, f64) {
+            let diffs: Vec<f64> = checks
+                .iter()
+                .map(|c| (f64::from(c.2) - f64::from(lidar(c))).abs())
+                .collect();
+            let ratios: Vec<f64> = checks
+                .iter()
+                .filter(|c| lidar(c) > 0.0)
+                .map(|c| f64::from(c.2) / f64::from(lidar(c)))
+                .collect();
+            let within = checks
+                .iter()
+                .filter(|c| {
+                    let l = f64::from(lidar(c));
+                    (f64::from(c.2) - l).abs() <= (l.abs() * 0.1).max(1.0)
+                })
+                .count();
+            (
+                median(diffs),
+                median(ratios),
+                within as f64 / checks.len() as f64,
+            )
+        };
+        let (median_abs_diff_m, median_ratio, within_fraction) = against(|c| c.0);
+        let (median_abs_diff_centre_m, median_ratio_centre, within_fraction_centre) =
+            against(|c| c.1);
+        Some(StereoCheckSummary {
+            tracks: checks.len(),
+            median_abs_diff_m,
+            median_ratio,
+            within_fraction,
+            median_abs_diff_centre_m,
+            median_ratio_centre,
+            within_fraction_centre,
+        })
+    }
 }
 
 /// The stage-to-stage hand-off, as `summary.json` records it.
@@ -528,6 +869,48 @@ pub struct TrackSummary {
     /// Camera references popped, and any whose payload was not one.
     pub cam_delivered: u64,
     pub cam_bad_format: u64,
+    /// The right camera, when the run had one: its references popped, its
+    /// pairing per sweep on the left's terms, and the sets built on its
+    /// frame alone because the left's was lost -- answered rather than
+    /// expired. All 0 without it, and `right_camera` says which.
+    pub right_camera: bool,
+    pub cam1_delivered: u64,
+    pub right_paired: u64,
+    pub right_stale: u64,
+    pub right_expired_dropped: u64,
+    pub right_expired_late: u64,
+    pub right_absent_in_source: u64,
+    pub sets_from_right_camera: u64,
+    /// The fusion's own fault handling of a camera stream: sweeps that
+    /// expired because the left camera was silent (and the right had no
+    /// frame either), sweeps the right camera was silent on, and how many
+    /// sweeps each camera was out for. A camera with no frame to pair for
+    /// three sweeps running is not waited for, and the other camera's set
+    /// is built on one camera's terms, until a frame of it pairs again.
+    pub expired_silent: u64,
+    pub right_silent: u64,
+    pub left_silent_sweeps: u64,
+    pub right_silent_sweeps: u64,
+    /// Sweeps whose tracks were carried through the vehicle's own motion
+    /// before the match: from the OXTS row of their own frame
+    /// (`compensated`), from the newest earlier row standing in for one that
+    /// was not there (`stale`), and sweeps that had a stream and no usable
+    /// row (`missing`). All 0 without the stream, and `velocity_frame` says
+    /// what the tracks' velocities then are.
+    pub ego_compensated: u64,
+    pub ego_stale: u64,
+    pub ego_missing: u64,
+    /// OXTS rows popped off `oxts->track`.
+    pub oxts_delivered: u64,
+    /// The fastest the vehicle went and the hardest it turned over the rows
+    /// the tracker used, or `null` without them. Drive 0005 reaches 6.5 m/s
+    /// and 0.25 rad/s.
+    pub ego_speed_mps_max: Option<f64>,
+    pub ego_yaw_rate_rps_max: Option<f64>,
+    /// What frame the tracks' velocities, and so the closing speeds, are in:
+    /// `over ground` once the vehicle's motion is subtracted, `relative to
+    /// the vehicle` without it.
+    pub velocity_frame: &'static str,
     /// **Carried**, per sample, at each link: the detections on `obj->track`,
     /// then the tracks on `track->state`.
     pub in_payload_bytes_per_sample: Option<u64>,
@@ -617,6 +1000,8 @@ pub struct TrackSummary {
     pub scratch_bytes: u64,
     /// What the association did with the camera's detections.
     pub fusion: FusionSummary,
+    /// What the fusion made of the lidar detector's boxes.
+    pub naming: NamingSummary,
     /// The answer.
     pub state: StateSummary,
 }
@@ -631,6 +1016,13 @@ pub struct FusionSummary {
     pub detector: bool,
     /// The rule, in one line; it has no parameter to record.
     pub rule: Option<&'static str>,
+    /// Whether the right camera's detections reached the fusion, and the
+    /// rules it was then held to beside `rule`.
+    pub right_camera: bool,
+    pub stereo_rule: Option<&'static str>,
+    /// Every track both cameras confirmed over the completed sets, measured
+    /// by both sensors; `null` without the right camera or without one.
+    pub stereo_check: Option<StereoCheckSummary>,
     /// Sets paired inside their sweep.
     pub completed: FuseTallySummary,
     /// Sets paired with an OLDER frame under `--pair-stale-ms`: the
@@ -645,6 +1037,7 @@ pub struct FusionSummary {
     /// Records by population at the far end, and the camera-only detections
     /// the answers carried.
     pub down_fused: u64,
+    pub down_one_camera: u64,
     pub down_lidar_only: u64,
     pub down_unfused: u64,
     pub down_camera_only: u64,
@@ -683,6 +1076,22 @@ pub struct FuseTallySummary {
     pub iou_p90: Option<f64>,
     /// Fused tracks by the class the camera gave them, most first.
     pub classes: Vec<(&'static str, u64)>,
+    /// The right camera's part, all 0 without it: sets its frame was
+    /// associated too and the detections in them; the left's matches it
+    /// confirmed (these are `fused`) and did not; the tracks it alone
+    /// matched; the one-camera tracks, `unconfirmed + right_only`; the
+    /// camera-only detections kept with a stereo range and dropped without
+    /// one; and the sets with one camera's frame only, every match in which
+    /// is one camera's.
+    pub right_samples: u64,
+    pub right_detections: u64,
+    pub confirmed: u64,
+    pub unconfirmed: u64,
+    pub right_only: u64,
+    pub one_camera: u64,
+    pub stereo_matched: u64,
+    pub camera_only_dropped: u64,
+    pub demoted_sets: u64,
 }
 
 impl FuseTallySummary {
@@ -695,6 +1104,15 @@ impl FuseTallySummary {
             camera_only: f.camera_only,
             contested: f.contested,
             crowded: f.crowded,
+            right_samples: f.right_samples,
+            right_detections: f.right_detections,
+            confirmed: f.confirmed,
+            unconfirmed: f.unconfirmed,
+            right_only: f.right_only,
+            one_camera: f.one_camera,
+            stereo_matched: f.stereo_matched,
+            camera_only_dropped: f.camera_only_dropped,
+            demoted_sets: f.demoted_sets,
             fused_per_sample: f.fused_per_sample(),
             fused_fraction_of_candidates: f.fused_fraction_of_candidates(),
             fused_fraction_of_detections: f.fused_fraction_of_detections(),
@@ -878,8 +1296,16 @@ pub struct RunSummary {
     pub stages: Vec<StageSummary>,
     /// Present exactly when the frozen camera detector ran.
     pub camera_detector: Option<CamDetSummary>,
+    /// Present exactly when the run replayed the right camera: its driver,
+    /// and the detector's stage on its frames.
+    pub cam1: Option<Cam1Summary>,
+    pub camera_detector_right: Option<CamDetSummary>,
+    /// Present exactly when the frozen lidar detector ran.
+    pub lidar_detector: Option<LidarDetSummary>,
     /// Present exactly when the run replayed the drive's lidar.
     pub lidar: Option<LidarSummary>,
+    /// Present exactly when the run replayed the drive's GPS/IMU rows.
+    pub oxts: Option<OxtsSummary>,
     pub storage_id_equal_all_stages: bool,
     /// Present exactly when the run had a recording to draw on.
     pub viewer: Option<ViewerSummary>,
@@ -906,21 +1332,30 @@ fn edge_rank(edge: &str) -> u8 {
         "cam0->rerun" => 2,
         "cam0->camdet" => 3,
         "cam_det" => 4,
-        "velo" => 5,
-        "velo->cloud" => 6,
-        "velo->reduce" => 7,
-        "det" => 8,
-        "det->cloud" => 9,
-        "det->detect" => 10,
-        "obj" => 11,
-        "obj->sink" => 12,
-        "obj->track" => 13,
-        "cam_det->track" => 14,
-        "track" => 15,
-        "track->state" => 16,
-        "state" => 17,
-        "state->sink" => 18,
-        _ => 19,
+        "cam1" => 5,
+        "cam1->camdet" => 6,
+        "cam1_det" => 7,
+        "velo" => 8,
+        "velo->cloud" => 9,
+        "velo->reduce" => 10,
+        "velo->pillars" => 11,
+        "pillar_det" => 12,
+        "det" => 13,
+        "det->cloud" => 14,
+        "det->detect" => 15,
+        "obj" => 16,
+        "obj->sink" => 17,
+        "obj->track" => 18,
+        "cam_det->track" => 19,
+        "cam1_det->track" => 20,
+        "pillar_det->track" => 21,
+        "oxts" => 22,
+        "oxts->track" => 23,
+        "track" => 24,
+        "track->state" => 25,
+        "state" => 26,
+        "state->sink" => 27,
+        _ => 28,
     }
 }
 
@@ -1080,43 +1515,22 @@ pub fn summarize(report: &RunReport, rss_bytes: Option<u64>) -> (RunSummary, Vec
         abs_pacing_us: Pct::of(&mut abs_pacing_us),
         decode_ms_p50,
         stages,
-        camera_detector: report.camdet.as_ref().map(|c| {
-            let r = &c.report;
-            let admitted = report.edge("cam0->camdet").map_or(0, |e| e.admitted);
-            let us = |v: &[i64]| Pct::of(&mut v.iter().map(|ns| ns / 1000).collect::<Vec<_>>());
-            let fraction = (admitted > 0).then(|| r.delivered as f64 / admitted as f64);
-            CamDetSummary {
-                model: MODEL_NAME,
-                model_file: MODEL_FILE,
-                model_sha256: c.model_sha256.clone(),
-                model_load_ms: c.load_ms,
-                admitted,
-                delivered: r.delivered,
-                produced: r.produced,
-                errors: r.errors,
-                dropped: report.edge("cam0->camdet").map_or(0, |e| e.queue_dropped),
-                delivered_fraction: fraction,
-                delivered_hz: match (fraction, c.period_ns) {
-                    (Some(f), Some(p)) if p > 0 => Some(f * 1e9 / p as f64),
-                    _ => None,
-                },
-                period_ms: c.period_ns.map(|p| p as f64 / 1e6),
-                service_us: us(&r.service_ns),
-                preprocess_us: us(&r.preprocess_ns),
-                infer_us: us(&r.infer_ns),
-                frames_over_period: c.period_ns.map(|p| r.over_period(p) as u64),
-                detections: r.detections_total,
-                detections_per_frame: r.detections_mean(),
-                classes: r.classes().into_iter().collect(),
-                frame_bytes_per_frame: r.frame_bytes_total / r.delivered.max(1),
-                preprocess_bytes_per_frame: r.preprocess_bytes_total / r.delivered.max(1),
-                build_bytes_per_batch: r.build_bytes_total / r.produced.max(1),
-                in_payload_bytes_per_frame: r.in_payload_bytes_total / r.delivered.max(1),
-                out_payload_bytes_per_batch: r.out_payload_bytes_mean(),
-                input_storage_id_equal: c.in_check.passed(),
-                batches_file: Some(c.file.display().to_string()),
-            }
-        }),
+        camera_detector: report
+            .camdet
+            .as_ref()
+            .map(|c| camdet_summary(report, c, "cam0->camdet")),
+        cam1: report
+            .cam1
+            .as_ref()
+            .map(|c| Cam1Summary::of(c, report, &by_edge)),
+        camera_detector_right: report
+            .camdet_right
+            .as_ref()
+            .map(|c| camdet_summary(report, c, "cam1->camdet")),
+        lidar_detector: report
+            .pillars
+            .as_ref()
+            .map(|p| lidar_det_summary(report, p)),
         lidar: report.velo.as_ref().map(|v| {
             let mut velo_pacing_us: Vec<i64> = by_edge
                 .get("velo")
@@ -1275,8 +1689,35 @@ pub fn summarize(report: &RunReport, rss_bytes: Option<u64>) -> (RunSummary, Vec
                                         pair_wait_ms_per_sweep: tr.wait_ns_total as f64
                                             / 1e6
                                             / tr.delivered.max(1) as f64,
-                                        cam_delivered: tr.cam_delivered,
-                                        cam_bad_format: tr.cam_bad_format,
+                                        cam_delivered: tr.cam.delivered,
+                                        cam_bad_format: tr.cam.bad_format,
+                                        right_camera: tk.right_camera,
+                                        cam1_delivered: tr.cam1.delivered,
+                                        right_paired: tr.right_paired,
+                                        right_stale: tr.right_stale,
+                                        right_expired_dropped: tr.right_dropped,
+                                        right_expired_late: tr.right_late,
+                                        right_absent_in_source: tr.right_absent_in_source,
+                                        sets_from_right_camera: tr.sets_from_right,
+                                        expired_silent: tr.pair_silent,
+                                        right_silent: tr.right_silent,
+                                        left_silent_sweeps: tr.left_silent_sweeps,
+                                        right_silent_sweeps: tr.right_silent_sweeps,
+                                        ego_compensated: tr.ego_compensated,
+                                        ego_stale: tr.ego_stale,
+                                        ego_missing: tr.ego_missing,
+                                        oxts_delivered: tr.oxts_delivered,
+                                        ego_speed_mps_max: tr
+                                            .ego_used()
+                                            .then_some(tr.ego_speed_mps_max),
+                                        ego_yaw_rate_rps_max: tr
+                                            .ego_used()
+                                            .then_some(tr.ego_yaw_rate_rps_max),
+                                        velocity_frame: if tr.ego_used() {
+                                            "over ground"
+                                        } else {
+                                            "relative to the vehicle"
+                                        },
                                         in_payload_bytes_per_sample: tr.in_payload_bytes_mean(),
                                         out_payload_bytes_per_sample: tr.out_payload_bytes_mean(),
                                         payload_shrink: tr.payload_shrink(),
@@ -1290,6 +1731,7 @@ pub fn summarize(report: &RunReport, rss_bytes: Option<u64>) -> (RunSummary, Vec
                                             tr.dt_s_last,
                                             r.voxel_size,
                                             RANGE_LIMIT_M,
+                                            tr.ego_used(),
                                         ),
                                         association_rate: tr.association_rate(),
                                         ambiguous_fraction: tr.ambiguous_fraction(),
@@ -1321,6 +1763,9 @@ pub fn summarize(report: &RunReport, rss_bytes: Option<u64>) -> (RunSummary, Vec
                                         fusion: FusionSummary {
                                             detector: tk.detector,
                                             rule: tk.detector.then_some(FUSION_RULE),
+                                            right_camera: tk.right_camera,
+                                            stereo_rule: tk.right_camera.then_some(STEREO_RULE),
+                                            stereo_check: StereoCheckSummary::of(&tr.stereo_checks),
                                             completed: FuseTallySummary::of(&tr.fuse_completed),
                                             degraded: FuseTallySummary::of(&tr.fuse_degraded),
                                             shape_completed: ShapeSummary {
@@ -1345,6 +1790,7 @@ pub fn summarize(report: &RunReport, rss_bytes: Option<u64>) -> (RunSummary, Vec
                                                 .map(|(k, r)| (*k, ShapeRowSummary::of(r)))
                                                 .collect(),
                                             down_fused: tk.sink.fused_total,
+                                            down_one_camera: tk.sink.one_camera_total,
                                             down_lidar_only: tk.sink.lidar_only_total,
                                             down_unfused: tk.sink.unfused_total,
                                             down_camera_only: tk.sink.camera_only_total,
@@ -1353,6 +1799,35 @@ pub fn summarize(report: &RunReport, rss_bytes: Option<u64>) -> (RunSummary, Vec
                                             scratch_growths: tr.fuse_scratch_growths,
                                             scratch_bytes: tr.fuse_scratch_bytes,
                                             batches_file: Some(tk.fused_file.display().to_string()),
+                                        },
+                                        naming: NamingSummary {
+                                            lidar_detector: tk.lidar_detector,
+                                            rule: tk.lidar_detector.then_some(NAMING_RULE),
+                                            score_min: tk.lidar_detector.then_some(NAME_SCORE_MIN),
+                                            named_sweeps: tr.lidar_named,
+                                            late_sweeps: tr.lidar_late,
+                                            dropped_sweeps: tr.lidar_dropped,
+                                            silent: tr.lidar_silent,
+                                            silent_sweeps: tr.lidar_silent_sweeps,
+                                            wait_ms_per_sweep: tr.lidar_wait_ns_total as f64
+                                                / 1e6
+                                                / tr.delivered.max(1) as f64,
+                                            delivered: tr.pillar.delivered,
+                                            bad_format: tr.pillar.bad_format,
+                                            completed: NameTallySummary::of(&tr.names_completed),
+                                            degraded: NameTallySummary::of(&tr.names_degraded),
+                                            down_named: tk.sink.named_total,
+                                            down_both_named: tk.sink.both_named_total,
+                                            down_agree: tk.sink.agree_total,
+                                            down_conflict: tk.sink.conflict_total,
+                                            down_lidar_only_named: tk.sink.lidar_named_only_total,
+                                            column_mismatch: tr.name_column_mismatch,
+                                            down_named_mismatch: tk.sink.named_mismatch,
+                                            input_storage_id_equal: tk
+                                                .pillar_check
+                                                .as_ref()
+                                                .map(VeloStorageCheck::passed),
+                                            join: tk.name_check,
                                         },
                                         state: StateSummary {
                                             delivered: st.delivered,
@@ -1408,6 +1883,35 @@ pub fn summarize(report: &RunReport, rss_bytes: Option<u64>) -> (RunSummary, Vec
                 }),
             }
         }),
+        oxts: report.oxts.as_ref().map(|o| {
+            let rows: Vec<&Evidence> = by_edge.get("oxts").cloned().unwrap_or_default();
+            let mut pacing_us: Vec<i64> = rows
+                .iter()
+                .filter(|r| r.outcome == Outcome::Delivered)
+                .filter_map(|r| r.due_ns.map(|d| (r.arrival_ns - d) / 1000))
+                .collect();
+            let delivered: Vec<&Evidence> = by_edge
+                .get("oxts->track")
+                .map(|rows| {
+                    rows.iter()
+                        .copied()
+                        .filter(|r| r.outcome == Outcome::Delivered)
+                        .collect()
+                })
+                .unwrap_or_default();
+            OxtsSummary {
+                n_rows: o.n_rows,
+                frames: o.frames,
+                absent_in_source: o.absent_in_source.clone(),
+                admitted: o.totals.admitted,
+                missing: o.totals.missing,
+                delivered: delivered.len() as u64,
+                payload_bytes_per_row: (!delivered.is_empty()).then(|| {
+                    delivered.iter().map(|r| r.payload_bytes).sum::<u64>() / delivered.len() as u64
+                }),
+                pacing_us: Pct::of(&mut pacing_us),
+            }
+        }),
         storage_id_equal_all_stages: matches!(report.storage_check, StorageCheck::Ok { .. }),
         viewer: report.viewer.as_ref().map(|v| ViewerSummary {
             edge: VIEWER_EDGE,
@@ -1434,6 +1938,111 @@ pub fn summarize(report: &RunReport, rss_bytes: Option<u64>) -> (RunSummary, Vec
         bytes_alloc_semantics: BYTES_ALLOC_SEMANTICS,
     };
     (summary, invariants)
+}
+
+/// The frozen detector's block, for either camera's stage: `edge` is the
+/// queue the stage reads, `cam0->camdet` or `cam1->camdet`.
+fn camdet_summary(report: &RunReport, c: &CamDetRun, edge: &str) -> CamDetSummary {
+    let r = &c.report;
+    let admitted = report.edge(edge).map_or(0, |e| e.admitted);
+    let us = |v: &[i64]| Pct::of(&mut v.iter().map(|ns| ns / 1000).collect::<Vec<_>>());
+    let fraction = (admitted > 0).then(|| r.delivered as f64 / admitted as f64);
+    CamDetSummary {
+        model: c.spec.name,
+        model_file: c.spec.file,
+        model_sha256: c.model_sha256.clone(),
+        model_params_m: c.spec.params_m,
+        input: c.spec.input_words(),
+        backend: c.backend.name(),
+        threads: c.threads,
+        cuda_search: (c.backend == Backend::Cuda).then_some(c.cuda.search.name()),
+        cuda_tf32: (c.backend == Backend::Cuda).then_some(c.cuda.tf32),
+        model_load_ms: c.load_ms,
+        admitted,
+        delivered: r.delivered,
+        produced: r.produced,
+        errors: r.errors,
+        dropped: report.edge(edge).map_or(0, |e| e.queue_dropped),
+        delivered_fraction: fraction,
+        delivered_hz: match (fraction, c.period_ns) {
+            (Some(f), Some(p)) if p > 0 => Some(f * 1e9 / p as f64),
+            _ => None,
+        },
+        period_ms: c.period_ns.map(|p| p as f64 / 1e6),
+        service_us: us(&r.service_ns),
+        preprocess_us: us(&r.preprocess_ns),
+        infer_us: us(&r.infer_ns),
+        frames_over_period: c.period_ns.map(|p| r.over_period(p) as u64),
+        detections: r.detections_total,
+        detections_per_frame: r.detections_mean(),
+        classes: r.classes().into_iter().collect(),
+        frame_bytes_per_frame: r.frame_bytes_total / r.delivered.max(1),
+        preprocess_bytes_per_frame: r.preprocess_bytes_total / r.delivered.max(1),
+        build_bytes_per_batch: r.build_bytes_total / r.produced.max(1),
+        in_payload_bytes_per_frame: r.in_payload_bytes_total / r.delivered.max(1),
+        out_payload_bytes_per_batch: r.out_payload_bytes_mean(),
+        input_storage_id_equal: c.in_check.passed(),
+        batches_file: Some(c.file.display().to_string()),
+    }
+}
+
+/// The lidar detector's stage as `summary.json` records it.
+fn lidar_det_summary(report: &RunReport, c: &PillarsRun) -> LidarDetSummary {
+    let r = &c.report;
+    let edge = "velo->pillars";
+    let admitted = report.edge(edge).map_or(0, |e| e.admitted);
+    let us = |v: &[i64]| Pct::of(&mut v.iter().map(|ns| ns / 1000).collect::<Vec<_>>());
+    let fraction = (admitted > 0).then(|| r.delivered as f64 / admitted as f64);
+    let per = |n: u64| n as f64 / r.delivered.max(1) as f64;
+    LidarDetSummary {
+        model: LIDAR_MODEL_NAME,
+        model_file: c.model_file,
+        model_sha256: c.model_sha256.clone(),
+        model_params_m: LIDAR_PARAMS_M,
+        backend: c.backend.name(),
+        threads: c.threads,
+        cuda_search: (c.backend == Backend::Cuda).then_some(c.cuda.search.name()),
+        cuda_tf32: (c.backend == Backend::Cuda).then_some(c.cuda.tf32),
+        score_threshold: LIDAR_SCORE_THRESHOLD,
+        nms_iou: LIDAR_NMS_IOU,
+        model_load_ms: c.load_ms,
+        views: c.views.iter().map(|v| v.name()).collect(),
+        admitted,
+        delivered: r.delivered,
+        produced: r.produced,
+        errors: r.errors,
+        dropped: report.edge(edge).map_or(0, |e| e.queue_dropped),
+        delivered_fraction: fraction,
+        delivered_hz: match (fraction, c.period_ns) {
+            (Some(f), Some(p)) if p > 0 => Some(f * 1e9 / p as f64),
+            _ => None,
+        },
+        period_ms: c.period_ns.map(|p| p as f64 / 1e6),
+        service_us: us(&r.service_ns),
+        pillarize_us: us(&r.pillarize_ns),
+        infer_us: us(&r.infer_ns),
+        network_us: us(&r.network_ns),
+        decode_us: us(&r.decode_ns),
+        nms_us: us(&r.nms_ns),
+        sweeps_over_period: c.period_ns.map(|p| r.over_period(p) as u64),
+        delay_ms: c.delay_ms,
+        points_per_sweep: per(r.points_total),
+        points_in_range_per_sweep: per(r.in_range_total),
+        pillars_per_sweep: per(r.pillars_total),
+        truncated_points: r.truncated_points_total,
+        capped_sweeps: r.capped_sweeps,
+        detections: r.detections_total,
+        detections_per_sweep: r.detections_mean(),
+        candidates_per_sweep: r.candidates_total as f64 / r.produced.max(1) as f64,
+        classes: r.classes().into_iter().collect(),
+        sweep_bytes_per_sweep: r.sweep_bytes_total / r.delivered.max(1),
+        pillar_bytes_per_sweep: r.pillar_bytes_total / r.delivered.max(1),
+        build_bytes_per_batch: r.build_bytes_total / r.produced.max(1),
+        in_payload_bytes_per_sweep: r.in_payload_bytes_total / r.delivered.max(1),
+        out_payload_bytes_per_batch: r.out_payload_bytes_mean(),
+        input_storage_id_equal: c.in_check.passed(),
+        batches_file: Some(c.file.display().to_string()),
+    }
 }
 
 /// The H.3 lines: one per driver, one reconciling the drivers with admission,
@@ -1487,6 +2096,45 @@ fn check_invariants(
         out.push(Invariant {
             text: format!("INVARIANT stage=camdet delivered={d} produced={p} errors={e}"),
             ok: p + e == d && p == report.admitted_of(StreamId::CAM_DET),
+        });
+    }
+    // The right camera's driver, on the GPS/IMU's terms, and its stage on
+    // the detector's: every frame slot once, every frame it ran on a batch
+    // or an error, every batch one `arrival_seq` on `CAM1_DET`.
+    if let Some(c) = &report.cam1 {
+        let (ca, cm, cn) = (c.totals.admitted, c.totals.missing, c.n_frames as u64);
+        let frames = c.frames as u64;
+        let absent = c.absent_in_source.len() as u64;
+        let absent_rows = absent_rows(by_edge, "cam1");
+        let ok = ca + cm == frames
+            && frames == cn + absent
+            && ca == report.admitted_of(StreamId::CAM1)
+            && absent_rows == c.absent_in_source;
+        let text = if absent == 0 {
+            format!("INVARIANT driver=cam1 admitted={ca} missing={cm} n_frames={cn}")
+        } else {
+            format!(
+                "INVARIANT driver=cam1 admitted={ca} missing={cm} frames={frames} = n_frames {cn} + absent_in_source {absent} (rows {})",
+                absent_rows.len()
+            )
+        };
+        out.push(Invariant { text, ok });
+    }
+    if let Some(c) = &report.camdet_right {
+        let (d, p, e) = (c.report.delivered, c.report.produced, c.report.errors);
+        out.push(Invariant {
+            text: format!("INVARIANT stage=camdet-right delivered={d} produced={p} errors={e}"),
+            ok: p + e == d && p == report.admitted_of(StreamId::CAM1_DET),
+        });
+    }
+    // The lidar detector's line, on the camera detector's terms: every sweep
+    // it ran on became a batch or an error, and every batch took exactly one
+    // `arrival_seq` on `PILLAR_DET`.
+    if let Some(c) = &report.pillars {
+        let (d, p, e) = (c.report.delivered, c.report.produced, c.report.errors);
+        out.push(Invariant {
+            text: format!("INVARIANT stage=pillars delivered={d} produced={p} errors={e}"),
+            ok: p + e == d && p == report.admitted_of(StreamId::PILLAR_DET),
         });
     }
     if let Some(v) = &report.velo {
@@ -1568,19 +2216,76 @@ fn check_invariants(
                     // went exactly one place, and the `fused_count` columns
                     // agree with the lanes they count -- in the fusion's own
                     // batches and again at the far end.
+                    // With the right camera a left detection has two more
+                    // places to go -- a match the right did not confirm, or
+                    // a camera-only detection dropped for want of a stereo
+                    // partner -- and the line gains their terms. One camera
+                    // keeps the line it always had.
                     let (fc, fd) = (&t.fuse_completed, &t.fuse_degraded);
                     let (nd, nf, nc) = (
                         fc.detections + fd.detections,
                         fc.fused + fd.fused,
                         fc.camera_only + fd.camera_only,
                     );
+                    let (nu, nx) = (
+                        fc.unconfirmed + fd.unconfirmed,
+                        fc.camera_only_dropped + fd.camera_only_dropped,
+                    );
                     let (cm, dm) = (t.fuse_column_mismatch, tk.sink.fused_mismatch);
-                    out.push(Invariant {
-                        text: format!(
+                    let text = if tk.right_camera {
+                        format!(
+                            "INVARIANT fusion detections={nd} fused={nf} unconfirmed={nu} camera_only={nc} camera_only_dropped={nx} column_mismatch={cm} down_fused_mismatch={dm}"
+                        )
+                    } else {
+                        format!(
                             "INVARIANT fusion detections={nd} fused={nf} camera_only={nc} column_mismatch={cm} down_fused_mismatch={dm}"
-                        ),
-                        ok: nd == nf + nc && cm == 0 && dm == 0,
+                        )
+                    };
+                    out.push(Invariant {
+                        text,
+                        ok: nd == nf + nu + nc + nx && cm == 0 && dm == 0,
                     });
+                    // The right camera's pairing, sweep by sweep: every
+                    // sweep handed to the fusion got exactly one verdict on
+                    // the right frame too.
+                    if tk.right_camera {
+                        let (rp, rs, rd, rl, rq, ra) = (
+                            t.right_paired,
+                            t.right_stale,
+                            t.right_dropped,
+                            t.right_late,
+                            t.right_silent,
+                            t.right_absent_in_source,
+                        );
+                        out.push(Invariant {
+                            text: format!(
+                                "INVARIANT stage=track right_camera paired={rp} stale={rs} dropped={rd} late={rl} silent={rq} absent_in_source={ra} delivered={d}"
+                            ),
+                            ok: rp + rs + rd + rl + rq + ra == d,
+                        });
+                    }
+                    // The lidar detector's half, sweep by sweep: every sweep
+                    // handed to the fusion got exactly one verdict on its
+                    // batch, the named tracks counted off the lanes are the
+                    // ones the columns count -- in the fusion's batches and
+                    // at the far end -- and every named set names its own
+                    // sweep's batch, one `pillars` really admitted.
+                    if tk.lidar_detector {
+                        let (ln, ll, ld, ls) =
+                            (t.lidar_named, t.lidar_late, t.lidar_dropped, t.lidar_silent);
+                        let (nt, dn) = (
+                            t.names_completed.named + t.names_degraded.named,
+                            tk.sink.named_total,
+                        );
+                        let (cm, dm) = (t.name_column_mismatch, tk.sink.named_mismatch);
+                        let join = tk.name_check.passed();
+                        out.push(Invariant {
+                            text: format!(
+                                "INVARIANT stage=track lidar_detector named={ln} late={ll} dropped={ld} silent={ls} delivered={d} | tracks named={nt} down_named={dn} column_mismatch={cm} down_named_mismatch={dm} join_ok={join}"
+                            ),
+                            ok: ln + ll + ld + ls == d && nt == dn && cm == 0 && dm == 0 && join,
+                        });
+                    }
                     let st = &tk.state;
                     let (d, p, e) = (st.delivered, st.produced, st.errors);
                     out.push(Invariant {
@@ -1613,6 +2318,28 @@ fn check_invariants(
                 }
             }
         }
+    }
+    // The GPS/IMU driver's line, in the velodyne's shape: every frame slot
+    // once, the rows plus the frames absent in its source, each absent one
+    // a row of its own and no other.
+    if let Some(o) = &report.oxts {
+        let (oa, om, on) = (o.totals.admitted, o.totals.missing, o.n_rows as u64);
+        let frames = o.frames as u64;
+        let absent = o.absent_in_source.len() as u64;
+        let absent_rows = absent_rows(by_edge, "oxts");
+        let ok = oa + om == frames
+            && frames == on + absent
+            && oa == report.admitted_of(StreamId::OXTS)
+            && absent_rows == o.absent_in_source;
+        let text = if absent == 0 {
+            format!("INVARIANT driver=oxts admitted={oa} missing={om} n_rows={on}")
+        } else {
+            format!(
+                "INVARIANT driver=oxts admitted={oa} missing={om} frames={frames} = n_rows {on} + absent_in_source {absent} (rows {})",
+                absent_rows.len()
+            )
+        };
+        out.push(Invariant { text, ok });
     }
     // The line that ties the producers to admission: every sample a driver
     // admitted took exactly one `arrival_seq`, and no `arrival_seq` went to
@@ -1801,7 +2528,11 @@ mod tests {
             }),
             rerun: None,
             camdet: None,
+            cam1: None,
+            camdet_right: None,
+            pillars: None,
             velo: None,
+            oxts: None,
             edges: vec![EdgeReport {
                 name: "cam0->proc",
                 admitted: 4,

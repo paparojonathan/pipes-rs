@@ -198,7 +198,7 @@ fn assert_shown_and_styled(rrd: &Rrd, want: &[&str]) {
 
 /// Every family the dashboard draws, the stages' own pictures and the
 /// recorder's mirror alike.
-const EVERY_FAMILY: [&str; 19] = [
+const EVERY_FAMILY: [&str; 20] = [
     "camera/image",
     "camera/status",
     "answer/headline",
@@ -210,9 +210,10 @@ const EVERY_FAMILY: [&str; 19] = [
     "lidar/voxels",
     "lidar/tracks",
     "lidar/answer",
+    "lidar/path",
     "lanes/pairing",
     "pairing/1_camera_done",
-    "pairing/3_detect_done",
+    "pairing/4_detect_done",
     "after_sweep/sweep_end",
     "after_sweep/2_reduce_done",
     "latency/table",

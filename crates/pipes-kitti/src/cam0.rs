@@ -1,4 +1,6 @@
-//! `Cam0Driver`: the paced PNG replayer for KITTI `image_02` (design §5.2).
+//! `Cam0Driver`: the paced PNG replayer for a KITTI colour camera (design
+//! §5.2): `image_02`, the left one, which is `cam0` and the default, or
+//! `image_03`, the right one, `cam1` ([`Camera`]).
 //! Deadlines are absolute, from the `ClockModel`, never from the previous
 //! arrival, so a slow decode or a slow admit never shifts a later `due`.
 //! Frame `i` is decoded in the gap before `due(i)` ("decode one ahead"), the
@@ -35,6 +37,131 @@ pub use crate::driver::{median_period_ns, DriverEvent, RunTotals, DEFAULT_PERIOD
 /// How many sibling directory names an error message lists before it stops.
 const SIBLINGS_SHOWN: usize = 6;
 
+/// Which of KITTI's two colour cameras a driver replays. The two fire on
+/// the lidar's trigger together, 54 cm apart, and are rectified to one
+/// image plane; each has its own directory, stream and calibration rows.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Camera {
+    /// `image_02`, the left colour camera: `cam0`, the one every run replays.
+    #[default]
+    Left,
+    /// `image_03`, the right colour camera: `cam1`, the second camera the
+    /// fusion reads beside the first.
+    Right,
+}
+
+impl Camera {
+    /// The drive's directory.
+    pub fn dir_name(self) -> &'static str {
+        match self {
+            Camera::Left => "image_02",
+            Camera::Right => "image_03",
+        }
+    }
+
+    /// The two digits KITTI's calibration keys use: `P_rect_02`, `S_rect_03`.
+    pub fn index(self) -> &'static str {
+        match self {
+            Camera::Left => "02",
+            Camera::Right => "03",
+        }
+    }
+
+    /// The stream its frames travel on.
+    pub fn stream(self) -> StreamId {
+        match self {
+            Camera::Left => StreamId::CAM0,
+            Camera::Right => StreamId::CAM1,
+        }
+    }
+
+    /// The driver's edge name, as the evidence rows carry it.
+    pub fn edge(self) -> &'static str {
+        match self {
+            Camera::Left => "cam0",
+            Camera::Right => "cam1",
+        }
+    }
+
+    /// Which camera a fused set's frame is, as its batch spells it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Camera::Left => "left",
+            Camera::Right => "right",
+        }
+    }
+
+    /// [`Camera::name`] read back off a batch; `None` for any other word.
+    pub fn parse(s: &str) -> Option<Camera> {
+        match s {
+            "left" => Some(Camera::Left),
+            "right" => Some(Camera::Right),
+            _ => None,
+        }
+    }
+
+    /// The driver's stage name on its rows. The left camera's is the run's
+    /// own `driver`, the name every committed row carries; the right's
+    /// names itself.
+    pub fn driver_stage(self) -> &'static str {
+        match self {
+            Camera::Left => "driver",
+            Camera::Right => "cam1-driver",
+        }
+    }
+
+    /// The detector stage that reads this camera's frames.
+    pub fn camdet_stage(self) -> &'static str {
+        match self {
+            Camera::Left => "camdet",
+            Camera::Right => "camdet-right",
+        }
+    }
+
+    /// That stage's input edge, the queue `--cap` and `--policy` size.
+    pub fn camdet_edge(self) -> &'static str {
+        match self {
+            Camera::Left => "cam0->camdet",
+            Camera::Right => "cam1->camdet",
+        }
+    }
+
+    /// The detections' producer edge, and the stream they travel on.
+    pub fn det_edge(self) -> &'static str {
+        match self {
+            Camera::Left => "cam_det",
+            Camera::Right => "cam1_det",
+        }
+    }
+
+    /// See [`Camera::det_edge`].
+    pub fn det_stream(self) -> StreamId {
+        match self {
+            Camera::Left => StreamId::CAM_DET,
+            Camera::Right => StreamId::CAM1_DET,
+        }
+    }
+
+    /// The edge the detections cross into the fusion on.
+    pub fn track_edge(self) -> &'static str {
+        match self {
+            Camera::Left => "cam_det->track",
+            Camera::Right => "cam1_det->track",
+        }
+    }
+}
+
+/// `<root>/<date>/<drive>/<image dir>` of one camera.
+pub fn camera_dir(root: &Path, date: &str, drive: &str, cam: Camera) -> PathBuf {
+    root.join(date).join(drive).join(cam.dir_name())
+}
+
+/// Whether the drive carries the right camera at all: `image_03/` either
+/// exists or it does not, on the terms the lidar is detected.
+pub fn has_right_camera(root: &Path, date: &str, drive: &str) -> bool {
+    camera_dir(root, date, drive, Camera::Right).is_dir()
+}
+
 /// One decoded frame, before it becomes an Arrow batch.
 pub struct Decoded {
     /// Interleaved RGB8, `width * height * 3` bytes. This buffer becomes the
@@ -48,9 +175,11 @@ pub struct Decoded {
     pub decode_ns: i64,
 }
 
-/// The cam0 replayer for one drive.
+/// The replayer of one colour camera of one drive.
 pub struct Cam0Driver {
-    /// KITTI data root holding `<date>/<drive>/image_02`.
+    /// Which camera: `image_02` (the default) or `image_03`.
+    pub cam: Camera,
+    /// KITTI data root holding `<date>/<drive>/<image dir>`.
     pub root: PathBuf,
     /// Capture date directory, e.g. `2011_09_26`.
     pub date: String,
@@ -80,7 +209,8 @@ pub enum MissingLevel {
     Date,
     /// The date exists but holds no such drive (`--drive` is wrong).
     Drive,
-    /// The drive exists but has no `image_02/`, so it carries no cam0 stream.
+    /// The drive exists but has no directory for this camera, so it carries
+    /// no stream of it.
     Image02,
 }
 
@@ -202,12 +332,17 @@ impl std::fmt::Display for DriverError {
                             "the drive {} exists but has ",
                             root.join(date).join(drive).display()
                         )?;
-                        f.write_str("no image_02/ directory, so it carries no cam0 stream. ")?;
+                        write!(
+                            f,
+                            "no {}/ directory, so it carries no stream of that camera. ",
+                            dir.file_name()
+                                .map(|n| n.to_string_lossy())
+                                .unwrap_or_default()
+                        )?;
                     }
                 }
-                f.write_str(
-                    "Run `cargo run --release -- drives` to list every drive under the data root. ",
-                )?;
+                f.write_str("Run `pipes drives` to list every drive under the data root. ")?;
+                f.write_str("In Docker, `docker compose run --rm fetch` downloads the drives. ")?;
                 f.write_str("Pass --kitti-root <dir>, or set PIPES_KITTI_ROOT once; ")?;
                 f.write_str("the default expects the dataset beside the checkout")
             }
@@ -266,7 +401,17 @@ impl Cam0Driver {
     ///
     /// One `read_dir` of `data`: no per-frame `stat`.
     pub fn open(root: &Path, date: &str, drive: &str) -> Result<Self, DriverError> {
-        let dir = root.join(date).join(drive).join("image_02");
+        Cam0Driver::open_camera(root, date, drive, Camera::Left)
+    }
+
+    /// [`Cam0Driver::open`] for either camera.
+    pub fn open_camera(
+        root: &Path,
+        date: &str,
+        drive: &str,
+        cam: Camera,
+    ) -> Result<Self, DriverError> {
+        let dir = camera_dir(root, date, drive, cam);
         if !dir.is_dir() {
             return Err(drive_missing(root, date, drive, dir));
         }
@@ -280,6 +425,7 @@ impl Cam0Driver {
         })?;
         let index = FrameIndex::read(&dir.join("data"), "png", &ts_path, &lines)?;
         Ok(Cam0Driver {
+            cam,
             root: root.to_path_buf(),
             date: date.to_string(),
             drive: drive.to_string(),
@@ -339,10 +485,7 @@ impl Cam0Driver {
     }
 
     fn dir(&self) -> PathBuf {
-        self.root
-            .join(&self.date)
-            .join(&self.drive)
-            .join("image_02")
+        camera_dir(&self.root, &self.date, &self.drive, self.cam)
     }
 
     /// `dir/data/{i:010}.png`.
@@ -442,7 +585,7 @@ impl Cam0Driver {
             let decoded = match self.decode(usize::try_from(frame).unwrap_or(usize::MAX)) {
                 Ok(d) => d,
                 Err(e) => {
-                    eprintln!("cam0: {e}");
+                    eprintln!("{}: {e}", self.cam.edge());
                     miss("decode_error", admit);
                     continue;
                 }
@@ -452,7 +595,7 @@ impl Cam0Driver {
                 match build_cam0_batch(decoded.pixels, decoded.width, decoded.height, schema) {
                     Ok(x) => x,
                     Err(e) => {
-                        eprintln!("cam0: frame {seq}: {e}");
+                        eprintln!("{}: frame {seq}: {e}", self.cam.edge());
                         miss("frame_error", admit);
                         continue;
                     }
@@ -466,7 +609,7 @@ impl Cam0Driver {
             }
             let arrival = now();
             admit(DriverEvent::Sample(Sample {
-                stream: StreamId::CAM0,
+                stream: self.cam.stream(),
                 seq,
                 arrival_seq: 0,
                 parent: None,
@@ -606,6 +749,7 @@ mod tests {
 
     fn driver(timestamps: Vec<SensorTime>) -> Cam0Driver {
         Cam0Driver {
+            cam: Camera::Left,
             root: PathBuf::from("root"),
             date: "d".to_string(),
             drive: "drv".to_string(),

@@ -79,6 +79,32 @@
 //!   column ([`CAMERA_ONLY_BYTES`]), never as a track record with a
 //!   made-up range.
 //!
+//! # The second camera: a class only where the two agree
+//!
+//! With the right camera's detections too ([`RightHalf`], [`Fuser::confirm`])
+//! the left association above is a proposal rather than a verdict. Each
+//! track the left camera matched is projected into the right image and
+//! matched there by the same rule; it keeps [`POPULATION_FUSED`] only when a
+//! right detection of the **same class** overlaps it by more than half, and
+//! otherwise becomes [`POPULATION_ONE_CAMERA`]: a class one camera gave and
+//! the other did not confirm, kept in lanes 21-24 for the record and trusted
+//! nowhere -- the answer takes a class from a fused track only. A track the
+//! left camera missed and the right one matched is one-camera too, with the
+//! right detection's class and confidence in lanes 23-24 and `-1` in lane 21,
+//! because the index would name a box in the wrong frame.
+//!
+//! The camera-only population is then held to the same standard: a left
+//! detection no track matched is kept only when the right camera's unmatched
+//! detections hold its stereo partner -- the same class, on the same image
+//! rows (the two cameras are rectified to one plane, so a point is on the
+//! same row in both), a box of about the same size, and further left in the
+//! right image by a disparity a real depth allows ([`stereo_match`]). The
+//! disparity is a depth: [`crate::calib::stereo_range_m`], written in the
+//! row's eighth lane, so a camera-only object has a range after all -- from
+//! the two cameras, never from a track it does not have. Left detections with
+//! no partner are dropped from the answer and counted
+//! ([`FusePlan::camera_only_dropped`]).
+//!
 //! # The populations
 //!
 //! Every lidar record and every detection of the paired frame ends in exactly
@@ -87,9 +113,10 @@
 //!
 //! | code | population | what it is |
 //! |---|---|---|
-//! | [`POPULATION_FUSED`] 1 | fused | a fresh in-frame track and a detection, one to one |
+//! | [`POPULATION_FUSED`] 1 | fused | a fresh in-frame track and a detection, one to one -- and, with the right camera, a detection of the same class in both |
 //! | [`POPULATION_LIDAR_ONLY`] 2 | lidar-only | a track, when a detector's output was associated and nothing matched it -- out of frame, coasted, or in frame and unmatched |
 //! | [`POPULATION_CAMERA_ONLY`] 3 | camera-only | a detection no track matched; never a record, always a `camera_only` row |
+//! | [`POPULATION_ONE_CAMERA`] 4 | one-camera | with the right camera: a track one camera matched and the other did not confirm |
 //! | [`POPULATION_UNFUSED`] 0 | unfused | a track, when there was no detector output at all (`--detector off`) |
 //!
 //! 0 and 2 are kept apart because they are different claims: "the camera
@@ -102,7 +129,7 @@ use arrow::buffer::{Buffer, MutableBuffer, OffsetBuffer, ScalarBuffer};
 use arrow::datatypes::{DataType, Field, FieldRef, Float32Type};
 use arrow::record_batch::RecordBatch;
 
-use crate::calib::ImageBox;
+use crate::calib::{Calib, ImageBox};
 use crate::camdet::DetView;
 use crate::track::{
     track_image_box, LANE_CLASS_ID, LANE_CONFIDENCE, LANE_DET_INDEX, LANE_FUSE_IOU,
@@ -119,6 +146,9 @@ pub const POPULATION_FUSED: u32 = 1;
 pub const POPULATION_LIDAR_ONLY: u32 = 2;
 /// Population code: a detection no track matched.
 pub const POPULATION_CAMERA_ONLY: u32 = 3;
+/// Population code: a track one camera matched and the other did not
+/// confirm. Only with the right camera; see the module docs.
+pub const POPULATION_ONE_CAMERA: u32 = 4;
 
 /// The spelling of a population code, as the run's output and `summary.json`
 /// use it.
@@ -128,6 +158,7 @@ pub fn population_name(p: u32) -> &'static str {
         POPULATION_FUSED => "fused",
         POPULATION_LIDAR_ONLY => "lidar_only",
         POPULATION_CAMERA_ONLY => "camera_only",
+        POPULATION_ONE_CAMERA => "one_camera",
         _ => "unknown",
     }
 }
@@ -137,13 +168,17 @@ pub fn population_name(p: u32) -> &'static str {
 /// the rule itself is the provenance.
 pub const FUSION_RULE: &str = "fresh in-frame track box vs detection box, IoU > 1/2 (3 I > A_t + A_d), greedy on (IoU desc, track id, detection index), one to one";
 
+/// The agreement and stereo rules in one line, beside [`FUSION_RULE`], for
+/// `run.json` and `summary.json` when the right camera runs.
+pub const STEREO_RULE: &str = "a fused track keeps its class only when a right-camera detection of the same class overlaps its right-image box by more than half, else it is one_camera; a track the left camera missed takes the right camera's match as one_camera; a camera-only detection is kept only with a stereo partner: same class, box rows within 8 px, widths within 30 %, the right box 0 to 192 px further left (depth 2 m or more), greedy on (row difference asc, left index, right index); its range is the baseline over the disparity; a sweep with one camera's frame only keeps that camera's matches as one_camera and its camera-only detections without a range; a sweep with the right frame only is answered from it";
+
 /// f32 lanes in one `camera_only` row. See [`CAMERA_ONLY_BYTES`].
-pub const CAMERA_ONLY_VALUES: i32 = 7;
+pub const CAMERA_ONLY_VALUES: i32 = 8;
 
 /// [`CAMERA_ONLY_VALUES`] as a `usize`.
 pub const CAMERA_ONLY_LANES: usize = CAMERA_ONLY_VALUES as usize;
 
-/// Bytes in one `camera_only` row: 7 f32 lanes.
+/// Bytes in one `camera_only` row: 8 f32 lanes.
 ///
 /// | lane | field |
 /// |---|---|
@@ -151,10 +186,93 @@ pub const CAMERA_ONLY_LANES: usize = CAMERA_ONLY_VALUES as usize;
 /// | 1 | `class_id` -- an index into [`crate::camdet::COCO_CLASSES`] |
 /// | 2 | `confidence` |
 /// | 3-6 | `x0, y0, x1, y1` -- its box in the frame, pixels |
+/// | 7 | `range_m` -- its depth from the two cameras' disparity when the right camera saw it too ([`stereo_match`]), else 0 |
 ///
-/// No distance, velocity or age: the camera measured none, and this module
-/// does not invent them.
-pub const CAMERA_ONLY_BYTES: usize = 28;
+/// No velocity or age, and no distance from one camera alone: the camera
+/// measured none, and this module does not invent them. The range in lane 7
+/// is a measurement the two cameras made together.
+pub const CAMERA_ONLY_BYTES: usize = 32;
+
+/// Lane 7 of a `camera_only` row: the stereo range, or 0.
+pub const CAMERA_ONLY_LANE_RANGE: usize = 7;
+
+/// The nearest an object a camera-only detection names can be, metres: the
+/// largest disparity the stereo match accepts is the baseline over this.
+pub const STEREO_MIN_RANGE_M: f64 = 2.0;
+
+/// How far apart, in pixels, the top edges and the bottom edges of a stereo
+/// pair may be. The two cameras are rectified to one image plane, so a
+/// point is on the same row in both; the detector's box edges are not that
+/// exact.
+pub const STEREO_ROW_TOL_PX: f32 = 8.0;
+
+/// The most one box of a stereo pair may be wider than the other.
+pub const STEREO_WIDTH_RATIO_MAX: f32 = 1.3;
+
+/// What the stereo rules need from the two cameras' calibration.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Stereo {
+    /// `left.baseline_term - right.baseline_term`: the pixel-metres a
+    /// disparity divides into a depth ([`crate::calib::stereo_range_m`]).
+    pub px_m: f64,
+    /// The largest disparity a real object can have: `px_m` over
+    /// [`STEREO_MIN_RANGE_M`].
+    pub max_disparity_px: f32,
+}
+
+impl Stereo {
+    /// From the two cameras' calibration.
+    pub fn of(left: &Calib, right: &Calib) -> Stereo {
+        let px_m = left.baseline_term - right.baseline_term;
+        Stereo {
+            px_m,
+            max_disparity_px: (px_m / STEREO_MIN_RANGE_M) as f32,
+        }
+    }
+
+    /// The depth of a disparity, or `None` for one that is not positive.
+    pub fn range_m(&self, disparity_px: f32) -> Option<f32> {
+        (disparity_px > 0.0 && self.px_m > 0.0)
+            .then(|| (self.px_m / f64::from(disparity_px)) as f32)
+    }
+}
+
+/// The right camera's half of one sweep's association.
+pub struct RightHalf<'a> {
+    /// What the detector found in the right frame paired with the sweep.
+    pub dets: &'a DetView<'a>,
+    /// The two cameras' baseline, for the camera-only stereo match.
+    pub stereo: Stereo,
+}
+
+/// Whether a left detection and a right one are one object seen from the
+/// two cameras, and if so the cost of the pairing (the row and width
+/// differences, pixels) and the disparity: the same class, both box rows
+/// within [`STEREO_ROW_TOL_PX`], widths within [`STEREO_WIDTH_RATIO_MAX`],
+/// and the right box further left by 0 to `max_disparity_px`. Positive
+/// tests throughout, so a NaN refuses.
+pub fn stereo_match(
+    left: &DetView<'_>,
+    li: usize,
+    right: &DetView<'_>,
+    ri: usize,
+    stereo: &Stereo,
+) -> Option<(f32, f32)> {
+    if left.class_id[li] != right.class_id[ri] {
+        return None;
+    }
+    let dy0 = (left.y0[li] - right.y0[ri]).abs();
+    let dy1 = (left.y1[li] - right.y1[ri]).abs();
+    let (wl, wr) = (left.x1[li] - left.x0[li], right.x1[ri] - right.x0[ri]);
+    let rows_agree = dy0 <= STEREO_ROW_TOL_PX && dy1 <= STEREO_ROW_TOL_PX;
+    let widths_agree = wl > 0.0
+        && wr > 0.0
+        && wl <= wr * STEREO_WIDTH_RATIO_MAX
+        && wr <= wl * STEREO_WIDTH_RATIO_MAX;
+    let disparity = (left.x0[li] + left.x1[li]) * 0.5 - (right.x0[ri] + right.x1[ri]) * 0.5;
+    let depth_allows = disparity > 0.0 && disparity <= stereo.max_disparity_px;
+    (rows_agree && widths_agree && depth_allows).then_some((dy0 + dy1 + (wl - wr).abs(), disparity))
+}
 
 /// Intersection over union of a track's image box and a detection's, when it
 /// is above one half -- the association's threshold -- and `None` otherwise.
@@ -205,6 +323,49 @@ pub struct FusePlan {
     pub crowded: u32,
     /// Sum of the fused pairs' IoU, for the mean.
     pub iou_sum: f64,
+    /// Whether the right camera's detections were associated too
+    /// ([`Fuser::confirm`]). The six below are 0 when not.
+    pub right_ran: bool,
+    /// Detections in the paired right frame.
+    pub right_detections: u32,
+    /// Left-fused tracks the right camera confirmed, same class: these stay
+    /// [`POPULATION_FUSED`], and `fused` is reduced to them.
+    pub confirmed: u32,
+    /// Tracks one camera matched and the other did not confirm
+    /// ([`POPULATION_ONE_CAMERA`]): the left-fused tracks not confirmed, plus
+    /// `right_only`.
+    pub one_camera: u32,
+    /// Tracks the left camera missed and the right one matched.
+    pub right_only: u32,
+    /// Left camera-only detections with a stereo partner, kept with a range.
+    pub stereo_matched: u32,
+    /// Left camera-only detections with none, dropped.
+    pub camera_only_dropped: u32,
+    /// Left-fused tracks the right camera did not confirm: the part of
+    /// `one_camera` that came off `fused`. With [`FusePlan::demoted`], all
+    /// of them.
+    pub unconfirmed: u32,
+    /// Whether the set was associated with one camera's frame in a run that
+    /// has two ([`demote_to_one_camera`]): every match is one camera's.
+    pub demoted: bool,
+}
+
+/// The second camera's pass when the sweep has no frame of it, in a run
+/// that has two: one camera's match is not an agreement, so every fused
+/// track becomes [`POPULATION_ONE_CAMERA`] -- keeping the class and the
+/// confidence it was matched with, for the record -- and `plan` says so.
+/// The camera-only detections stay as the one camera left them, with no
+/// range. Allocates nothing.
+pub fn demote_to_one_camera(rows: &mut [[f32; TRACK_LANES]], plan: &mut FusePlan) {
+    for t in rows.iter_mut() {
+        if t[LANE_POPULATION] == POPULATION_FUSED as f32 {
+            t[LANE_POPULATION] = POPULATION_ONE_CAMERA as f32;
+        }
+    }
+    plan.demoted = true;
+    plan.unconfirmed = plan.fused;
+    plan.one_camera = plan.fused;
+    plan.fused = 0;
 }
 
 /// Reusable scratch for the association, so the only per-sample allocation
@@ -222,6 +383,27 @@ pub struct Fuser {
     det_taken: Vec<bool>,
     /// Candidate tracks per detection, only for [`FusePlan::contested`].
     det_cands: Vec<u32>,
+    /// Each track's box in the right image, filled by the caller
+    /// ([`Fuser::right_boxes`]) before [`Fuser::confirm`].
+    right_boxes: Vec<Option<ImageBox>>,
+    /// Candidate `(IoU, track id, track row, right detection index)` above
+    /// the threshold, in the right image.
+    right_pairs: Vec<(f32, u32, u32, u32)>,
+    /// Whether each right detection has been taken this association.
+    right_taken: Vec<bool>,
+    /// Whether each track row has been settled by the right pass.
+    row_done: Vec<bool>,
+    /// `(cost, left index, right index)` of the stereo candidates among the
+    /// camera-only detections.
+    stereo_pairs: Vec<(f32, u32, u32)>,
+    /// Each left detection's stereo range, 0 where it has no partner.
+    ranges: Vec<f32>,
+    /// `(the lidar's distance to the near face, to the box's centre, the
+    /// stereo range)` of every track both cameras confirmed this
+    /// association: the second sensor's range beside the first's, for the
+    /// run to compare. Both lidar figures, because a silhouette's disparity
+    /// is nearer the object's centre than its near face.
+    checks: Vec<(f32, f32, f32)>,
 }
 
 impl Fuser {
@@ -253,11 +435,237 @@ impl Fuser {
         true
     }
 
+    /// Makes room for the right camera's half: `tracks` rows against
+    /// `right_dets` detections, and the stereo match of `dets` left
+    /// detections against them. **Outside the measured window**, on
+    /// [`Fuser::reserve`]'s terms, and returns whether it had to allocate.
+    pub fn reserve_right(&mut self, tracks: usize, dets: usize, right_dets: usize) -> bool {
+        let pairs = tracks.saturating_mul(right_dets);
+        let stereo = dets.saturating_mul(right_dets);
+        let grew = self.right_boxes.capacity() < tracks
+            || self.right_pairs.capacity() < pairs
+            || self.right_taken.capacity() < right_dets
+            || self.row_done.capacity() < tracks
+            || self.stereo_pairs.capacity() < stereo
+            || self.ranges.capacity() < dets
+            || self.checks.capacity() < tracks;
+        if !grew {
+            return false;
+        }
+        self.right_boxes.clear();
+        self.right_pairs.clear();
+        self.right_taken.clear();
+        self.row_done.clear();
+        self.stereo_pairs.clear();
+        self.ranges.clear();
+        self.checks.clear();
+        self.right_boxes.reserve(tracks);
+        self.right_pairs.reserve(pairs);
+        self.right_taken.reserve(right_dets);
+        self.row_done.reserve(tracks);
+        self.stereo_pairs.reserve(stereo);
+        self.ranges.reserve(dets);
+        self.checks.reserve(tracks);
+        true
+    }
+
     /// Bytes the scratch currently holds.
     pub fn scratch_bytes(&self) -> usize {
         self.pairs.capacity() * std::mem::size_of::<(f32, u32, u32, u32)>()
             + self.det_taken.capacity()
             + self.det_cands.capacity() * 4
+            + self.right_boxes.capacity() * std::mem::size_of::<Option<ImageBox>>()
+            + self.right_pairs.capacity() * std::mem::size_of::<(f32, u32, u32, u32)>()
+            + self.right_taken.capacity()
+            + self.row_done.capacity()
+            + self.stereo_pairs.capacity() * std::mem::size_of::<(f32, u32, u32)>()
+            + self.ranges.capacity() * 4
+            + self.checks.capacity() * std::mem::size_of::<(f32, f32, f32)>()
+    }
+
+    /// The slot for each of `n` track rows' box in the right image, cleared,
+    /// for the caller to fill before [`Fuser::confirm`]. Allocates nothing
+    /// once [`Fuser::reserve_right`] has been called for `n` tracks.
+    pub fn right_boxes(&mut self, n: usize) -> &mut [Option<ImageBox>] {
+        self.right_boxes.clear();
+        self.right_boxes.resize(n, None);
+        &mut self.right_boxes
+    }
+
+    /// Each left detection's stereo range after [`Fuser::confirm`]: 0 where
+    /// it has no partner, which is also every detection that was fused.
+    pub fn stereo_ranges(&self) -> &[f32] {
+        &self.ranges
+    }
+
+    /// Whether each right detection was taken, by a track or as a stereo
+    /// partner.
+    pub fn right_taken(&self) -> &[bool] {
+        &self.right_taken
+    }
+
+    /// `(the lidar's distance to the near face, to the box's centre, the
+    /// stereo range)` of every track both cameras confirmed in the last
+    /// [`Fuser::confirm`]: the disparity of the two boxes' centres, turned
+    /// into a depth. Two sensors measuring one object, for the run to
+    /// compare.
+    pub fn stereo_checks(&self) -> &[(f32, f32, f32)] {
+        &self.checks
+    }
+
+    /// The right camera's pass, after [`Fuser::associate`] and after
+    /// [`Fuser::right_boxes`] has been filled: holds every left-fused track
+    /// to a right detection of the same class, gives the right camera's
+    /// matches to the tracks the left missed, and finds the camera-only
+    /// detections' stereo partners. Rewrites lanes 21-25 where it changes
+    /// its mind, and `plan` with it. See the module docs.
+    ///
+    /// Allocates nothing once [`Fuser::reserve_right`] has been called.
+    pub fn confirm(
+        &mut self,
+        rows: &mut [[f32; TRACK_LANES]],
+        left: &DetView<'_>,
+        right: &RightHalf<'_>,
+        plan: &mut FusePlan,
+    ) {
+        let dets = right.dets;
+        let n = dets.len();
+        plan.right_ran = true;
+        plan.right_detections = n as u32;
+        self.right_pairs.clear();
+        self.right_taken.clear();
+        self.right_taken.resize(n, false);
+        self.row_done.clear();
+        self.row_done.resize(rows.len(), false);
+        self.checks.clear();
+        for (ri, t) in rows.iter().enumerate() {
+            if t[8] != 0.0 {
+                continue;
+            }
+            let Some(tb) = self.right_boxes.get(ri).copied().flatten() else {
+                continue;
+            };
+            let pop = t[LANE_POPULATION];
+            let fused = pop == POPULATION_FUSED as f32;
+            if !fused && pop != POPULATION_LIDAR_ONLY as f32 {
+                continue;
+            }
+            // A right-only match is for a track the left camera MISSED, not
+            // one outside the left frame: the record's image box, and the
+            // picture the answer is drawn on, are the left camera's, and a
+            // class on a track with no box there is a record the far end
+            // refuses. The right image sees further right than the left.
+            if !fused && track_image_box(t).is_none() {
+                continue;
+            }
+            for di in 0..n {
+                // A fused track's confirmation must be the same class; a
+                // track the left camera missed takes any.
+                if fused && dets.class_id[di] as f32 != t[LANE_CLASS_ID] {
+                    continue;
+                }
+                let d = ImageBox {
+                    x0: dets.x0[di],
+                    y0: dets.y0[di],
+                    x1: dets.x1[di],
+                    y1: dets.y1[di],
+                };
+                if let Some(iou) = fused_iou(&tb, &d) {
+                    self.right_pairs
+                        .push((iou, t[6] as u32, ri as u32, di as u32));
+                }
+            }
+        }
+        self.right_pairs
+            .sort_unstable_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)).then(a.3.cmp(&b.3)));
+        for &(iou, _, ri, di) in &self.right_pairs {
+            let (ri, di) = (ri as usize, di as usize);
+            if self.right_taken[di] || self.row_done[ri] {
+                continue;
+            }
+            self.right_taken[di] = true;
+            self.row_done[ri] = true;
+            let t = &mut rows[ri];
+            if t[LANE_POPULATION] == POPULATION_FUSED as f32 {
+                plan.confirmed += 1;
+                // One object in both cameras: the two boxes' centres apart
+                // is its disparity, and so a second range, which the run
+                // reads against the lidar's distance to its near face.
+                let li = t[LANE_DET_INDEX];
+                if li >= 0.0 {
+                    let li = li as usize;
+                    if let (Some(&lx0), Some(&lx1)) = (left.x0.get(li), left.x1.get(li)) {
+                        let disparity = 0.5 * ((lx0 + lx1) - (dets.x0[di] + dets.x1[di]));
+                        if let Some(range) = right.stereo.range_m(disparity) {
+                            self.checks.push((t[9], 0.5 * (t[9] + t[12]), range));
+                        }
+                    }
+                }
+            } else {
+                // The right camera alone: its class and confidence, and no
+                // index, because the index would name a box in the left frame.
+                t[LANE_DET_INDEX] = -1.0;
+                t[LANE_FUSE_IOU] = iou;
+                t[LANE_CLASS_ID] = dets.class_id[di] as f32;
+                t[LANE_CONFIDENCE] = dets.confidence[di];
+                t[LANE_POPULATION] = POPULATION_ONE_CAMERA as f32;
+                plan.right_only += 1;
+            }
+        }
+        // A left match the right camera did not confirm keeps its lanes for
+        // the record and loses the population that would let the answer
+        // trust them.
+        for (ri, t) in rows.iter_mut().enumerate() {
+            if t[LANE_POPULATION] == POPULATION_FUSED as f32 && !self.row_done[ri] {
+                t[LANE_POPULATION] = POPULATION_ONE_CAMERA as f32;
+            }
+        }
+        plan.unconfirmed = plan.fused - plan.confirmed;
+        plan.one_camera = plan.unconfirmed + plan.right_only;
+        plan.fused = plan.confirmed;
+
+        // The camera-only detections' stereo partners, among what neither
+        // pass took on either side.
+        let left_n = left.len();
+        self.ranges.clear();
+        self.ranges.resize(left_n, 0.0);
+        self.stereo_pairs.clear();
+        for li in 0..left_n {
+            if self.det_taken.get(li).copied().unwrap_or(false) {
+                continue;
+            }
+            for di in 0..n {
+                if self.right_taken[di] {
+                    continue;
+                }
+                if let Some((cost, _)) = stereo_match(left, li, dets, di, &right.stereo) {
+                    self.stereo_pairs.push((cost, li as u32, di as u32));
+                }
+            }
+        }
+        self.stereo_pairs
+            .sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+        let mut left_unmatched = (0..left_n)
+            .filter(|&li| !self.det_taken.get(li).copied().unwrap_or(false))
+            .count() as u32;
+        for &(_, li, di) in &self.stereo_pairs {
+            let (li, di) = (li as usize, di as usize);
+            if self.right_taken[di] || self.ranges[li] > 0.0 {
+                continue;
+            }
+            let Some((_, disparity)) = stereo_match(left, li, dets, di, &right.stereo) else {
+                continue;
+            };
+            let Some(range) = right.stereo.range_m(disparity) else {
+                continue;
+            };
+            self.right_taken[di] = true;
+            self.ranges[li] = range;
+            plan.stereo_matched += 1;
+            left_unmatched -= 1;
+        }
+        plan.camera_only_dropped = left_unmatched;
+        plan.camera_only = plan.stereo_matched;
     }
 
     /// Whether each detection of the last association was fused: the
@@ -364,7 +772,9 @@ pub fn camera_only_data_type() -> DataType {
 
 /// The one-row `camera_only` column: every detection of `dets` that `taken`
 /// says was NOT fused, in detection order, or an empty list when there are no
-/// detections at all (`None`).
+/// detections at all (`None`). With `ranges`, the right camera ran, and only
+/// the detections with a stereo partner -- a range above 0 -- are kept, each
+/// with its range in lane 7.
 ///
 /// Its own buffer, allocated at exactly its size: a handful of rows a frame,
 /// never the track buffer, so the address the zero-copy proof follows is
@@ -372,17 +782,20 @@ pub fn camera_only_data_type() -> DataType {
 pub fn build_camera_only(
     dets: Option<&DetView<'_>>,
     taken: &[bool],
+    ranges: Option<&[f32]>,
 ) -> Result<ArrayRef, SweepError> {
     let n_dets = dets.map_or(0, |d| d.len());
-    let n = (0..n_dets)
-        .filter(|&i| !taken.get(i).copied().unwrap_or(false))
-        .count();
+    let keep = |i: usize| {
+        !taken.get(i).copied().unwrap_or(false)
+            && ranges.is_none_or(|r| r.get(i).copied().unwrap_or(0.0) > 0.0)
+    };
+    let n = (0..n_dets).filter(|&i| keep(i)).count();
     let mut buf = MutableBuffer::from_len_zeroed(n * CAMERA_ONLY_BYTES);
     if let Some(d) = dets {
         let out = buf.typed_data_mut::<f32>();
         let mut w = 0usize;
         for i in 0..d.len() {
-            if taken.get(i).copied().unwrap_or(false) {
+            if !keep(i) {
                 continue;
             }
             let lane = &mut out[w * CAMERA_ONLY_LANES..][..CAMERA_ONLY_LANES];
@@ -393,6 +806,7 @@ pub fn build_camera_only(
             lane[4] = d.y0[i];
             lane[5] = d.x1[i];
             lane[6] = d.y1[i];
+            lane[CAMERA_ONLY_LANE_RANGE] = ranges.map_or(0.0, |r| r.get(i).copied().unwrap_or(0.0));
             w += 1;
         }
     }
@@ -480,6 +894,326 @@ mod tests {
         (p, f.taken().to_vec())
     }
 
+    /// The 2011_09_26 rig: 384.38 pixel-metres between the two cameras.
+    fn rig() -> Stereo {
+        Stereo {
+            px_m: 384.38148,
+            max_disparity_px: (384.38148 / STEREO_MIN_RANGE_M) as f32,
+        }
+    }
+
+    /// A box as the right camera sees it: `d` pixels further left.
+    fn shifted(bx: ImageBox, d: f32) -> ImageBox {
+        b(bx.x0 - d, bx.y0, bx.x1 - d, bx.y1)
+    }
+
+    /// [`fuse`], then the right camera's pass with every track's right box
+    /// its left box shifted by `shift` (the disparity of a track at one
+    /// depth), and the camera-only column built from the result.
+    fn fuse_both(
+        rows: &mut [[f32; TRACK_LANES]],
+        dets: &[Det],
+        right: &[Det],
+        shift: f32,
+    ) -> (FusePlan, Vec<[f32; CAMERA_ONLY_LANES]>, Vec<bool>) {
+        let lb = batch(dets);
+        let lv = cam_det_view(&lb).unwrap();
+        let rb = batch(right);
+        let rv = cam_det_view(&rb).unwrap();
+        let mut f = Fuser::new();
+        f.reserve(rows.len(), lv.len());
+        f.reserve_right(rows.len(), lv.len(), rv.len());
+        let mut p = f.associate(rows, &lv);
+        let boxes = f.right_boxes(rows.len());
+        for (slot, t) in boxes.iter_mut().zip(rows.iter()) {
+            *slot = track_image_box(t).map(|bx| shifted(bx, shift));
+        }
+        let half = RightHalf {
+            dets: &rv,
+            stereo: rig(),
+        };
+        f.confirm(rows, &lv, &half, &mut p);
+        let col = build_camera_only(Some(&lv), f.taken(), Some(f.stereo_ranges())).unwrap();
+        let lanes: &[f32] = col
+            .as_list::<i64>()
+            .values()
+            .as_fixed_size_list()
+            .values()
+            .as_primitive::<Float32Type>()
+            .values();
+        let (co, _) = lanes.as_chunks::<CAMERA_ONLY_LANES>();
+        (p, co.to_vec(), f.right_taken().to_vec())
+    }
+
+    /// With the right camera, a class survives only where both cameras gave
+    /// it: a confirmed car stays fused, a car the right camera calls a
+    /// bicycle becomes one-camera with the left's class kept for the record,
+    /// and a track only the right camera matched is one-camera with the
+    /// right's class and no left index.
+    #[test]
+    fn a_class_is_kept_only_where_the_right_camera_agrees() {
+        let mut rows = vec![
+            trk(7.0, b(100.0, 100.0, 200.0, 200.0)),
+            trk(8.0, b(400.0, 100.0, 450.0, 200.0)),
+            trk(9.0, b(800.0, 100.0, 900.0, 200.0)),
+        ];
+        let shift = 40.0;
+        let dets = [
+            det(b(105.0, 102.0, 198.0, 205.0), 2, 0.91, 0), // car, on track 7
+            det(b(402.0, 98.0, 452.0, 199.0), 0, 0.74, 1),  // person, on track 8
+        ];
+        let right = [
+            det(shifted(b(105.0, 102.0, 198.0, 205.0), shift), 2, 0.88, 0), // car on 7: agrees
+            det(shifted(b(402.0, 98.0, 452.0, 199.0), shift), 1, 0.70, 1), // bicycle on 8: disagrees
+            det(shifted(b(805.0, 101.0, 895.0, 199.0), shift), 2, 0.66, 2), // car on 9: right only
+        ];
+        let (p, co, right_taken) = fuse_both(&mut rows, &dets, &right, shift);
+        assert!(p.right_ran);
+        assert_eq!(
+            (p.fused, p.confirmed, p.one_camera, p.right_only),
+            (1, 1, 2, 1),
+            "{p:?}"
+        );
+        assert_eq!(track_population(&rows[0]), POPULATION_FUSED);
+        let (index, iou, class, conf) = track_detection(&rows[0]).unwrap();
+        assert_eq!((index, class, conf), (0, 2, 0.91));
+        assert!(iou > 0.5, "{iou}");
+        // The left's class is kept in the lanes, and the population says it
+        // was not confirmed; the reader that hands out classes refuses it.
+        assert_eq!(track_population(&rows[1]), POPULATION_ONE_CAMERA);
+        assert_eq!(rows[1][LANE_CLASS_ID], 0.0);
+        assert_eq!(rows[1][LANE_DET_INDEX], 1.0);
+        assert_eq!(track_detection(&rows[1]), None);
+        // The right camera's own match: its class, its confidence, no index.
+        assert_eq!(track_population(&rows[2]), POPULATION_ONE_CAMERA);
+        assert_eq!(rows[2][LANE_DET_INDEX], -1.0);
+        assert_eq!(rows[2][LANE_CLASS_ID], 2.0);
+        assert_eq!(rows[2][LANE_CONFIDENCE], 0.66);
+        // The bicycle could not confirm a person, so nothing took it.
+        assert_eq!(right_taken, [true, false, true]);
+        // Nothing was camera-only on either side.
+        assert!(co.is_empty());
+        assert_eq!(
+            (p.stereo_matched, p.camera_only_dropped, p.camera_only),
+            (0, 0, 0)
+        );
+    }
+
+    /// A detection no track matched is kept only with a stereo partner, and
+    /// then carries the range the two cameras agree on; one without is
+    /// dropped and counted.
+    #[test]
+    fn a_camera_only_detection_needs_a_stereo_partner_and_gets_a_range() {
+        let mut rows = vec![trk(7.0, b(100.0, 100.0, 200.0, 200.0))];
+        let dets = [
+            det(b(105.0, 102.0, 198.0, 205.0), 2, 0.91, 0), // car, on track 7
+            det(b(600.0, 100.0, 650.0, 150.0), 1, 0.42, 1), // bicycle, nowhere: 10 m away
+            det(b(900.0, 200.0, 960.0, 300.0), 0, 0.55, 2), // person, nowhere, no partner
+        ];
+        let right = [
+            det(shifted(b(105.0, 102.0, 198.0, 205.0), 40.0), 2, 0.88, 0), // confirms the car
+            det(b(560.0, 103.0, 612.0, 152.0), 1, 0.40, 1), // the bicycle, 38.4 px left (10 m)
+            det(b(300.0, 200.0, 360.0, 300.0), 2, 0.50, 2), // a car no left detection has
+        ];
+        let (p, co, right_taken) = fuse_both(&mut rows, &dets, &right, 40.0);
+        assert_eq!((p.fused, p.confirmed), (1, 1));
+        assert_eq!(
+            (p.stereo_matched, p.camera_only_dropped, p.camera_only),
+            (1, 1, 1),
+            "{p:?}"
+        );
+        assert_eq!(co.len(), 1);
+        let r = &co[0];
+        assert_eq!((r[0], r[1], r[2]), (1.0, 1.0, 0.42));
+        assert_eq!(&r[3..7], &[600.0, 100.0, 650.0, 150.0]);
+        // Centres 625 and 586: 39 px apart, 9.86 m.
+        assert!(
+            (r[CAMERA_ONLY_LANE_RANGE] - 384.38148 / 39.0).abs() < 1e-3,
+            "{}",
+            r[7]
+        );
+        assert_eq!(right_taken, [true, true, false]);
+        // Without the right camera the same column keeps both, with no range.
+        let (_, taken) = fuse(&mut rows.clone(), &dets);
+        let lb = batch(&dets);
+        let lv = cam_det_view(&lb).unwrap();
+        let col = build_camera_only(Some(&lv), &taken, None).unwrap();
+        assert_eq!(col.as_list::<i64>().value(0).len(), 2);
+    }
+
+    /// A sweep with one camera's frame in a run that has two: the matches
+    /// stay in the lanes, for the record, and lose the population the
+    /// answer trusts; the plan says every one of them is one camera's.
+    #[test]
+    fn without_the_second_frame_every_match_is_one_camera_s() {
+        let mut rows = vec![
+            trk(7.0, b(100.0, 100.0, 200.0, 200.0)),
+            trk(8.0, b(400.0, 100.0, 500.0, 200.0)),
+        ];
+        let dets = [
+            det(b(105.0, 102.0, 198.0, 205.0), 2, 0.91, 0),
+            det(b(900.0, 200.0, 960.0, 300.0), 0, 0.55, 1),
+        ];
+        let (mut p, taken) = fuse(&mut rows, &dets);
+        assert_eq!((p.fused, p.camera_only), (1, 1));
+        demote_to_one_camera(&mut rows, &mut p);
+        assert!(p.demoted);
+        assert_eq!((p.fused, p.unconfirmed, p.one_camera), (0, 1, 1));
+        assert_eq!(p.camera_only, 1, "the camera-only detection is kept");
+        assert_eq!(track_population(&rows[0]), POPULATION_ONE_CAMERA);
+        assert_eq!(
+            (
+                rows[0][LANE_DET_INDEX],
+                rows[0][LANE_CLASS_ID],
+                rows[0][LANE_CONFIDENCE]
+            ),
+            (0.0, 2.0, 0.91),
+            "the match is kept for the record"
+        );
+        assert_eq!(track_detection(&rows[0]), None, "and is not a fused one");
+        assert_eq!(track_population(&rows[1]), POPULATION_LIDAR_ONLY);
+        // The camera-only column is the one camera's, with no range.
+        let lb = batch(&dets);
+        let lv = cam_det_view(&lb).unwrap();
+        let col = build_camera_only(Some(&lv), &taken, None).unwrap();
+        assert_eq!(col.as_list::<i64>().value(0).len(), 1);
+    }
+
+    /// Every track both cameras confirm gives the run a second range: the
+    /// boxes' centres 40 px apart on a track whose near face the lidar put
+    /// at 9.5 m is 9.6 m by stereo.
+    #[test]
+    fn a_confirmed_track_has_a_stereo_range_to_check_the_lidar_s_against() {
+        let mut rows = vec![trk(7.0, b(100.0, 100.0, 200.0, 200.0))];
+        rows[0][9] = 9.5;
+        let dets = [det(b(105.0, 102.0, 198.0, 205.0), 2, 0.91, 0)];
+        let right = [det(
+            shifted(b(105.0, 102.0, 198.0, 205.0), 40.0),
+            2,
+            0.88,
+            0,
+        )];
+        let lb = batch(&dets);
+        let lv = cam_det_view(&lb).unwrap();
+        let rb = batch(&right);
+        let rv = cam_det_view(&rb).unwrap();
+        let mut f = Fuser::new();
+        f.reserve(rows.len(), lv.len());
+        f.reserve_right(rows.len(), lv.len(), rv.len());
+        let mut p = f.associate(&mut rows, &lv);
+        let boxes = f.right_boxes(rows.len());
+        boxes[0] = Some(shifted(b(100.0, 100.0, 200.0, 200.0), 40.0));
+        let half = RightHalf {
+            dets: &rv,
+            stereo: rig(),
+        };
+        f.confirm(&mut rows, &lv, &half, &mut p);
+        assert_eq!((p.confirmed, p.unconfirmed, p.demoted), (1, 0, false));
+        let checks = f.stereo_checks();
+        assert_eq!(checks.len(), 1);
+        assert_eq!((checks[0].0, checks[0].1), (9.5, 4.75));
+        assert!((checks[0].2 - 384.38148 / 40.0).abs() < 1e-3, "{checks:?}");
+    }
+
+    /// A track outside the left frame is not the right camera's to match
+    /// alone: its record would carry a class and no box on the picture the
+    /// answer is drawn on. One inside it, which the left camera missed, is.
+    #[test]
+    fn a_right_only_match_needs_the_track_in_the_left_frame() {
+        let mut rows = vec![
+            trk(7.0, b(100.0, 100.0, 200.0, 200.0)),
+            trk(8.0, b(0.0, 0.0, 0.0, 0.0)),
+        ];
+        let dets: [Det; 0] = [];
+        let right = [
+            det(b(60.0, 102.0, 160.0, 198.0), 2, 0.9, 0),
+            det(b(1100.0, 100.0, 1200.0, 200.0), 2, 0.9, 1),
+        ];
+        let lb = batch(&dets);
+        let lv = cam_det_view(&lb).unwrap();
+        let rb = batch(&right);
+        let rv = cam_det_view(&rb).unwrap();
+        let mut f = Fuser::new();
+        f.reserve(rows.len(), lv.len());
+        f.reserve_right(rows.len(), lv.len(), rv.len());
+        let mut p = f.associate(&mut rows, &lv);
+        let boxes = f.right_boxes(rows.len());
+        boxes[0] = Some(b(60.0, 100.0, 160.0, 200.0));
+        // Track 8 is beyond the left frame's right edge and inside the right
+        // frame.
+        boxes[1] = Some(b(1100.0, 100.0, 1200.0, 200.0));
+        let half = RightHalf {
+            dets: &rv,
+            stereo: rig(),
+        };
+        f.confirm(&mut rows, &lv, &half, &mut p);
+        assert_eq!((p.right_only, p.one_camera), (1, 1), "{p:?}");
+        assert_eq!(track_population(&rows[0]), POPULATION_ONE_CAMERA);
+        assert_eq!(track_population(&rows[1]), POPULATION_LIDAR_ONLY);
+        assert_eq!(f.right_taken(), [true, false]);
+    }
+
+    /// The stereo rules, one at a time: the right box must be on the same
+    /// rows, about the same width, the same class, and to the LEFT by no
+    /// more than the nearest allowed depth's disparity.
+    #[test]
+    fn a_stereo_pair_is_the_same_rows_the_same_width_the_same_class_and_to_the_left() {
+        let stereo = rig();
+        let left_box = b(600.0, 100.0, 650.0, 150.0);
+        let l = batch(&[det(left_box, 1, 0.5, 0)]);
+        let lv = cam_det_view(&l).unwrap();
+        let try_right = |d: Det| {
+            let rb = batch(&[d]);
+            let rv = cam_det_view(&rb).unwrap();
+            stereo_match(&lv, 0, &rv, 0, &stereo)
+        };
+        let ok = try_right(det(b(560.0, 104.0, 612.0, 146.0), 1, 0.5, 0)).unwrap();
+        assert!(
+            (ok.1 - 39.0).abs() < 1e-6 && (ok.0 - (4.0 + 4.0 + 2.0)).abs() < 1e-6,
+            "{ok:?}"
+        );
+        // A different class, a box on other rows, a box twice the width, a
+        // box to the RIGHT, and one further left than 2 m allows.
+        assert_eq!(
+            try_right(det(b(560.0, 104.0, 612.0, 146.0), 2, 0.5, 0)),
+            None
+        );
+        assert_eq!(
+            try_right(det(b(560.0, 120.0, 612.0, 170.0), 1, 0.5, 0)),
+            None
+        );
+        assert_eq!(
+            try_right(det(b(500.0, 100.0, 612.0, 150.0), 1, 0.5, 0)),
+            None
+        );
+        assert_eq!(
+            try_right(det(b(640.0, 100.0, 690.0, 150.0), 1, 0.5, 0)),
+            None
+        );
+        assert_eq!(
+            try_right(det(b(380.0, 100.0, 430.0, 150.0), 1, 0.5, 0)),
+            None
+        );
+        // The rig's own numbers: 54 cm at 721.5 px is 192 px at 2 m.
+        let r = Stereo::of(&calib(44.85728), &calib(-339.5242));
+        assert!((r.px_m - 384.38148).abs() < 1e-5);
+        assert!((r.max_disparity_px - 192.19) < 0.01);
+        assert_eq!(r.range_m(0.0), None);
+        assert!((r.range_m(38.438_15).unwrap() - 10.0).abs() < 1e-4);
+    }
+
+    /// A calibration with only the baseline term set: what [`Stereo::of`]
+    /// reads.
+    fn calib(baseline_term: f64) -> Calib {
+        Calib {
+            cam: crate::cam0::Camera::Left,
+            m: [[0.0; 4]; 3],
+            width: 1242,
+            height: 375,
+            baseline_term,
+        }
+    }
+
     /// The threshold is one half, exactly, and the divide-free test agrees
     /// with the divided one on both sides of it.
     #[test]
@@ -533,11 +1267,15 @@ mod tests {
         assert_eq!(track_population(&rows[2]), POPULATION_LIDAR_ONLY);
         assert_eq!(rows[2][LANE_DET_INDEX], -1.0);
         // The one left over is the camera-only row, with no range.
-        let co = build_camera_only(Some(&cam_det_view(&batch(&dets)).unwrap()), &taken).unwrap();
+        let co =
+            build_camera_only(Some(&cam_det_view(&batch(&dets)).unwrap()), &taken, None).unwrap();
         let rb = RecordBatch::try_from_iter([("camera_only", co)]).unwrap();
         let rows_co = camera_only_rows(&rb);
         assert_eq!(rows_co.len(), 1);
-        assert_eq!(rows_co[0], [2.0, 1.0, 0.42, 600.0, 100.0, 650.0, 150.0]);
+        assert_eq!(
+            rows_co[0],
+            [2.0, 1.0, 0.42, 600.0, 100.0, 650.0, 150.0, 0.0]
+        );
     }
 
     /// A coasted track and an out-of-frame track are never candidates: their
@@ -618,7 +1356,7 @@ mod tests {
         assert!(p.ran);
         assert_eq!((p.detections, p.candidates, p.fused), (0, 1, 0));
         assert_eq!(track_population(&rows[0]), POPULATION_LIDAR_ONLY);
-        let co = build_camera_only(None, &[]).unwrap();
+        let co = build_camera_only(None, &[], None).unwrap();
         assert_eq!(co.len(), 1, "one list per sample");
         let rb = RecordBatch::try_from_iter([("camera_only", co)]).unwrap();
         assert!(camera_only_rows(&rb).is_empty());

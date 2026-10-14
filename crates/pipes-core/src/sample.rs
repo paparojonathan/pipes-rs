@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::clock::{HostTime, Tov};
 
 /// Identifies a stream: cam0=0, lidar=1, oxts=2, lidar_det=3, cam_det=4,
-/// ego=5, tracks=6, lidar_obj=7.
+/// ego=5, tracks=6, lidar_obj=7, cam1=8, cam1_det=9, pillar_det=10.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct StreamId(pub u8);
 
@@ -16,7 +16,8 @@ impl StreamId {
     pub const CAM0: StreamId = StreamId(0);
     /// Lidar point cloud (phase 2).
     pub const LIDAR: StreamId = StreamId(1);
-    /// OXTS GPS/IMU rows (phase 2).
+    /// OXTS GPS/IMU rows: the vehicle's own speed, heading and turn rate,
+    /// one row per frame (`oxts/data`).
     pub const OXTS: StreamId = StreamId(2);
     /// A stream **derived from** a lidar scan by a pipeline stage rather than
     /// read off a sensor: the voxel-reduced cloud `reduce` produces.
@@ -108,6 +109,21 @@ impl StreamId {
     /// shape it consumed: a detection is not a point, so `velo_xyzr` does not
     /// read it and must not.
     pub const LIDAR_OBJ: StreamId = StreamId(7);
+    /// Right colour camera (`image_03`): the second camera, 54 cm to the
+    /// right of the first, which fires on the same trigger. The fusion
+    /// reads it beside the first and takes a class only where the two
+    /// agree.
+    pub const CAM1: StreamId = StreamId(8);
+    /// The right camera's half of the fusion: what the frozen detector found
+    /// in each of its frames, on the terms of [`StreamId::CAM_DET`].
+    pub const CAM1_DET: StreamId = StreamId(9);
+    /// The lidar detector's half of the fusion: the boxes the frozen
+    /// PointPillars network found in each raw sweep (`pillars` stage), with
+    /// a class and a heading each, on the terms of [`StreamId::CAM_DET`]: one
+    /// sample per sweep the stage finished, derived from the sweep and
+    /// carrying its seq, so the fusion pairs it by number rather than by
+    /// time.
+    pub const PILLAR_DET: StreamId = StreamId(10);
 
     /// Human-readable name; `"unknown"` for ids outside the table.
     pub fn name(self) -> &'static str {
@@ -120,6 +136,9 @@ impl StreamId {
             StreamId::EGO => "ego",
             StreamId::TRACKS => "tracks",
             StreamId::LIDAR_OBJ => "lidar_obj",
+            StreamId::CAM1 => "cam1",
+            StreamId::CAM1_DET => "cam1_det",
+            StreamId::PILLAR_DET => "pillar_det",
             _ => "unknown",
         }
     }

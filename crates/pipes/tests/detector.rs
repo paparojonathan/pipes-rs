@@ -34,7 +34,8 @@ use tempfile::TempDir;
 
 mod common;
 use common::{
-    assert_ok, dropped_on, evidence, line_with, pipes, run_dir, stderr, stdout, summary, u64_of,
+    assert_ok, dropped_on, evidence, line_with, pipes, run_dir, run_json, stderr, stdout, summary,
+    u64_of,
 };
 
 const N: usize = 8;
@@ -305,6 +306,62 @@ fn two_real_runs_feed_the_fusion_the_same_detections() {
     println!("{} frames compared, byte-identical", common.len());
 }
 
+/// **The second runtime, as a test.** The same drive through ONNX Runtime on
+/// the CPU (`--detector-backend ort`) and through tract: two implementations
+/// of one network should find the same objects, and they do not have to find
+/// the same bytes -- their arithmetic differs in the last places, and a score
+/// at the threshold can fall either side of it. Pinned: the `ort` run says
+/// what it ran on, every invariant holds, and over the drive it finds within
+/// a few per cent as many detections and fused tracks as tract. Needs the
+/// library `ORT_DYLIB_PATH` names, which the test image carries.
+#[test]
+#[ignore = "needs drive_0005, models/ and ONNX Runtime at ORT_DYLIB_PATH"]
+fn onnx_runtime_on_the_cpu_finds_what_tract_finds() {
+    let cwd = TempDir::new().unwrap();
+    let model = cwd.path().join(MODEL_FILE);
+    std::fs::create_dir_all(model.parent().unwrap()).unwrap();
+    std::fs::copy(repo_root().join(MODEL_FILE), &model)
+        .unwrap_or_else(|e| panic!("{}: {e}", repo_root().join(MODEL_FILE).display()));
+    let mut totals = std::collections::BTreeMap::new();
+    for (name, backend) in [("tract", "tract"), ("ort", "ort")] {
+        let o = Command::new(env!("CARGO_BIN_EXE_pipes"))
+            .current_dir(cwd.path())
+            .args(["run", "--kitti-root"])
+            .arg(kitti_root())
+            .args(["--name", name, "--rerun", "null", "--dashboard", "off"])
+            .args(["--detector-backend", backend, "--right-camera", "off"])
+            .output()
+            .expect("spawn pipes");
+        assert!(
+            o.status.success(),
+            "{name}: exit {:?}\n{}\n{}",
+            o.status.code(),
+            String::from_utf8_lossy(&o.stdout),
+            String::from_utf8_lossy(&o.stderr)
+        );
+        let r = run_json(&cwd, name);
+        assert_eq!(r["detector_backend"], serde_json::json!(backend), "{r}");
+        let s = summary(&cwd, name);
+        assert_eq!(s["camera_detector"]["backend"], serde_json::json!(backend));
+        let t = s["lidar"]["reduce"]["detect"]["track"].clone();
+        totals.insert(
+            name,
+            (
+                u64_of(&s["camera_detector"], "detections"),
+                u64_of(&t["fusion"]["completed"], "fused"),
+                u64_of(&s["camera_detector"], "delivered"),
+            ),
+        );
+    }
+    let (td, tf, tn) = totals["tract"];
+    let (od, of, on) = totals["ort"];
+    assert_eq!((tn, on), (154, 154), "a frame was lost: {totals:?}");
+    let close = |a: u64, b: u64| (a as f64 - b as f64).abs() <= 0.03 * a.max(b) as f64;
+    assert!(close(td, od), "detections {td} (tract) vs {od} (ort)");
+    assert!(close(tf, of), "fused {tf} (tract) vs {of} (ort)");
+    println!("tract: {td} detections, {tf} fused; ort: {od} detections, {of} fused");
+}
+
 /// The fusion's sets of one run, by sweep: `(cam_seq, pair_age_ns,
 /// pair_outcome, the 26-lane tracks)`.
 #[allow(clippy::type_complexity)]
@@ -382,6 +439,9 @@ fn a_stale_camera_changes_the_camera_lanes_and_nothing_else() {
             .args(["run", "--kitti-root"])
             .arg(kitti_root())
             .args(["--name", name, "--rerun", "null", "--dashboard", "off"])
+            // One camera: these two experiments are about one camera's
+            // frames being late or lost, which the right camera answers.
+            .args(["--right-camera", "off"])
             .args(&extra)
             .output()
             .expect("spawn pipes");
@@ -512,6 +572,9 @@ fn slowing_the_detector_expires_exactly_the_frames_it_lost() {
             .args(["run", "--kitti-root"])
             .arg(kitti_root())
             .args(["--name", name, "--rerun", "null", "--dashboard", "off"])
+            // One camera: these two experiments are about one camera's
+            // frames being late or lost, which the right camera answers.
+            .args(["--right-camera", "off"])
             .args(&extra)
             .output()
             .expect("spawn pipes");

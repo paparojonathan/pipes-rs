@@ -110,6 +110,17 @@ pub mod entity {
     pub const LIDAR_TRACKS: &str = "lidar/tracks";
     /// The one object the answer flags, as a gold wireframe among the tracks.
     pub const LIDAR_ANSWER: &str = "lidar/answer";
+    /// What the frozen lidar detector found in the sweep and is sure enough
+    /// of to name a track by, drawn by `pillars` on the sweep it ran on: a
+    /// violet wireframe each, turned to its heading, labelled `class score`
+    /// -- the lidar's own names, beside the unnamed clusters of
+    /// `lidar/detections`, before any track takes one, and all the way
+    /// round the vehicle when the detector looks behind as well.
+    pub const LIDAR_NAMED: &str = "lidar/named";
+    /// The corridor the answer is measured against: the path the vehicle is
+    /// on, half the vehicle's width either side, as two grey lines on the
+    /// road ahead. What "in the path" means, where it can be seen.
+    pub const LIDAR_PATH: &str = "lidar/path";
     /// Root of the answer's series (`answer/ttc_s`, `answer/ttc_warn`) and
     /// its sentence (`answer/line`, one per sweep: the answer's, or why the
     /// sweep had none).
@@ -169,27 +180,33 @@ pub mod entity {
 /// Every real queue this binary can open, in chain order, as the edge name
 /// the evidence rows carry: what the health lanes are fed from
 /// ([`queue_lane`]), and the table the chart tests check their edges against.
-pub const EDGES: [&str; 12] = [
+pub const EDGES: [&str; 16] = [
     "cam0->proc",
     "cam0->rerun",
     "cam0->camdet",
+    "cam1->camdet",
     "velo->cloud",
     "velo->reduce",
+    "velo->pillars",
     "det->cloud",
     "det->detect",
     "obj->sink",
     "obj->track",
     "cam_det->track",
+    "cam1_det->track",
+    "pillar_det->track",
     "track->state",
     "state->sink",
 ];
 
-/// The two sensor drivers' pseudo-edges: rows for frames and sweeps that were
-/// admitted, or never produced at all. The only producer rows that can be
-/// `Missing` -- a derived stream's producer row (`det`, `obj`, `track`,
-/// `state`, `cam_det`) is structurally always Delivered -- and so the only
-/// rows that can say a frame is absent in the source.
-pub const ADMISSION_EDGES: [&str; 2] = ["cam0", "velo"];
+/// The sensor drivers' pseudo-edges that the dashboard draws from: rows for
+/// frames and sweeps that were admitted, or never produced at all. The only
+/// producer rows that can be `Missing` -- a derived stream's producer row
+/// (`det`, `obj`, `track`, `state`, `cam_det`) is structurally always
+/// Delivered -- and so the only rows that can say a frame is absent in the
+/// source. (The GPS/IMU's rows are the same kind, and have no lane or
+/// picture to mark.)
+pub const ADMISSION_EDGES: [&str; 3] = ["cam0", "cam1", "velo"];
 
 /// One link of the byte chain, a row of [`entity::BYTES_TABLE`].
 #[derive(Clone, Copy, Debug)]
@@ -238,38 +255,52 @@ pub const CHAIN_BYTES: [ChainLink; 5] = [
         name: "answer",
         edge: "state->sink",
         built_by: "state",
-        step: "state: one 68-byte record per track",
+        step: "state: one 76-byte record per track",
     },
 ];
 
 /// The pipeline graph's nodes, as `(id, x, y)` in the graph's own units:
-/// the two sensors on the left, the admission, the camera stage above the
-/// lidar's two, the fusion, the answer's state, and the answer on the right.
-/// Fixed positions, every force off, so the picture is the same every sweep.
-/// The rows are 70 apart, not 40: the camera, the admission and the camera
-/// stage carry a second line saying what they do, and at 40 a two-line
-/// label met its diagonal neighbour's.
-pub const GRAPH_NODES: [(&str, f32, f32); 9] = [
+/// the sensors on the left (the right camera above the left, the GPS/IMU
+/// between the cameras and the lidar), the admission, the camera stage
+/// above the lidar's two, the fusion, the answer's state, and the answer on
+/// the right. Fixed positions, every force off, so the picture is the same
+/// every sweep. The rows are 70 apart, not 40: the cameras, the GPS/IMU,
+/// the admission and the camera stage carry a second line saying what they
+/// do, and at 40 a two-line label met its diagonal neighbour's. The right
+/// camera's node is drawn only on a run that has one
+/// ([`crate::record::Bounds`]).
+pub const GRAPH_NODES: [(&str, f32, f32); 12] = [
+    ("cam1", 0.0, -140.0),
     ("cam0", 0.0, -70.0),
+    ("oxts", 0.0, 0.0),
     ("velo", 0.0, 70.0),
     ("admit", 120.0, 0.0),
     ("camera", 240.0, -70.0),
     ("reduce", 240.0, 70.0),
     ("detect", 360.0, 70.0),
+    // The lidar detector, below the lidar's chain: a second consumer of
+    // the raw sweep, drawn only on a run that has it.
+    ("pillars", 300.0, 140.0),
     ("track", 480.0, 0.0),
     ("state", 600.0, 0.0),
     ("answer", 720.0, 0.0),
 ];
 
 /// The pipeline graph's edges, directed, between [`GRAPH_NODES`] ids.
-pub const GRAPH_EDGES: [(&str, &str); 9] = [
+pub const GRAPH_EDGES: [(&str, &str); 14] = [
+    ("cam1", "admit"),
     ("cam0", "admit"),
+    ("oxts", "admit"),
     ("velo", "admit"),
     ("admit", "camera"),
     ("admit", "reduce"),
+    // The GPS/IMU rows' one consumer is the fusion.
+    ("admit", "track"),
+    ("admit", "pillars"),
     ("camera", "track"),
     ("reduce", "detect"),
     ("detect", "track"),
+    ("pillars", "track"),
     ("track", "state"),
     ("state", "answer"),
 ];
@@ -310,7 +341,7 @@ pub struct ReadyDot {
 /// answer, and are left out of both. Numbered in the order they are drawn,
 /// last on top, so the answer's gold sits over `detect`'s teal when the two
 /// coincide.
-pub const READY_DOTS: [ReadyDot; 4] = [
+pub const READY_DOTS: [ReadyDot; 5] = [
     ReadyDot {
         leaf: "1_camera_done",
         clock: StageClock::Camera,
@@ -321,13 +352,22 @@ pub const READY_DOTS: [ReadyDot; 4] = [
         clock: StageClock::Edge("velo->reduce"),
         overview: false,
     },
+    // The lidar detector, on a run that has it: the third thing the fusion
+    // waits for, drawn in the detectors' violet, between the lidar's two
+    // stages in chain order. A violet diamond above the answer's gold is a
+    // sweep the fusion waited for its names, or did without them.
     ReadyDot {
-        leaf: "3_detect_done",
+        leaf: "3_pillars_done",
+        clock: StageClock::Edge("velo->pillars"),
+        overview: true,
+    },
+    ReadyDot {
+        leaf: "4_detect_done",
         clock: StageClock::Edge("det->detect"),
         overview: true,
     },
     ReadyDot {
-        leaf: "4_answer_done",
+        leaf: "5_answer_done",
         clock: StageClock::Edge("state->sink"),
         overview: true,
     },
@@ -341,11 +381,13 @@ pub const PAIRING_DONE_TOP: f64 = 2.5;
 
 /// The zoom on the sweep's end, in sweep periods after the sweep ended: the
 /// edges a ready dot is held at, from 0.15 of a period before the end -- a
-/// camera frame ready that early was ready in time -- to 0.25 after it,
-/// past the healthy run's answer at about a tenth. A dot outside is drawn at
-/// the edge, as "this early or earlier" or "this late or later"; the pairing
-/// plot above says how late.
-pub const SWEEP_END_ZOOM: (f64, f64) = (-0.15, 0.25);
+/// camera frame ready that early was ready in time -- to 0.45 after it,
+/// past the healthy run's answer: at about a tenth without the lidar
+/// detector, and at about a third with it looking both ways, where 0.25 held
+/// every answer on the plot's top edge. A dot outside is drawn at the edge,
+/// as "this early or earlier" or "this late or later"; the pairing plot
+/// above says how late.
+pub const SWEEP_END_ZOOM: (f64, f64) = (-0.15, 0.45);
 
 /// The zoom's reference line, `after_sweep/sweep_end`: the sweep's end, at
 /// 0. The pairing plot's own `sweep_end` leaf, and so its style.
@@ -370,8 +412,9 @@ pub const TTC_WARN_S: f64 = 3.0;
 pub const TTC_TOP_S: f64 = 10.0;
 
 /// The fusion's populations in the camera frame, under `tracks/count/`,
-/// logged on EVERY answer by `state-sink`: records the camera confirmed,
-/// in-frame records only the lidar holds, and detections only the camera
+/// logged on EVERY answer by `state-sink`: records the cameras confirmed,
+/// in-frame records only the lidar holds (a track one camera matched and
+/// the other did not confirm counts here), and detections only the camera
 /// holds. Styled through `record::series_archetype`, like every leaf.
 pub const TRACK_COUNT_LEAVES: [&str; 3] = ["fused", "lidar_only", "camera_only"];
 
@@ -461,6 +504,8 @@ pub fn entities() -> Vec<String> {
         entity::LIDAR_DETECTIONS,
         entity::LIDAR_TRACKS,
         entity::LIDAR_ANSWER,
+        entity::LIDAR_NAMED,
+        entity::LIDAR_PATH,
         entity::LOG_DROPS,
         entity::LOG_EVENTS,
         entity::BYTES_TABLE,
@@ -946,7 +991,7 @@ impl Builder<'_> {
 /// stage allocated to read it, 0 where it read in place. At the bottom every
 /// stage, the camera's and the lidar's, as a table: what it does, its median
 /// time per sample and what it hands on.
-fn pipeline_page(b: &mut Builder) -> Result<String, RecordingStreamError> {
+fn pipeline_page(b: &mut Builder, bounds: &Bounds) -> Result<String, RecordingStreamError> {
     let graph = b.view(
         "bytes-graph",
         "Graph",
@@ -956,13 +1001,17 @@ fn pipeline_page(b: &mut Builder) -> Result<String, RecordingStreamError> {
     )?;
     // Wide enough for the two-line labels at the left edge, whose second
     // line runs about 80 units either side of a node at x = 0, and tall
-    // enough for the rows at +-70.
+    // enough for the rows at +-70 -- and for the right camera's row above
+    // them, on a run that has one.
+    let top = if bounds.right_camera { -165.0 } else { -95.0 };
+    // And for the lidar detector's row below them, on a run that has one.
+    let bottom = if bounds.lidar_detector { 165.0 } else { 95.0 };
     b.prop(
         &graph,
         "VisualBounds2D",
         &VisualBounds2D::new(Range2D {
             x_range: Range1D([-100.0, 820.0]),
-            y_range: Range1D([-95.0, 95.0]),
+            y_range: Range1D([top, bottom]),
         }),
     )?;
     // Every force off: the nodes stay where they are put, the same every
@@ -1067,15 +1116,28 @@ fn demo_page(b: &mut Builder, bounds: &Bounds) -> Result<String, RecordingStream
         &[answer("ttc_s"), answer("ttc_warn")],
         Some((0.0, TTC_TOP_S)),
     )?;
+    // The lidar detector's diamond is on both plots on a run that has one,
+    // and the titles say so.
+    let (done, done_zoom) = if bounds.lidar_detector {
+        (
+            "Pairing (ms from sweep start) - photo (dot); done: camera, detect, lidar detector, answer (diamonds)",
+            "Sweep's end, zoomed (ms after it) - done: camera, reduce, detect, lidar detector, answer",
+        )
+    } else {
+        (
+            "Pairing (ms from sweep start) - photo (dot); done: camera, detect, answer (diamonds)",
+            "Sweep's end, zoomed (ms after it) - done: camera, reduce, detect, answer",
+        )
+    };
     let pairing = b.plot(
         "demo-pairing",
-        "Pairing (ms from sweep start) - photo (dot); done: camera, detect, answer (diamonds)",
+        done,
         &[q(&format!("{}/**", entity::PAIRING))],
         Some(pairing_range(bounds)),
     )?;
     let zoom = b.plot(
         "demo-sweep-end",
-        "Sweep's end, zoomed (ms after it) - done: camera, reduce, detect, answer",
+        done_zoom,
         &[q(&format!("{}/**", entity::AFTER_SWEEP))],
         Some(sweep_end_range(bounds)),
     )?;
@@ -1206,6 +1268,9 @@ fn build(
         &[q(entity::ANSWER_HEADLINE)],
     )?;
     let camera = camera_view(&mut b, bounds)?;
+    // The lidar detector's named boxes are in both views, among the tracks:
+    // a run without the detector logs nothing there, and the views show
+    // nothing of it.
     let lidar = b.lidar(
         "lidar",
         "Lidar - voxels, tracks",
@@ -1213,6 +1278,8 @@ fn build(
             q(entity::LIDAR_VOXELS),
             q(entity::LIDAR_TRACKS),
             q(entity::LIDAR_ANSWER),
+            q(entity::LIDAR_NAMED),
+            q(entity::LIDAR_PATH),
         ],
     )?;
     // The detections a track was built from are in the raw view but hidden:
@@ -1225,6 +1292,8 @@ fn build(
             q(entity::LIDAR_TRACKS),
             q(entity::LIDAR_ANSWER),
             q(entity::LIDAR_DETECTIONS),
+            q(entity::LIDAR_NAMED),
+            q(entity::LIDAR_PATH),
         ],
     )?;
     b.hide(&lidar_raw, entity::LIDAR_DETECTIONS)?;
@@ -1244,7 +1313,7 @@ fn build(
     // ---- right column: the demo and the auditor's pages -------------------
     let demo = demo_page(&mut b, bounds)?;
     let fusion = fusion_page(&mut b)?;
-    let pipeline = pipeline_page(&mut b)?;
+    let pipeline = pipeline_page(&mut b, bounds)?;
     let log = log_page(&mut b)?;
     let right = b.container(
         "right",
@@ -1335,7 +1404,7 @@ mod tests {
         }
         // The two sensor drivers and nothing else: a derived stream's producer
         // row cannot be Missing, so it can never say a frame is absent.
-        assert_eq!(ADMISSION_EDGES, ["cam0", "velo"]);
+        assert_eq!(ADMISSION_EDGES, ["cam0", "cam1", "velo"]);
         for e in ADMISSION_EDGES {
             assert!(!e.contains("->"), "{e} is a queue, not a driver");
             assert!(!EDGES.contains(&e));
@@ -1395,6 +1464,7 @@ mod tests {
             [
                 (StageClock::Camera, true),
                 (StageClock::Edge("velo->reduce"), false),
+                (StageClock::Edge("velo->pillars"), true),
                 (StageClock::Edge("det->detect"), true),
                 (StageClock::Edge("state->sink"), true),
             ]
@@ -1510,6 +1580,8 @@ mod tests {
             camera_edge: Some("cam0->camdet"),
             camera_delay_ms: 0,
             rate: Some(1.0),
+            right_camera: false,
+            lidar_detector: false,
         }
     }
 

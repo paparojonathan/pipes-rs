@@ -20,6 +20,7 @@ chrono.workspace = true
 image.workspace = true
 pipes-core.workspace = true
 tract-onnx.workspace = true
+ort.workspace = true
 sha2.workspace = true
 # Optional, and enabled by `testing`, because a downstream crate that turns the
 # feature on does NOT get this crate's dev-dependencies -- `testing.rs` would

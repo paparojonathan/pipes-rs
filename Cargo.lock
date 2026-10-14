@@ -2922,7 +2922,7 @@ dependencies = [
  "profiling",
  "ron",
  "serde",
- "smallvec",
+ "smallvec 1.16.1",
  "unicode-segmentation",
  "web-sys",
 ]
@@ -3270,7 +3270,7 @@ dependencies = [
  "self_cell",
  "serde",
  "skrifa",
- "smallvec",
+ "smallvec 1.16.1",
  "unicode-general-category",
  "unicode-segmentation",
  "vello_cpu",
@@ -3562,7 +3562,7 @@ dependencies = [
  "futures-core",
  "futures-lite",
  "pin-project",
- "smallvec",
+ "smallvec 1.16.1",
 ]
 
 [[package]]
@@ -3796,7 +3796,7 @@ dependencies = [
  "log",
  "peniko",
  "skrifa",
- "smallvec",
+ "smallvec 1.16.1",
  "vello_common",
 ]
 
@@ -4000,7 +4000,7 @@ dependencies = [
  "bitflags 2.13.2",
  "bytemuck",
  "read-fonts",
- "smallvec",
+ "smallvec 1.16.1",
 ]
 
 [[package]]
@@ -4232,7 +4232,7 @@ dependencies = [
  "httpdate",
  "itoa",
  "pin-project-lite",
- "smallvec",
+ "smallvec 1.16.1",
  "tokio",
  "want",
 ]
@@ -4350,7 +4350,7 @@ dependencies = [
  "icu_normalizer_data",
  "icu_properties",
  "icu_provider",
- "smallvec",
+ "smallvec 1.16.1",
  "zerovec",
 ]
 
@@ -4409,7 +4409,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3b0875f23caa03898994f6ddc501886a45c7d3d62d04d2d90788d47be1b1e4de"
 dependencies = [
  "idna_adapter",
- "smallvec",
+ "smallvec 1.16.1",
  "utf8_iter",
 ]
 
@@ -4812,7 +4812,7 @@ checksum = "c62026ae44756f8a599ba21140f350303d4f08dcdcc71b5ad9c9bb8128c13c62"
 dependencies = [
  "arrayvec",
  "euclid",
- "smallvec",
+ "smallvec 1.16.1",
 ]
 
 [[package]]
@@ -4824,7 +4824,7 @@ dependencies = [
  "arrayvec",
  "euclid",
  "polycool",
- "smallvec",
+ "smallvec 1.16.1",
 ]
 
 [[package]]
@@ -6097,6 +6097,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "ort"
+version = "2.0.0-rc.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1fa7e49bd669d32d7bc2a15ec540a527e7764aec722a45467814005725bcd721"
+dependencies = [
+ "libloading",
+ "ndarray 0.16.1",
+ "ort-sys",
+ "smallvec 2.0.0-alpha.10",
+ "tracing",
+]
+
+[[package]]
+name = "ort-sys"
+version = "2.0.0-rc.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e2aba9f5c7c479925205799216e7e5d07cc1d4fa76ea8058c60a9a30f6a4e890"
+dependencies = [
+ "pkg-config",
+]
+
+[[package]]
 name = "owo-colors"
 version = "4.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6127,7 +6149,7 @@ dependencies = [
  "cfg-if",
  "libc",
  "redox_syscall 0.5.18",
- "smallvec",
+ "smallvec 1.16.1",
  "windows-link",
 ]
 
@@ -6215,7 +6237,7 @@ dependencies = [
  "color",
  "kurbo 0.13.1",
  "linebender_resource_handle",
- "smallvec",
+ "smallvec 1.16.1",
 ]
 
 [[package]]
@@ -6417,6 +6439,7 @@ dependencies = [
  "arrow",
  "chrono",
  "image",
+ "ort",
  "pipes-core",
  "pipes-kitti",
  "sha2 0.10.9",
@@ -7177,7 +7200,7 @@ dependencies = [
  "re_ui",
  "re_viewer_context",
  "re_viewport_blueprint",
- "smallvec",
+ "smallvec 1.16.1",
 ]
 
 [[package]]
@@ -7219,7 +7242,7 @@ dependencies = [
  "macaw",
  "parking_lot",
  "re_byte_size_derive",
- "smallvec",
+ "smallvec 1.16.1",
  "vec1",
 ]
 
@@ -7412,7 +7435,7 @@ dependencies = [
  "re_viewer_context",
  "re_viewport_blueprint",
  "re_web",
- "smallvec",
+ "smallvec 1.16.1",
  "static_assertions",
 ]
 
@@ -8038,7 +8061,7 @@ dependencies = [
  "re_quota_channel",
  "re_tracing",
  "serde",
- "smallvec",
+ "smallvec 1.16.1",
  "sysinfo",
  "wasm-bindgen",
  "web-time",
@@ -8419,7 +8442,7 @@ dependencies = [
  "regex-lite",
  "serde",
  "slotmap",
- "smallvec",
+ "smallvec 1.16.1",
  "static_assertions",
  "stl_io",
  "thiserror 2.0.20",
@@ -8531,7 +8554,7 @@ dependencies = [
  "re_types_core",
  "re_video",
  "serde",
- "smallvec",
+ "smallvec 1.16.1",
  "thiserror 2.0.20",
  "tiff",
  "uuid",
@@ -8565,7 +8588,7 @@ dependencies = [
  "re_viewer_context",
  "re_viewport_blueprint",
  "serde",
- "smallvec",
+ "smallvec 1.16.1",
  "static_assertions",
 ]
 
@@ -8725,7 +8748,7 @@ dependencies = [
  "re_viewer_context",
  "re_viewport_blueprint",
  "serde",
- "smallvec",
+ "smallvec 1.16.1",
  "vec1",
 ]
 
@@ -8839,7 +8862,7 @@ dependencies = [
  "re_uri",
  "ron",
  "serde",
- "smallvec",
+ "smallvec 1.16.1",
  "strum 0.26.3",
  "strum_macros 0.26.4",
  "thiserror 2.0.20",
@@ -8902,7 +8925,7 @@ dependencies = [
  "scuffle-av1",
  "scuffle-bytes-util",
  "serde",
- "smallvec",
+ "smallvec 1.16.1",
  "thiserror 2.0.20",
  "tiff",
  "wasm-bindgen",
@@ -9093,7 +9116,7 @@ dependencies = [
  "re_viewer_context",
  "re_viewport_blueprint",
  "serde",
- "smallvec",
+ "smallvec 1.16.1",
  "thiserror 2.0.20",
  "vec1",
 ]
@@ -9218,7 +9241,7 @@ dependencies = [
  "re_view",
  "re_viewer_context",
  "re_viewport_blueprint",
- "smallvec",
+ "smallvec 1.16.1",
  "vec1",
 ]
 
@@ -9400,7 +9423,7 @@ dependencies = [
  "rfd",
  "serde",
  "slotmap",
- "smallvec",
+ "smallvec 1.16.1",
  "static_assertions",
  "strum_macros 0.26.4",
  "thiserror 2.0.20",
@@ -9457,7 +9480,7 @@ dependencies = [
  "re_ui",
  "re_viewer_context",
  "slotmap",
- "smallvec",
+ "smallvec 1.16.1",
  "thiserror 2.0.20",
 ]
 
@@ -10493,6 +10516,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "smallvec"
+version = "2.0.0-alpha.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "51d44cfb396c3caf6fbfd0ab422af02631b69ddd96d2eff0b0f0724f9024051b"
+
+[[package]]
 name = "smithay-client-toolkit"
 version = "0.19.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -11307,7 +11336,7 @@ checksum = "adbc64cba7137545b8044cb1fe9814f7aacf3c6b5f9b45be8bb5db538befdb26"
 dependencies = [
  "js-sys",
  "opentelemetry",
- "smallvec",
+ "smallvec 1.16.1",
  "tracing",
  "tracing-core",
  "tracing-log",
@@ -11338,7 +11367,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sharded-slab",
- "smallvec",
+ "smallvec 1.16.1",
  "thread_local",
  "tracing",
  "tracing-core",
@@ -11383,7 +11412,7 @@ dependencies = [
  "pastey",
  "rustfft",
  "serde",
- "smallvec",
+ "smallvec 1.16.1",
  "tract-data",
  "tract-linalg",
 ]
@@ -11410,7 +11439,7 @@ dependencies = [
  "num-integer",
  "num-traits",
  "parking_lot",
- "smallvec",
+ "smallvec 1.16.1",
  "string-interner",
 ]
 
@@ -11493,7 +11522,7 @@ dependencies = [
  "num-rational",
  "num-traits",
  "prost",
- "smallvec",
+ "smallvec 1.16.1",
  "tract-extra",
  "tract-hir",
  "tract-nnef",
@@ -11765,7 +11794,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "eab68b56840f69efb0fefbe3ab6661499217ffdc58e2eef7c3f6f69835386322"
 dependencies = [
  "serde",
- "smallvec",
+ "smallvec 1.16.1",
 ]
 
 [[package]]
@@ -11785,7 +11814,7 @@ dependencies = [
  "guillotiere",
  "log",
  "peniko",
- "smallvec",
+ "smallvec 1.16.1",
  "thiserror 2.0.20",
 ]
 
@@ -11941,7 +11970,7 @@ dependencies = [
  "downcast-rs 1.2.1",
  "rustix 1.1.5",
  "scoped-tls",
- "smallvec",
+ "smallvec 1.16.1",
  "wayland-sys",
 ]
 
@@ -12137,7 +12166,7 @@ dependencies = [
  "portable-atomic",
  "profiling",
  "raw-window-handle",
- "smallvec",
+ "smallvec 1.16.1",
  "static_assertions",
  "wasm-bindgen",
  "wasm-bindgen-futures",
@@ -12171,7 +12200,7 @@ dependencies = [
  "profiling",
  "raw-window-handle",
  "rustc-hash 1.1.0",
- "smallvec",
+ "smallvec 1.16.1",
  "thiserror 2.0.20",
  "wgpu-core-deps-apple",
  "wgpu-core-deps-emscripten",
@@ -12261,7 +12290,7 @@ dependencies = [
  "raw-window-handle",
  "raw-window-metal",
  "renderdoc-sys",
- "smallvec",
+ "smallvec 1.16.1",
  "static_assertions",
  "thiserror 2.0.20",
  "wasm-bindgen",

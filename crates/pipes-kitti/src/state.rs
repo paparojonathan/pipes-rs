@@ -25,7 +25,7 @@
 //! as a flag on the one record it named ([`Object::nearest_in_path`]).
 //!
 //! The honest consequence: **the last link barely shrinks the payload any
-//! more.** A record is smaller than a track (17 lanes against 26: the answer
+//! more.** A record is smaller than a track (19 lanes against 34: the answer
 //! drops the 3D box, the raw velocity and the association's detection index
 //! and IoU, and keeps the quantities a consumer acts on), so the answer is
 //! smaller than the tracks it came from and larger than the detections
@@ -56,27 +56,37 @@
 //!
 //! # What "in front of this vehicle" means, and where the number comes from
 //!
-//! A track counts as being in the vehicle's path when its bounding box
-//! overlaps a corridor of half-width [`CORRIDOR_HALF_WIDTH_M`] about the
-//! sensor's x axis. That half-width is **half the width of the recording
-//! vehicle**, a VW Passat B6 Variant at 1.82 m — not a lane width, not a
-//! margin, and not a number chosen by looking at how many objects it selects.
-//! The claim it supports is exactly "this object is in the space the car would
-//! drive through", and widening it to a lane would make the claim weaker while
+//! A track counts as being in the vehicle's path when it stands on a
+//! corridor of half-width [`CORRIDOR_HALF_WIDTH_M`] about **the path the
+//! vehicle is on** ([`crate::path`]): the arc its own forward speed and yaw
+//! rate put it on, with the vehicle's motion, and straight ahead without
+//! it. That half-width is **half the width of the recording vehicle**, a VW
+//! Passat B6 Variant at 1.82 m — not a lane width, not a margin, and not a
+//! number chosen by looking at how many objects it selects. The claim it
+//! supports is exactly "this object is in the space the car would drive
+//! through", and widening it to a lane would make the claim weaker while
 //! making the demo look busier.
 //!
-//! The test is on the **box**, not the centroid. A van whose centroid is 1.2 m
-//! off the axis still has a metre of itself in the corridor, and a chain that
-//! answered "nothing ahead" in that situation would be wrong in the one
-//! direction that matters.
+//! The corridor used to be straight ahead whatever the vehicle did, and the
+//! test used to be whether the track's box reached into it. On a drive that
+//! turns, that named the wrong thing: drive_0005's most urgent answer was a
+//! parked car beside a bend, while the cyclist on the road ahead went
+//! unflagged. [`crate::path`] has the measurement and the rule that
+//! replaced it: a track the lidar detector named is on the path when the
+//! detector's rectangle reaches the corridor, and every other track when
+//! its centroid lies in it -- because a cluster's box is the hull of
+//! whatever was connected, and round a bend it covers road the cluster
+//! stands beside.
 //!
 //! # What the distance is measured from, and to
 //!
-//! **From the lidar origin, to the near face of the object's box**
-//! (`bbox_min.x`), signed: it is the gap for anything ahead, and it is
-//! negative for a box that reaches behind the lidar origin — a car alongside,
-//! or one behind — where "the gap ahead" has no meaning and time to contact
-//! is 0 (below).
+//! **From the lidar origin, along the path, to the nearest corner of the
+//! object's own box**, signed: on a straight path that is the near face of
+//! the box (`bbox_min.x`), as it always was. It is the gap for anything
+//! ahead, and it is negative for a box that reaches behind the lidar origin
+//! — a car alongside, or one behind — where "the gap ahead" has no meaning
+//! and time to contact is 0 (below). Always the cluster's own box, measured
+//! points, whatever named the track.
 //!
 //! The near face rather than the centroid, because "the nearest obstacle is
 //! 12.3 m away" is a statement about the gap, and a centroid puts a car's
@@ -115,17 +125,22 @@
 //! guessed. Every distance here is therefore larger than the gap to the bumper
 //! by a fixed, unmeasured amount of order a metre.
 //!
-//! # Closing speed: uncompensated, and that is the correct choice here
+//! # Closing speed: the gap's rate, from whichever frame the velocity is in
 //!
-//! `closing = -vx` of the track, in the sensor frame, with no ego-motion
-//! correction — because the pipeline does not replay OXTS.
+//! The number answers "how fast is the gap shrinking": a parked car ahead of
+//! a vehicle doing 5 m/s is closing at 5 m/s, and that is what a driver, or a
+//! brake, needs to know.
 //!
-//! For most questions that is a defect. For **this** question it is the right
-//! quantity and a compensated one would be the wrong one: a parked car ahead
-//! of a vehicle doing 5 m/s is closing at 5 m/s, and that is what a driver,
-//! or a brake, needs to know. The number answers "how fast is the gap
-//! shrinking", not "is that object moving", and this module cannot answer the
-//! second.
+//! With the vehicle's own motion (the OXTS stream; the track batch's
+//! `ego_outcome` says so, [`crate::track::EgoHalf`]) a track's velocity is
+//! the object's own, over ground, and the closing speed is the vehicle's
+//! forward speed less the object's velocity **along the path where the
+//! object is** ([`crate::path::closing_mps`]): `closing = vf - v_along`.
+//! Right in a turn, where the uncompensated number read every wall as
+//! moving, and where a rider further round the bend moves partly sideways
+//! in the sensor's own axes. Without the vehicle's motion the velocity is
+//! relative to the vehicle, the path is straight, and `closing = -vx`, as
+//! it always was.
 //!
 //! Its **noise** is inherited from [`crate::track`] and is `0.20 m / age_s`:
 //! a voxel centroid carries 0.20 m of quantisation and the velocity is
@@ -134,8 +149,10 @@
 //! 0.72 s to about ±0.3 m/s. The age travels in every record, in seconds on
 //! the sensor clock, so that is readable rather than assumed.
 //!
-//! Time to contact is `distance / closing` only when **both** are positive —
-//! something ahead, and the gap shrinking — and 0 otherwise, rather than a
+//! Time to contact is the distance over the closing speed the track's age
+//! has established (the closing speed less [`unsure_of_age`]) only when
+//! **both** are positive — something ahead, and the gap shrinking — and 0
+//! otherwise, rather than a
 //! negative or infinite number: with every track in the answer, most records
 //! are beside or behind the vehicle or not closing at all.
 //!
@@ -170,38 +187,42 @@ use crate::calib::ImageBox;
 use crate::camdet::class_name;
 use crate::fuse::{
     build_camera_only, camera_only_data_type, POPULATION_FUSED, POPULATION_LIDAR_ONLY,
-    POPULATION_UNFUSED,
+    POPULATION_ONE_CAMERA, POPULATION_UNFUSED,
 };
+use crate::path::{closing_mps, place, Path};
+use crate::pillars::class_name as lidar_class_name;
 use crate::track::{
-    track_age_s, track_detection, track_image_box, track_population, track_since_seen_s,
-    TRACK_LANES,
+    track_age_s, track_class, track_image_box, track_lidar_class, track_population,
+    track_since_seen_s, TRACK_LANES,
 };
 use crate::velo::SweepError;
 
 /// f32 lanes in one answer record. See [`OBJECT_BYTES`].
-pub const OBJECT_VALUES: i32 = 17;
+pub const OBJECT_VALUES: i32 = 19;
 
 /// [`OBJECT_VALUES`] as a `usize`.
 pub const OBJECT_LANES: usize = OBJECT_VALUES as usize;
 
-/// Bytes in one answer record — one per track — as 17 f32 lanes:
+/// Bytes in one answer record — one per track — as 19 f32 lanes:
 ///
 /// | lane | field |
 /// |---|---|
 /// | 0 | `object_id` — the track's stable id, so an object can be followed across sweeps |
-/// | 1 | `distance_m` — lidar origin to the near face of the box, along x, signed; see the module docs |
-/// | 2 | `closing_mps` — positive is approaching; uncompensated, see the module docs |
-/// | 3 | `time_to_contact_s` — `distance / closing` when both are positive, else 0 |
+/// | 1 | `distance_m` — lidar origin to the nearest corner of the box, along the vehicle's path (the box's near face on a straight one), signed; see the module docs |
+/// | 2 | `closing_mps` — positive is approaching: the vehicle's forward speed less the object's along the path, or minus its velocity relative to the vehicle on a run without the vehicle's motion; see the module docs |
+/// | 3 | `time_to_contact_s` — the distance over the closing speed the track's age has established (lane 2 less [`unsure_of_age`]) when both are positive, else 0 |
 /// | 4 | `bearing_deg` — of the centroid, 0 straight ahead, positive to the left |
 /// | 5 | `age_s` — last seen minus first seen, seconds on the sensor clock; the closing speed's noise is `0.20 m / age_s` |
 /// | 6 | `since_seen_s` — seconds since the track was last seen: 0 on a fresh observation, one sweep on a coasted one. How old lanes 1-4 and 8-11 are |
 /// | 7 | `in_frame` — 1 when the object projects into the paired camera frame, else 0 |
 /// | 8-11 | `image_box` x0, y0, x1, y1 — where it is in that frame, pixels; all zero when `in_frame` is 0 |
-/// | 12 | `in_path` — 1 when its box, as last observed, is ahead and overlaps the corridor |
+/// | 12 | `in_path` — 1 when, as last observed, it is ahead and stands on the corridor of the vehicle's path: by its lidar-detector rectangle when it has one, by its centroid when it does not ([`crate::path`]) |
 /// | 13 | `nearest_in_path` — 1 on exactly one record when anything fresh is in the path: the nearest such, which is the one object this stage used to answer with |
 /// | 14 | `class_id` — the class of the camera detection fused with this track, an index into [`crate::camdet::COCO_CLASSES`]; 0 when not fused |
 /// | 15 | `confidence` — that detection's score, above the detector's 0.3; 0 when not fused |
 /// | 16 | `population` — [`crate::fuse::POPULATION_FUSED`], [`crate::fuse::POPULATION_LIDAR_ONLY`] or [`crate::fuse::POPULATION_UNFUSED`]; see [`crate::fuse`] |
+/// | 17 | `lidar_class_id` — the class the lidar detector gave this track ([`crate::name`]), an index into [`crate::pillars::CLASSES`]; 0 when it gave none |
+/// | 18 | `lidar_confidence` — that box's score, above the detector's 0.1; 0 when there is none, which is how lanes 17-18 are read: never alone |
 ///
 /// **Lanes 14-15 of a record that was not fused are zero, and that is the one
 /// exception to this module's rule against sentinels.** Class 0 is also a real
@@ -217,15 +238,17 @@ pub const OBJECT_LANES: usize = OBJECT_VALUES as usize;
 /// know that convention, and a second spelling of one fact is only safe if the
 /// two cannot disagree: [`record_is_consistent`] checks them, and the far end
 /// of the chain counts every record where they do.
-pub const OBJECT_BYTES: usize = 68;
+pub const OBJECT_BYTES: usize = 76;
 
-/// Value of the `state_format` column: what the 17 lanes mean.
+/// Value of the `state_format` column: what the 19 lanes mean.
 ///
 /// `i1` id, `d1` distance, `c1` closing, `t1` time to contact, `b1` bearing,
 /// `a1` age, `s1` since seen, `f1` in frame, `r4` image rectangle, `p1` in
-/// path, `n1` nearest in path, `k1` class, `q1` confidence, `o1` population.
-/// It changed when the answer stopped being one object of nine lanes.
-pub const STATE_FORMAT: &str = "state_i1d1c1t1b1a1s1f1r4p1n1k1q1o1_f32le";
+/// path, `n1` nearest in path, `k1` class, `q1` confidence, `o1` population,
+/// `l1` the lidar detector's class, `w1` its score. It changed when the
+/// answer stopped being one object of nine lanes, and again with the lidar
+/// detector's two lanes.
+pub const STATE_FORMAT: &str = "state_i1d1c1t1b1a1s1f1r4p1n1k1q1o1l1w1_f32le";
 
 /// Width of the KITTI recording vehicle (VW Passat B6 Variant), metres.
 pub const VEHICLE_WIDTH_M: f32 = 1.82;
@@ -236,19 +259,6 @@ pub const VEHICLE_WIDTH_M: f32 = 1.82;
 /// Half the vehicle's own width and nothing else. See the module docs for why
 /// it is not a lane width.
 pub const CORRIDOR_HALF_WIDTH_M: f32 = VEHICLE_WIDTH_M / 2.0;
-
-/// Whether a track's box, as last observed, is ahead of the sensor and
-/// overlaps the corridor.
-///
-/// Both tests written POSITIVELY, so a NaN coordinate excludes the track
-/// instead of slipping through a negated float comparison. Box overlap, not
-/// centroid containment: see the module docs.
-fn in_path(t: &[f32; TRACK_LANES]) -> bool {
-    let (xmin, ymin, ymax) = (t[9], t[10], t[13]);
-    let ahead = xmin > 0.0;
-    let in_corridor = ymin <= CORRIDOR_HALF_WIDTH_M && ymax >= -CORRIDOR_HALF_WIDTH_M;
-    ahead && in_corridor
-}
 
 /// `distance / closing` when something is ahead and the gap is shrinking,
 /// else 0.
@@ -267,9 +277,15 @@ pub struct Object {
     pub id: u32,
     /// Lidar origin to the near face of its box along x, metres, signed.
     pub distance_m: f32,
-    /// Positive when the gap is shrinking, m/s.
+    /// Positive when the gap is shrinking, m/s: as the track's velocity
+    /// measures it.
     pub closing_mps: f32,
-    /// `distance / closing` when both are positive, else 0.
+    /// The distance over the closing speed **the track's age has
+    /// established** -- `closing_mps` less twice the tracker's gate over
+    /// the track's age ([`unsure_of_age`]) -- when both are
+    /// positive, else 0. A track one sweep old closing at 15 m/s has no
+    /// time to contact: its velocity is one association's worth of noise,
+    /// and a time computed from it is not a measurement.
     pub ttc_s: f32,
     /// Bearing of its centroid, degrees, 0 straight ahead.
     pub bearing_deg: f32,
@@ -279,41 +295,74 @@ pub struct Object {
     pub since_seen_s: f32,
     /// Where it is in the paired camera frame, when it is in frame at all.
     pub image: Option<ImageBox>,
-    /// Its box, as last observed, is ahead and overlaps the corridor.
+    /// As last observed, it is ahead and stands on the corridor of the
+    /// vehicle's path ([`crate::path::place`]).
     pub in_path: bool,
     /// The one record the old single answer named: the nearest FRESH object
     /// in the path.
     pub nearest_in_path: bool,
     /// `(class_id, confidence)` of the camera detection fused with this
-    /// track, or `None` when it was not fused; see [`OBJECT_BYTES`].
+    /// track -- or matched by one camera alone, which `population` says --
+    /// or `None` when no camera matched it; see [`OBJECT_BYTES`].
     pub class: Option<(u32, f32)>,
-    /// The population code ([`crate::fuse`]): fused, lidar-only, or unfused.
+    /// The population code ([`crate::fuse`]): fused, one camera's,
+    /// lidar-only, or unfused.
     pub population: u32,
+    /// `(class_id, score)` the lidar detector gave this track
+    /// ([`crate::name`]), an index into [`crate::pillars::CLASSES`], or
+    /// `None` when it lay in none of its boxes.
+    pub lidar_class: Option<(u32, f32)>,
 }
 
 impl Object {
     /// The record for one track of [`crate::track::track_rows`], not flagged.
-    pub fn of_track(t: &[f32; TRACK_LANES]) -> Object {
-        let distance_m = t[9];
-        // `-vx`: positive when the object is coming towards the sensor.
-        let closing_mps = -t[3];
+    ///
+    /// `ego_vf` is the vehicle's own forward speed when the track's velocity
+    /// is over ground (the batch's `ego_outcome` says so), and `None` when
+    /// it is relative to the vehicle; see the module docs. A straight path,
+    /// and a gate of nothing: the whole closing speed is taken as
+    /// established.
+    pub fn of_track(t: &[f32; TRACK_LANES], ego_vf: Option<f32>) -> Object {
+        Object::of_track_on(t, ego_vf, &Path::STRAIGHT, 0.0)
+    }
+
+    /// [`Object::of_track`] against the path the vehicle is on: the gap,
+    /// the closing speed and whether the track is in the way are all
+    /// measured along it. See [`crate::path`]. `gate_m` is the tracker's
+    /// association gate for the sweep, which with the track's age says how
+    /// much of the closing speed is established; the time to contact is at
+    /// that part.
+    pub fn of_track_on(
+        t: &[f32; TRACK_LANES],
+        ego_vf: Option<f32>,
+        path: &Path,
+        gate_m: f32,
+    ) -> Object {
+        let placed = place(path, t, CORRIDOR_HALF_WIDTH_M);
+        let distance_m = placed.gap_m;
+        // Positive when the gap is shrinking: the vehicle's forward speed
+        // less the object's own along the path, or minus a velocity
+        // relative to the vehicle.
+        let closing_mps = closing_mps(path, t, placed.along_m, ego_vf);
+        let established = closing_mps - unsure_of_age(track_age_s(t), gate_m);
         Object {
             id: t[6] as u32,
             distance_m,
             closing_mps,
-            ttc_s: time_to_contact(distance_m, closing_mps),
+            ttc_s: time_to_contact(distance_m, established),
             bearing_deg: t[1].atan2(t[0]).to_degrees(),
             age_s: track_age_s(t),
             since_seen_s: track_since_seen_s(t),
             image: track_image_box(t),
-            in_path: in_path(t),
+            in_path: placed.on,
             nearest_in_path: false,
-            class: track_detection(t).map(|(_, _, class, confidence)| (class, confidence)),
+            class: track_class(t),
             population: track_population(t),
+            lidar_class: track_lidar_class(t),
         }
     }
 
-    /// The 17 lanes, in [`OBJECT_BYTES`]' order.
+    /// The 19 lanes, in [`OBJECT_BYTES`]' order.
     pub fn lanes(&self) -> [f32; OBJECT_LANES] {
         let flag = |b: bool| if b { 1.0 } else { 0.0 };
         let mut r = [0.0f32; OBJECT_LANES];
@@ -339,6 +388,10 @@ impl Object {
             r[15] = confidence;
         }
         r[16] = self.population as f32;
+        if let Some((class, score)) = self.lidar_class {
+            r[17] = class as f32;
+            r[18] = score;
+        }
         r
     }
 
@@ -368,6 +421,7 @@ impl Object {
             nearest_in_path: r[13] == 1.0,
             class: (r[15] > 0.0).then_some((r[14] as u32, r[15])),
             population: r[16] as u32,
+            lidar_class: (r[18] > 0.0).then_some((r[17] as u32, r[18])),
         }
     }
 }
@@ -375,8 +429,8 @@ impl Object {
 /// Whether one record's redundant lanes agree with each other: `in_frame`
 /// (lane 7) with the box, a `nearest_in_path` flag only on a fresh record
 /// that is in the path, and the camera's lanes with the population: a class
-/// exactly on a fused record, and a fused record only where a fusion could
-/// have happened -- fresh and in frame.
+/// exactly on a fused or one-camera record, and such a record only where a
+/// match could have happened -- fresh and in frame.
 ///
 /// The far end of the chain counts the records where this is false, and the
 /// run's invariants require that count to be 0.
@@ -384,14 +438,23 @@ pub fn record_is_consistent(r: &[f32; OBJECT_LANES]) -> bool {
     let o = Object::from_lanes(r);
     let in_frame_agrees = (r[7] == 1.0) == o.image.is_some() && (r[7] == 0.0 || r[7] == 1.0);
     let flag_is_earned = !o.nearest_in_path || (o.in_path && o.since_seen_s == 0.0);
-    let fused = o.population == POPULATION_FUSED;
+    let matched = matches!(o.population, POPULATION_FUSED | POPULATION_ONE_CAMERA);
     let population_known = matches!(
         o.population,
-        POPULATION_UNFUSED | POPULATION_FUSED | POPULATION_LIDAR_ONLY
+        POPULATION_UNFUSED | POPULATION_FUSED | POPULATION_LIDAR_ONLY | POPULATION_ONE_CAMERA
     ) && r[16] == o.population as f32;
-    let class_agrees = fused == o.class.is_some();
-    let fusion_is_possible = !fused || (o.image.is_some() && o.since_seen_s == 0.0);
-    in_frame_agrees && flag_is_earned && population_known && class_agrees && fusion_is_possible
+    let class_agrees = matched == o.class.is_some();
+    let match_is_possible = !matched || (o.image.is_some() && o.since_seen_s == 0.0);
+    // The lidar's class is given to fresh tracks only (`crate::name`): a
+    // coasted record carrying one would have been named from a box of a
+    // sweep its position is not from.
+    let lidar_name_is_possible = o.lidar_class.is_none() || o.since_seen_s == 0.0;
+    in_frame_agrees
+        && flag_is_earned
+        && population_known
+        && class_agrees
+        && match_is_possible
+        && lidar_name_is_possible
 }
 
 /// The nearest tracked object in the vehicle's path, or the fact that there
@@ -422,9 +485,10 @@ pub struct StateAnswer {
     /// schemas and therefore every measured byte figure in this project. It is
     /// stated rather than quietly worked around. See the module docs.
     pub distance_m: f32,
-    /// Positive when the gap is shrinking, m/s.
+    /// Positive when the gap is shrinking, m/s, as measured.
     pub closing_mps: f32,
-    /// `distance / closing` when closing, else 0.
+    /// The distance over the closing speed the track's age has established,
+    /// else 0 ([`Object::ttc_s`]).
     pub ttc_s: f32,
     /// Bearing of its centroid, degrees, 0 straight ahead.
     pub bearing_deg: f32,
@@ -433,6 +497,10 @@ pub struct StateAnswer {
     /// `(class_id, confidence)` from the camera, when the fusion associated
     /// this object with a detection of the paired frame.
     pub class: Option<(u32, f32)>,
+    /// `(class_id, score)` from the lidar detector, when the object lay in
+    /// one of its boxes ([`crate::name`]); an index into
+    /// [`crate::pillars::CLASSES`], a different vocabulary from the camera's.
+    pub lidar_class: Option<(u32, f32)>,
     /// Fresh tracks that were in the corridor, of which this is the nearest.
     pub candidates: u32,
 }
@@ -441,23 +509,38 @@ impl StateAnswer {
     /// The nearest qualifying track of `tracks`, which are
     /// [`crate::track::track_rows`] of one fused sample.
     ///
-    /// Qualifying means: observed in this sweep (`misses == 0`), its box in
-    /// front of the sensor, and its box overlapping the corridor.
+    /// Qualifying means: observed in this sweep (`misses == 0`), ahead of
+    /// the sensor, and standing on the corridor of a straight path.
     /// Deterministic on ties, by lowest id — the rows are already in a fixed
     /// order, but "nearest" over floats can tie and iteration order must not
-    /// be what decides.
-    pub fn of(tracks: &[[f32; TRACK_LANES]]) -> StateAnswer {
+    /// be what decides. `ego_vf` as for [`Object::of_track`].
+    pub fn of(tracks: &[[f32; TRACK_LANES]], ego_vf: Option<f32>) -> StateAnswer {
+        StateAnswer::of_on(tracks, ego_vf, &Path::STRAIGHT, 0.0)
+    }
+
+    /// [`StateAnswer::of`] against the path the vehicle is on: the nearest
+    /// fresh track standing on its corridor, nearest along it. `gate_m` as
+    /// for [`Object::of_track_on`].
+    pub fn of_on(
+        tracks: &[[f32; TRACK_LANES]],
+        ego_vf: Option<f32>,
+        path: &Path,
+        gate_m: f32,
+    ) -> StateAnswer {
         let mut out = StateAnswer::default();
         let mut best: Option<(f32, u32)> = None;
         for t in tracks {
             // Fresh observation only: a coasted track's position is one sweep
             // old and answering from it would report a measurement that was
             // not made.
-            if t[8] != 0.0 || !in_path(t) {
+            if t[8] != 0.0 {
+                continue;
+            }
+            let o = Object::of_track_on(t, ego_vf, path, gate_m);
+            if !o.in_path {
                 continue;
             }
             out.candidates += 1;
-            let o = Object::of_track(t);
             let better = match best {
                 None => true,
                 Some((d, bid)) => o.distance_m < d || (o.distance_m == d && o.id < bid),
@@ -473,7 +556,9 @@ impl StateAnswer {
         out
     }
 
-    /// The answer a flagged record gives, `candidates` aside.
+    /// The answer a flagged record gives, `candidates` aside. Its class is
+    /// the fused one only: a class one camera gave that the other did not
+    /// confirm is on the record, and the answer does not repeat it.
     fn from_object(o: &Object) -> StateAnswer {
         StateAnswer {
             has_object: true,
@@ -484,7 +569,8 @@ impl StateAnswer {
             ttc_s: o.ttc_s,
             bearing_deg: o.bearing_deg,
             image: o.image,
-            class: o.class,
+            class: o.class.filter(|_| o.population == POPULATION_FUSED),
+            lidar_class: o.lidar_class,
             candidates: 0,
         }
     }
@@ -495,8 +581,12 @@ impl StateAnswer {
         if !self.has_object {
             return "nothing in the vehicle's path".to_string();
         }
+        // A closing speed with no time to contact is one the track's age
+        // has not established: said, not passed off as "not closing".
         let ttc = if self.ttc_s > 0.0 {
             format!("{:.1} s to contact", self.ttc_s)
+        } else if self.closing_mps > 0.0 {
+            "not established yet".to_string()
         } else {
             "not closing".to_string()
         };
@@ -504,9 +594,19 @@ impl StateAnswer {
             Some(b) => format!("image ({:.0},{:.0})-({:.0},{:.0})", b.x0, b.y0, b.x1, b.y1),
             None => "not in the camera frame".to_string(),
         };
-        let what = match self.class {
-            Some((class, confidence)) => format!(" ({} {confidence:.2})", class_name(class)),
-            None => String::new(),
+        // What the sensors call it: the camera's class, the lidar's, both,
+        // or nothing. Two vocabularies, so both are said when both spoke.
+        let camera = self
+            .class
+            .map(|(class, confidence)| format!("{} {confidence:.2}", class_name(class)));
+        let lidar = self
+            .lidar_class
+            .map(|(class, score)| format!("lidar {} {score:.2}", lidar_class_name(class)));
+        let what = match (camera, lidar) {
+            (Some(c), Some(l)) => format!(" ({c}, {l})"),
+            (Some(c), None) => format!(" ({c})"),
+            (None, Some(l)) => format!(" ({l})"),
+            (None, None) => String::new(),
         };
         format!(
             "object {}{what} at {:.2} m, {:+.2} deg, closing {:.2} m/s, {ttc}, tracked for {:.2} s, {img}",
@@ -520,7 +620,7 @@ fn object_value_field() -> FieldRef {
     Arc::new(Field::new("item", DataType::Float32, false))
 }
 
-/// Arrow field of one record: `FixedSizeList<Float32, 17>`.
+/// Arrow field of one record: `FixedSizeList<Float32, 19>`.
 fn object_field() -> FieldRef {
     Arc::new(Field::new(
         "item",
@@ -533,8 +633,15 @@ fn object_field() -> FieldRef {
 /// has_object bool, candidates u32, in_frame_count u32, source_tracks u32,
 /// source_detections u32, source_voxel_count u32, source_point_count u32,
 /// cam_seq i64, pair_outcome Utf8,
-/// objects LargeList<FixedSizeList<Float32, 17>>, pair_age_ns i64,
-/// fused_count u32, camera_only LargeList<FixedSizeList<Float32, 7>>`.
+/// objects LargeList<FixedSizeList<Float32, 19>>, pair_age_ns i64,
+/// fused_count u32, camera_only LargeList<FixedSizeList<Float32, 7>>`, the
+/// vehicle's two, the second camera's four, and the lidar detector's two:
+/// `lidar_det_outcome Utf8, named_count u32` -- how its batch was found at
+/// the fusion, carried through from the track batch, and how many records
+/// carry a class from it, written beside the lanes it counts -- and the
+/// path's two: `path_curvature f32, gate_m f32`, the path every record was
+/// measured against ([`read_path`]) and the tracker's gate its times to
+/// contact were computed with ([`state_gate_m`]).
 ///
 /// One row per sweep, as every other link of the chain, and one record per
 /// track in `objects`, the way [`crate::track::track_schema`] carries its
@@ -556,6 +663,12 @@ fn object_field() -> FieldRef {
 /// far end can check the two against each other; `camera_only` is the track
 /// batch's own column, shared rather than copied: the paired frame's
 /// detections that no track matched ([`crate::fuse::CAMERA_ONLY_BYTES`]).
+/// `ego_outcome` and `ego_vf` are the vehicle's own half, carried through
+/// from the track batch: whether the closing speeds were computed from
+/// velocities over ground, and the forward speed they were computed with
+/// (0 when they were not). `cam_side`, `cam1_seq` and `cam1_pair_outcome`
+/// are the second camera's half, carried through the same way: which
+/// camera the records' boxes are in, and what became of the other's frame.
 pub fn state_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         Field::new("state_format", DataType::Utf8, false),
@@ -574,6 +687,16 @@ pub fn state_schema() -> Arc<Schema> {
         Field::new("pair_age_ns", DataType::Int64, false),
         Field::new("fused_count", DataType::UInt32, false),
         Field::new("camera_only", camera_only_data_type(), false),
+        Field::new("ego_outcome", DataType::Utf8, false),
+        Field::new("ego_vf", DataType::Float32, false),
+        Field::new("cam_side", DataType::Utf8, false),
+        Field::new("cam1_seq", DataType::Int64, false),
+        Field::new("cam1_pair_outcome", DataType::Utf8, false),
+        Field::new("cam0_pair_outcome", DataType::Utf8, false),
+        Field::new("lidar_det_outcome", DataType::Utf8, false),
+        Field::new("named_count", DataType::UInt32, false),
+        Field::new("path_curvature", DataType::Float32, false),
+        Field::new("gate_m", DataType::Float32, false),
     ]))
 }
 
@@ -597,6 +720,38 @@ pub struct StateMeta {
     /// The camera frame's instant minus the sweep's trigger, ns: about +10.5
     /// ms on a clean pair, about -92.8 ms on a frame one period stale.
     pub pair_age_ns: i64,
+    /// How the vehicle's own motion reached the tracks, as
+    /// `EgoOutcome::name` spells it: carried through unchanged from the
+    /// track batch.
+    pub ego_outcome: &'static str,
+    /// The vehicle's forward speed, m/s, when the tracks' velocities are
+    /// over ground -- the closing speeds are computed with it -- and `None`
+    /// when they are relative to the vehicle.
+    pub ego_vf: Option<f32>,
+    /// Which camera the records' boxes are in (`Camera::name`): the left,
+    /// unless the sweep was answered from the right camera's frame alone.
+    pub cam_side: &'static str,
+    /// The right camera's frame the sweep was paired with, or -1.
+    pub cam1_seq: i64,
+    /// How that pairing went (`Pairing::name`); `pair_absent` without a
+    /// right camera.
+    pub cam1_pair_outcome: &'static str,
+    /// How the left camera's pairing went: `pair_outcome` again on a set
+    /// built on the left frame, the left frame's own fate on one built on
+    /// the right.
+    pub cam0_pair_outcome: &'static str,
+    /// How the lidar detector's batch was found at the fusion
+    /// (`Naming::name`), carried through from the track batch; `lidar_off`
+    /// without a lidar detector.
+    pub lidar_det_outcome: &'static str,
+    /// The path the vehicle is on, which every record's distance, closing
+    /// speed and `in_path` are measured against: [`Path::STRAIGHT`] without
+    /// the vehicle's motion.
+    pub path: Path,
+    /// The tracker's association gate for this sweep, metres, as the track
+    /// batch states it: with a record's age, how much of its closing speed
+    /// is established. 0 takes all of it as established.
+    pub gate_m: f32,
 }
 
 /// Builds the one-row answer batch: one record per track in `tracks`, the
@@ -628,17 +783,19 @@ pub fn build_state_batch(
     }
     let mut in_frame = 0u32;
     let mut fused = 0u32;
+    let mut named = 0u32;
     let mut flagged = false;
     {
         let out = buf.typed_data_mut::<f32>();
         for (w, t) in tracks.iter().enumerate() {
-            let mut o = Object::of_track(t);
+            let mut o = Object::of_track_on(t, meta.ego_vf, &meta.path, meta.gate_m);
             if answer.has_object && !flagged && o.id == answer.object_id && t[8] == 0.0 {
                 o.nearest_in_path = true;
                 flagged = true;
             }
             in_frame += u32::from(o.image.is_some());
             fused += u32::from(o.population == POPULATION_FUSED);
+            named += u32::from(o.lidar_class.is_some());
             out[w * OBJECT_LANES..][..OBJECT_LANES].copy_from_slice(&o.lanes());
         }
     }
@@ -659,7 +816,7 @@ pub fn build_state_batch(
     let objects = LargeListArray::try_new(object_field(), offsets, Arc::new(rec), None)?;
     let camera_only = match camera_only {
         Some(c) => c,
-        None => build_camera_only(None, &[])?,
+        None => build_camera_only(None, &[], None)?,
     };
     let columns: Vec<ArrayRef> = vec![
         Arc::new(StringArray::from(vec![STATE_FORMAT])),
@@ -680,6 +837,16 @@ pub fn build_state_batch(
         Arc::new(Int64Array::from(vec![meta.pair_age_ns])),
         Arc::new(UInt32Array::from(vec![fused])),
         camera_only,
+        Arc::new(StringArray::from(vec![meta.ego_outcome])),
+        Arc::new(Float32Array::from(vec![meta.ego_vf.unwrap_or(0.0)])),
+        Arc::new(StringArray::from(vec![meta.cam_side])),
+        Arc::new(Int64Array::from(vec![meta.cam1_seq])),
+        Arc::new(StringArray::from(vec![meta.cam1_pair_outcome])),
+        Arc::new(StringArray::from(vec![meta.cam0_pair_outcome])),
+        Arc::new(StringArray::from(vec![meta.lidar_det_outcome])),
+        Arc::new(UInt32Array::from(vec![named])),
+        Arc::new(Float32Array::from(vec![meta.path.curvature() as f32])),
+        Arc::new(Float32Array::from(vec![meta.gate_m])),
     ];
     Ok((
         RecordBatch::try_new(Arc::clone(schema), columns).map_err(SweepError::Arrow)?,
@@ -688,7 +855,7 @@ pub fn build_state_batch(
 }
 
 /// The interleaved answer lanes of a state batch, shared with the buffer the
-/// stage built. `chunks_exact(17)` gives one record each.
+/// stage built. `chunks_exact(19)` gives one record each.
 pub fn objects_f32(batch: &RecordBatch) -> Option<&[f32]> {
     Some(
         batch
@@ -707,6 +874,56 @@ pub fn object_rows(batch: &RecordBatch) -> &[[f32; OBJECT_LANES]] {
     let lanes: &[f32] = objects_f32(batch).unwrap_or(&[]);
     let (rows, _) = lanes.as_chunks::<OBJECT_LANES>();
     rows
+}
+
+/// Records that carry a class from the lidar detector: the batch's own
+/// count, beside the lanes it counts.
+pub fn named_count(batch: &RecordBatch) -> Option<u32> {
+    u32_col(batch, "named_count")
+}
+
+fn f32_col(batch: &RecordBatch, name: &str) -> Option<f32> {
+    let c = batch
+        .column_by_name(name)?
+        .as_primitive_opt::<Float32Type>()?;
+    (!c.is_empty()).then(|| c.value(0))
+}
+
+/// What of a track's closing speed its age cannot rule out, m/s: twice the
+/// tracker's association gate, `gate_m`, over the track's age. A cluster that
+/// forms round a different part of an object from one sweep to the next moves
+/// its centroid by up to one gate, and the measured step and the true one are
+/// each within a gate, hence twice. Infinite for a track with no age, which
+/// rules nothing out.
+pub fn unsure_of_age(age_s: f32, gate_m: f32) -> f32 {
+    // Written positively, so an age that is not a number rules nothing out.
+    if age_s > 0.0 {
+        2.0 * gate_m / age_s
+    } else {
+        f32::INFINITY
+    }
+}
+
+/// The tracker's association gate the answer's times to contact were
+/// computed with, metres.
+pub fn state_gate_m(batch: &RecordBatch) -> Option<f32> {
+    f32_col(batch, "gate_m")
+}
+
+/// The path the answer's records were measured against, read back out of
+/// the batch's `path_curvature`.
+pub fn read_path(batch: &RecordBatch) -> Option<Path> {
+    f32_col(batch, "path_curvature").map(|k| Path::from_curvature(f64::from(k)))
+}
+
+/// How the lidar detector's batch was found at the fusion, as
+/// `crate::track::Naming::name` spells it.
+pub fn lidar_det_outcome(batch: &RecordBatch) -> Option<&str> {
+    let c = batch
+        .column_by_name("lidar_det_outcome")?
+        .as_any()
+        .downcast_ref::<StringArray>()?;
+    (!c.is_empty()).then(|| c.value(0))
 }
 
 /// Address of the shared answer buffer: the zero-copy proof at the far end of
@@ -780,7 +997,7 @@ pub fn source_tracks(batch: &RecordBatch) -> Option<u32> {
     u32_col(batch, "source_tracks")
 }
 
-/// What the 17 lanes of a record MEAN, read back out of the batch.
+/// What the 19 lanes of a record MEAN, read back out of the batch.
 pub fn state_format(batch: &RecordBatch) -> Option<&str> {
     let c = batch
         .column_by_name("state_format")?
@@ -821,10 +1038,75 @@ pub fn cam_seq(batch: &RecordBatch) -> Option<i64> {
     (!c.is_empty()).then(|| c.value(0))
 }
 
+/// How the vehicle's own motion reached this answer's tracks, as the track
+/// batch spelled it (`EgoOutcome::name`).
+pub fn ego_outcome(batch: &RecordBatch) -> Option<&str> {
+    let c = batch
+        .column_by_name("ego_outcome")?
+        .as_any()
+        .downcast_ref::<StringArray>()?;
+    (!c.is_empty()).then(|| c.value(0))
+}
+
+/// The vehicle's forward speed the closing speeds were computed with, m/s:
+/// `None` when they were not, which is when the velocities were relative to
+/// the vehicle.
+pub fn ego_vf(batch: &RecordBatch) -> Option<f32> {
+    let compensated = matches!(ego_outcome(batch)?, "compensated" | "stale");
+    let c = batch
+        .column_by_name("ego_vf")?
+        .as_primitive_opt::<Float32Type>()?;
+    (compensated && !c.is_empty()).then(|| c.value(0))
+}
+
+/// Which camera the records' boxes are in, as `Camera::name` spells it.
+pub fn cam_side(batch: &RecordBatch) -> Option<&str> {
+    let c = batch
+        .column_by_name("cam_side")?
+        .as_any()
+        .downcast_ref::<StringArray>()?;
+    (!c.is_empty()).then(|| c.value(0))
+}
+
+/// The right camera's frame this answer's sweep was paired with, or -1.
+pub fn cam1_seq(batch: &RecordBatch) -> Option<i64> {
+    let c = batch
+        .column_by_name("cam1_seq")?
+        .as_primitive_opt::<Int64Type>()?;
+    (!c.is_empty()).then(|| c.value(0))
+}
+
+/// How the right camera's pairing went, as `Pairing::name` spells it.
+pub fn cam1_pair_outcome(batch: &RecordBatch) -> Option<&str> {
+    let c = batch
+        .column_by_name("cam1_pair_outcome")?
+        .as_any()
+        .downcast_ref::<StringArray>()?;
+    (!c.is_empty()).then(|| c.value(0))
+}
+
+/// How the left camera's pairing went, as `Pairing::name` spells it.
+pub fn cam0_pair_outcome(batch: &RecordBatch) -> Option<&str> {
+    let c = batch
+        .column_by_name("cam0_pair_outcome")?
+        .as_any()
+        .downcast_ref::<StringArray>()?;
+    (!c.is_empty()).then(|| c.value(0))
+}
+
 /// The sweep this answer is about.
 pub fn state_sweep_seq(batch: &RecordBatch) -> Option<i64> {
     let c = batch
         .column_by_name("source_sweep_seq")?
+        .as_primitive_opt::<Int64Type>()?;
+    (!c.is_empty()).then(|| c.value(0))
+}
+
+/// That sweep's trigger, ns of sensor time, inherited unchanged down the
+/// whole chain.
+pub fn state_trigger_ns(batch: &RecordBatch) -> Option<i64> {
+    let c = batch
+        .column_by_name("tov_trigger_ns")?
         .as_primitive_opt::<Int64Type>()?;
     (!c.is_empty()).then(|| c.value(0))
 }
@@ -889,11 +1171,56 @@ mod tests {
             cam_seq: 7,
             pair_outcome: "paired",
             pair_age_ns: 10_503_000,
+            ego_outcome: "unavailable",
+            ego_vf: None,
+            cam_side: "left",
+            cam1_seq: -1,
+            cam1_pair_outcome: "pair_absent",
+            cam0_pair_outcome: "paired",
+            lidar_det_outcome: "lidar_off",
+            gate_m: 0.0,
+            path: Path::STRAIGHT,
         }
     }
 
+    /// With the vehicle's motion the closing speed is its forward speed less
+    /// the object's own: a parked car closes at the vehicle's speed, a car
+    /// pulling away at less, a car coming the other way at more. Without it
+    /// the velocity is already relative, and the sign is all there is.
+    #[test]
+    fn the_closing_speed_comes_from_whichever_frame_the_velocity_is_in() {
+        let parked = car(1.0, 10.0, 0.0, 0.0);
+        let away = car(1.0, 10.0, 0.0, 3.0);
+        let toward = car(1.0, 10.0, 0.0, -4.0);
+        for (t, want) in [(parked, 5.0), (away, 2.0), (toward, 9.0)] {
+            let o = Object::of_track(&t, Some(5.0));
+            assert_eq!(o.closing_mps, want);
+            assert_eq!(o.ttc_s, 10.0 / want);
+        }
+        // Relative: the same lanes read as the gap's own rate.
+        assert_eq!(Object::of_track(&toward, None).closing_mps, 4.0);
+        assert_eq!(Object::of_track(&away, None).closing_mps, -3.0);
+        assert_eq!(Object::of_track(&away, None).ttc_s, 0.0);
+        // The answer and the batch use the same speed, and the batch says so.
+        let a = StateAnswer::of(&[away], Some(5.0));
+        assert_eq!(a.closing_mps, 2.0);
+        let meta = StateMeta {
+            ego_outcome: "compensated",
+            ego_vf: Some(5.0),
+            ..meta()
+        };
+        let (b, _) = build_state_batch(&[away], &a, &meta, None, &state_schema()).unwrap();
+        assert_eq!(ego_outcome(&b), Some("compensated"));
+        assert_eq!(ego_vf(&b), Some(5.0));
+        assert_eq!(Object::from_lanes(&object_rows(&b)[0]).closing_mps, 2.0);
+        // A batch that was not compensated offers no speed, whatever its column holds.
+        let b = build(&[away]);
+        assert_eq!(ego_outcome(&b), Some("unavailable"));
+        assert_eq!(ego_vf(&b), None);
+    }
+
     fn build(tracks: &[[f32; TRACK_LANES]]) -> RecordBatch {
-        let a = StateAnswer::of(tracks);
+        let a = StateAnswer::of(tracks, None);
         build_state_batch(tracks, &a, &meta(), None, &state_schema())
             .unwrap()
             .0
@@ -921,7 +1248,7 @@ mod tests {
     #[test]
     fn the_nearest_object_in_the_corridor_wins() {
         let tracks = [car(1.0, 20.0, 0.0, -3.0), car(2.0, 12.0, 0.0, -5.0)];
-        let a = StateAnswer::of(&tracks);
+        let a = StateAnswer::of(&tracks, None);
         assert!(a.has_object);
         assert_eq!(a.object_id, 2);
         assert_eq!(a.distance_m, 12.0);
@@ -935,7 +1262,7 @@ mod tests {
     #[test]
     fn an_object_beside_the_path_is_not_the_answer() {
         let tracks = [car(1.0, 20.0, 0.0, -3.0), car(2.0, 8.0, 6.0, -5.0)];
-        let a = StateAnswer::of(&tracks);
+        let a = StateAnswer::of(&tracks, None);
         assert_eq!(
             a.object_id, 1,
             "an object 6 m to the side became the answer"
@@ -943,12 +1270,13 @@ mod tests {
         assert_eq!(a.candidates, 1);
     }
 
-    /// The test is on the BOX, not the centroid: a wide object whose centre is
-    /// outside the corridor still blocks it.
+    /// The test is on where the material IS: a wide cluster whose centre is
+    /// beside the corridor is not in the path because its hull reaches in,
+    /// and it is when the lidar detector's own rectangle for it does.
     #[test]
-    fn a_wide_object_overlapping_the_corridor_counts() {
-        // Centroid at y = +1.6, outside the 0.91 m half-width; box reaches
-        // y = +0.4, inside it.
+    fn a_wide_cluster_is_in_the_path_by_its_centroid_or_by_its_lidar_box() {
+        // Centroid at y = +1.6, outside the 0.91 m half-width; the cluster's
+        // hull reaches y = +0.4, inside it.
         let wide = trk(
             9.0,
             4.0,
@@ -958,9 +1286,109 @@ mod tests {
             [10.0, 0.4, -1.7],
             [12.0, 2.8, 0.0],
         );
-        let a = StateAnswer::of(&[wide]);
-        assert!(a.has_object, "the box overlaps the corridor and was missed");
-        assert_eq!(a.distance_m, 10.0);
+        let a = StateAnswer::of(&[wide], None);
+        assert!(!a.has_object, "a hull is not where the material is");
+        // Its record is still carried, with its own box's near face.
+        let o = Object::of_track(&wide, None);
+        assert!(!o.in_path);
+        assert_eq!(o.distance_m, 10.0);
+        // Named by the lidar detector, the detector's rectangle is asked:
+        // a car whose side is at y = 0.7 is in the path...
+        let mut named = wide;
+        named[crate::track::LANE_LIDAR_DET_INDEX] = 0.0;
+        named[crate::track::LANE_LIDAR_CONFIDENCE] = 0.9;
+        let at = crate::track::LANE_LIDAR_BOX;
+        named[at..at + 5].copy_from_slice(&[11.0, 1.6, 4.0, 1.8, 0.0]);
+        let a = StateAnswer::of(&[named], None);
+        assert!(a.has_object, "the car's rectangle reaches the corridor");
+        assert_eq!(a.distance_m, 10.0, "the distance is the cluster's own");
+        // ...and one a metre further left is not.
+        named[at + 1] = 2.8;
+        assert!(!StateAnswer::of(&[named], None).has_object);
+    }
+
+    /// On a turning vehicle the corridor follows the road: the track straight
+    /// ahead is beside it, the one round the bend is on it, and its distance
+    /// and closing speed are measured along the arc.
+    #[test]
+    fn on_a_bend_the_path_not_the_axis_decides_what_is_in_the_way() {
+        // 20 m radius to the left: 10 m of arc ends 9.59 m ahead, 2.45 m left.
+        let path = Path::from_curvature(1.0 / 20.0);
+        let ahead = car(1.0, 8.0, 0.0, 0.0);
+        let round = trk(
+            2.0,
+            5.0,
+            0.0,
+            [9.59, 2.45, -1.0],
+            [0.0, 0.0, 0.0],
+            [9.3, 2.2, -1.7],
+            [9.9, 2.7, 0.0],
+        );
+        // Straight, the car dead ahead is the answer.
+        assert_eq!(StateAnswer::of(&[ahead, round], Some(5.0)).object_id, 1);
+        // On the bend it is the one on the road.
+        let a = StateAnswer::of_on(&[ahead, round], Some(5.0), &path, 0.0);
+        assert_eq!((a.has_object, a.object_id, a.candidates), (true, 2, 1));
+        assert!((a.distance_m - 9.7).abs() < 0.2, "{}", a.distance_m);
+        assert_eq!(a.closing_mps, 5.0);
+        let o = Object::of_track_on(&ahead, Some(5.0), &path, 0.0);
+        assert!(!o.in_path);
+        // The batch says which path its records were measured against.
+        let on_bend = StateMeta {
+            ego_outcome: "compensated",
+            ego_vf: Some(5.0),
+            path,
+            ..meta()
+        };
+        let (b, _) =
+            build_state_batch(&[ahead, round], &a, &on_bend, None, &state_schema()).unwrap();
+        // The curvature rides in an f32 column, so it reads back to that.
+        let back = read_path(&b).unwrap();
+        assert!(
+            (back.curvature() - path.curvature()).abs() < 1e-7,
+            "{back:?}"
+        );
+        assert_eq!(read_answer(&b).map(|x| x.object_id), Some(2));
+    }
+
+    #[test]
+    fn the_time_to_contact_is_at_the_closing_speed_the_tracks_age_has_established() {
+        // 12 m ahead of a vehicle doing 6 m/s, standing still: 2 s to
+        // contact once the whole closing speed is established.
+        let mut t = car(1.0, 12.0, 0.0, 0.0);
+        let whole = Object::of_track_on(&t, Some(6.0), &Path::STRAIGHT, 0.0);
+        assert_eq!((whole.closing_mps, whole.ttc_s), (6.0, 2.0));
+        // The same track two seconds old, with the gate of a real run: twice
+        // 1.63 m over 2 s is 1.63 m/s of the 6 that could be the tracker's
+        // doing, 4.37 are established, and the time is at those.
+        t[19] = 2.0;
+        let o = Object::of_track_on(&t, Some(6.0), &Path::STRAIGHT, 1.63);
+        assert_eq!(o.closing_mps, 6.0);
+        assert!((o.ttc_s - 12.0 / 4.37).abs() < 1e-4, "{}", o.ttc_s);
+        // One sweep old, none of it is: no time to contact, and the answer
+        // says why instead of calling a closing gap "not closing".
+        t[19] = 0.1;
+        let young = Object::of_track_on(&t, Some(6.0), &Path::STRAIGHT, 1.63);
+        assert_eq!((young.closing_mps, young.ttc_s), (6.0, 0.0));
+        let a = StateAnswer::of_on(&[t], Some(6.0), &Path::STRAIGHT, 1.63);
+        assert_eq!((a.object_id, a.ttc_s), (1, 0.0));
+        assert!(
+            a.line()
+                .contains("closing 6.00 m/s, not established yet, tracked for 0.10 s"),
+            "{}",
+            a.line()
+        );
+        // The batch carries the gate its times were computed with, and the
+        // record's lane is the same number.
+        let made = StateMeta {
+            ego_outcome: "compensated",
+            ego_vf: Some(6.0),
+            gate_m: 1.63,
+            ..meta()
+        };
+        let (b, _) = build_state_batch(&[t], &a, &made, None, &state_schema()).unwrap();
+        assert_eq!(state_gate_m(&b), Some(1.63));
+        assert_eq!(Object::from_lanes(&object_rows(&b)[0]).ttc_s, 0.0);
     }
 
     /// A coasted track cannot be the answer: its position is one sweep old.
@@ -970,7 +1398,7 @@ mod tests {
         stale[8] = 1.0;
         stale[20] = 0.1;
         let fresh = car(2.0, 20.0, 0.0, -3.0);
-        let a = StateAnswer::of(&[stale, fresh]);
+        let a = StateAnswer::of(&[stale, fresh], None);
         assert_eq!(a.object_id, 2, "an unobserved position became the answer");
         assert_eq!(a.candidates, 1);
         // It is still a record, in the path as last observed, not flagged,
@@ -984,7 +1412,7 @@ mod tests {
         let mut ok = stale;
         ok[8] = 0.0;
         ok[20] = 0.0;
-        assert_eq!(StateAnswer::of(&[ok, fresh]).object_id, 1);
+        assert_eq!(StateAnswer::of(&[ok, fresh], None).object_id, 1);
     }
 
     /// Nothing ahead is an answer, not an absence, and it is flagged rather
@@ -992,7 +1420,7 @@ mod tests {
     #[test]
     fn an_empty_corridor_is_an_answer_and_still_carries_every_track() {
         let beside = car(1.0, 10.0, 8.0, -3.0);
-        let a = StateAnswer::of(&[beside]);
+        let a = StateAnswer::of(&[beside], None);
         assert!(!a.has_object);
         assert_eq!(a.candidates, 0);
         assert_eq!(a.line(), "nothing in the vehicle's path");
@@ -1011,7 +1439,7 @@ mod tests {
     /// rather than a negative or infinite one.
     #[test]
     fn a_receding_object_has_no_time_to_contact() {
-        let a = StateAnswer::of(&[car(1.0, 10.0, 0.0, 4.0)]);
+        let a = StateAnswer::of(&[car(1.0, 10.0, 0.0, 4.0)], None);
         assert!(a.has_object);
         assert_eq!(a.closing_mps, -4.0);
         assert_eq!(a.ttc_s, 0.0);
@@ -1023,7 +1451,7 @@ mod tests {
     #[test]
     fn an_object_behind_has_no_time_to_contact() {
         let behind = car(3.0, -12.0, 0.0, -4.0);
-        let o = Object::of_track(&behind);
+        let o = Object::of_track(&behind, None);
         assert!(o.distance_m < 0.0);
         assert!(o.closing_mps > 0.0);
         assert_eq!(o.ttc_s, 0.0);
@@ -1057,13 +1485,13 @@ mod tests {
             .filter(|o| o.nearest_in_path)
             .map(|o| o.id)
             .collect();
-        assert_eq!(flagged, [StateAnswer::of(&tracks).object_id]);
+        assert_eq!(flagged, [StateAnswer::of(&tracks, None).object_id]);
         for r in rows {
             assert!(record_is_consistent(r), "{r:?}");
         }
         // The flagged record reads back as the answer, in full.
         let back = read_answer(&b).unwrap();
-        assert_eq!(back, StateAnswer::of(&tracks));
+        assert_eq!(back, StateAnswer::of(&tracks, None));
         assert_eq!(back.image.map(|i| (i.x0, i.y1)), Some((500.0, 300.0)));
     }
 
@@ -1129,7 +1557,7 @@ mod tests {
     #[test]
     fn a_population_that_disagrees_with_its_lanes_is_caught() {
         let good = fused(with_image(car(1.0, 12.0, 0.0, -1.0)), 0.0, 2.0, 0.9);
-        let r = Object::of_track(&good).lanes();
+        let r = Object::of_track(&good, None).lanes();
         assert!(record_is_consistent(&r), "the positive control failed");
         let mut classed_lidar_only = r;
         classed_lidar_only[16] = POPULATION_LIDAR_ONLY as f32;
@@ -1159,7 +1587,7 @@ mod tests {
     #[test]
     fn the_camera_only_detections_are_handed_on_not_copied() {
         let t = [car(1.0, 12.0, 0.0, -1.0)];
-        let a = StateAnswer::of(&t);
+        let a = StateAnswer::of(&t, None);
         let empty = build(&t);
         assert!(crate::fuse::camera_only_rows(&empty).is_empty());
         assert_eq!(pair_age_ns(&empty), Some(10_503_000));
@@ -1185,12 +1613,12 @@ mod tests {
         )
         .unwrap();
         let v = crate::camdet::cam_det_view(&cb).unwrap();
-        let co = build_camera_only(Some(&v), &[false]).unwrap();
+        let co = build_camera_only(Some(&v), &[false], None).unwrap();
         let (b, _) =
             build_state_batch(&t, &a, &meta(), Some(Arc::clone(&co)), &state_schema()).unwrap();
         let rows = crate::fuse::camera_only_rows(&b);
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0], [0.0, 2.0, 0.6, 10.0, 20.0, 30.0, 60.0]);
+        assert_eq!(rows[0], [0.0, 2.0, 0.6, 10.0, 20.0, 30.0, 60.0, 0.0]);
         let src = co
             .as_list::<i64>()
             .values()
@@ -1210,11 +1638,11 @@ mod tests {
     #[test]
     fn a_record_round_trips_through_its_lanes() {
         let t = with_image(car(4.0, 12.25, 0.0, -5.0));
-        let a = StateAnswer::of(&[t]);
+        let a = StateAnswer::of(&[t], None);
         let (b, sid) = build_state_batch(&[t], &a, &meta(), None, &state_schema()).unwrap();
         assert_eq!(state_storage_id(&b), Some(sid));
         let o = Object::from_lanes(&object_rows(&b)[0]);
-        let mut want = Object::of_track(&t);
+        let mut want = Object::of_track(&t, None);
         want.nearest_in_path = true;
         assert_eq!(o, want);
         assert_eq!(o.age_s, 0.4);
@@ -1274,8 +1702,8 @@ mod tests {
     fn a_tie_is_broken_deterministically() {
         let a = car(7.0, 10.0, 0.5, -1.0);
         let b = car(3.0, 10.0, -0.5, -1.0);
-        assert_eq!(StateAnswer::of(&[a, b]).object_id, 3);
-        assert_eq!(StateAnswer::of(&[b, a]).object_id, 3);
+        assert_eq!(StateAnswer::of(&[a, b], None).object_id, 3);
+        assert_eq!(StateAnswer::of(&[b, a], None).object_id, 3);
         for order in [[a, b], [b, a]] {
             let flagged: Vec<u32> = object_rows(&build(&order))
                 .iter()

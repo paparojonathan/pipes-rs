@@ -1,22 +1,40 @@
-# Downloads the frozen camera detector `pipes run --detector on` loads:
-# YOLOX-Nano, the ONNX file Megvii publishes as a release asset of YOLOX.
+# Downloads the camera detectors `pipes run --detector-model` loads: the ONNX
+# files Megvii publishes for YOLOX-Nano, -S, -M, -L and -X (754 MB in all, four
+# fifths of it the two biggest, which only a GPU run loads), then derives the
+# files `pipes` loads from them with scripts/prepare_models.py. That script
+# also downloads and derives the lidar detector (`pipes run --lidar-detector
+# on`, models\pointpillars-kitti.onnx and its 16-bit twin for the GPU), so one
+# run of this fetches everything.
 #
 #   powershell -ExecutionPolicy Bypass -File scripts\fetch_model.ps1
 #
-# Run it from the repository root. It writes models\yolox_nano.onnx and
-# models\THIRD_PARTY.md; `models/` is gitignored, so the weights are never
-# committed. The file is checked against a pinned sha256 and deleted if it
-# does not match: a different file is a different model, and "frozen" would
-# stop being true without anything saying so.
+# Run it from the repository root. It writes models\yolox_nano.onnx and the
+# other four published files, each checked against a pinned sha256 and deleted
+# if it does not match -- a different file is a different model, and "frozen"
+# would stop being true without anything saying so -- then runs
+# `python scripts\prepare_models.py`, which needs the `onnx` package and, for
+# the GPU's files of 16-bit weights, `onnxconverter-common`:
 #
-# Already present and matching: nothing is downloaded.
+#   pip install onnx==1.17.0 onnxconverter-common==1.14.0 numpy==2.1.3
+#
+# It writes the derived files (yolox_nano-640x192.onnx and the others) beside
+# them. `models/` is gitignored, so no weights are ever committed. Already
+# present and matching: nothing is downloaded.
+#
+# Docker users need none of this: the image downloads and derives the models
+# when it is built.
 
 $ErrorActionPreference = 'Stop'
 
-$Url    = 'https://github.com/Megvii-BaseDetection/YOLOX/releases/download/0.1.1rc0/yolox_nano.onnx'
-$Sha256 = 'c789161ed43c8269fcd4e67c67eeeb4e80c622da2eb296a20bc6007bd18a0b7d'
-$Dir    = 'models'
-$File   = Join-Path $Dir 'yolox_nano.onnx'
+$Release = 'https://github.com/Megvii-BaseDetection/YOLOX/releases/download/0.1.1rc0/'
+$Sources = @{
+    'yolox_nano.onnx' = 'c789161ed43c8269fcd4e67c67eeeb4e80c622da2eb296a20bc6007bd18a0b7d'
+    'yolox_s.onnx'    = 'c5c2d13e59ae883e6af3b45daea64af4833a4951c92d116ec270d9ddbe998063'
+    'yolox_m.onnx'    = '21ff6cfdeb53b013bac2249599e55f00bff3cfdfdab37ed7a4620818c1d15b3f'
+    'yolox_l.onnx'    = '7860ae79de6c89a3c1eb72ae9a2756c0ccfbe04b7791bb5880afabd97855a411'
+    'yolox_x.onnx'    = 'c892d7aaf1c4746d8a4d675bec669a4db4f434b4ee1efb654bc9b353379c7c55'
+}
+$Dir = 'models'
 
 if (-not (Test-Path 'Cargo.toml')) {
     throw 'Run this from the repository root (the directory holding Cargo.toml).'
@@ -27,46 +45,32 @@ function Get-Sha256([string]$Path) {
     (Get-FileHash -Algorithm SHA256 -LiteralPath $Path).Hash.ToLowerInvariant()
 }
 
-if ((Test-Path $File) -and ((Get-Sha256 $File) -eq $Sha256)) {
-    Write-Output "$File already present, sha256 $Sha256"
-} else {
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+foreach ($Name in $Sources.Keys) {
+    $File = Join-Path $Dir $Name
+    $Sha256 = $Sources[$Name]
+    if ((Test-Path $File) -and ((Get-Sha256 $File) -eq $Sha256)) {
+        Write-Output "$File already present, sha256 $Sha256"
+        continue
+    }
     $Part = "$File.part"
-    Write-Output "downloading $Url"
-    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-    Invoke-WebRequest -UseBasicParsing -Uri $Url -OutFile $Part
+    Write-Output "downloading $Release$Name"
+    Invoke-WebRequest -UseBasicParsing -Uri "$Release$Name" -OutFile $Part
     $Got = Get-Sha256 $Part
     if ($Got -ne $Sha256) {
         Remove-Item -Force $Part
-        throw "sha256 mismatch: expected $Sha256, got $Got. The file was deleted."
+        throw "sha256 mismatch for ${Name}: expected $Sha256, got $Got. The file was deleted."
     }
     Move-Item -Force $Part $File
     Write-Output "$File written, sha256 $Sha256"
 }
 
-$Notice = @"
-# Third-party files in models/
-
-These files are downloaded by ``scripts/fetch_model.ps1`` and are never
-committed.
-
-## yolox_nano.onnx
-
-- What: YOLOX-Nano, an 80-class COCO object detector, as the ONNX export
-  Megvii publishes (opset 11, input ``images`` 1x3x416x416, output
-  ``output`` 1x3549x85). ``pipes`` loads it at 1x3x192x640.
-- From: $Url
-  (release 0.1.1rc0 of https://github.com/Megvii-BaseDetection/YOLOX)
-- sha256: $Sha256
-- Size: 3,659,407 bytes.
-- Trained on: COCO 2017.
-- Licence of the code: Apache-2.0
-  (https://github.com/Megvii-BaseDetection/YOLOX/blob/main/LICENSE).
-  The repository has no NOTICE file.
-- Licence of the weights: **inferred, not stated.** The release carries no
-  separate licence for the ONNX files; they are assets of the same
-  repository, linked from its documentation as its pre-generated models, and
-  are treated here as covered by the repository's Apache-2.0 grant. That is
-  an inference from where they are published, not a quoted statement.
-"@
-Set-Content -Encoding utf8 -Path (Join-Path $Dir 'THIRD_PARTY.md') -Value $Notice
-Write-Output "$(Join-Path $Dir 'THIRD_PARTY.md') written"
+$Python = Get-Command python -ErrorAction SilentlyContinue
+if ($null -eq $Python) {
+    Write-Output 'python not found: install Python 3 with `pip install onnx==1.17.0 onnxconverter-common==1.14.0 numpy==2.1.3`, then run `python scripts\prepare_models.py` to derive the files pipes loads.'
+    exit 0
+}
+& python scripts\prepare_models.py
+if ($LASTEXITCODE -ne 0) {
+    throw 'scripts\prepare_models.py failed (are its packages installed? pip install onnx==1.17.0 onnxconverter-common==1.14.0 numpy==2.1.3)'
+}

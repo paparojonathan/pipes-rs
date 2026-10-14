@@ -53,7 +53,17 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 /// And from 17, for the viewer ([`SLOT_VIEWER`]): the one thread that calls
 /// the Rerun SDK, so what the SDK allocates when it takes a drawing is the
 /// viewer's own number rather than a stage's.
-pub const N_SLOTS: usize = 18;
+///
+/// And from 18, for the OXTS replay thread ([`SLOT_OXTS_DRIVER`]): the
+/// third sensor, on the terms the other two drivers are counted.
+///
+/// And from 19, for the right camera's replay thread and its detector
+/// ([`SLOT_CAM1_DRIVER`], [`SLOT_CAMDET_RIGHT`]): the fourth sensor and the
+/// second copy of the one stage whose allocation is meant to be large,
+/// counted apart from the left's so each camera's cost is its own. And 21
+/// for the lidar detector ([`SLOT_PILLARS`]), the second stage whose
+/// allocation is meant to be large.
+pub const N_SLOTS: usize = 22;
 /// Where allocations land for any thread that never called [`set_stage_slot`] —
 /// notably Rerun's own batcher and encoder threads, which is why a viewer run
 /// reports ~1.5 GB untracked while the pipeline's own stages report kilobytes.
@@ -132,6 +142,20 @@ pub const SLOT_CAMDET: usize = 16;
 /// drawing (its rows, its batcher's bookkeeping). The drawings themselves are
 /// built on the stages' own slots; this thread only hands them over.
 pub const SLOT_VIEWER: usize = 17;
+/// The OXTS (GPS/IMU) replay thread: one row's parse plus its Arrow batch
+/// build, measured between consecutive admits exactly as [`SLOT_DRIVER`]
+/// and [`SLOT_VELO_DRIVER`] are.
+pub const SLOT_OXTS_DRIVER: usize = 18;
+/// The right camera's replay thread, on [`SLOT_DRIVER`]'s terms.
+pub const SLOT_CAM1_DRIVER: usize = 19;
+/// The right camera's `camdet` stage, on [`SLOT_CAMDET`]'s terms.
+pub const SLOT_CAMDET_RIGHT: usize = 20;
+/// The `pillars` stage: the frozen lidar detector. It reads the sweep's
+/// shared buffer in place and then, as `camdet` does with a frame,
+/// **copies** it -- into the pillars the network reads, ten numbers a point
+/// -- and runs a network that allocates its own activations. Megabytes a
+/// sweep, on its own counter so the figure is read rather than absorbed.
+pub const SLOT_PILLARS: usize = 21;
 
 static BYTES_ALLOC: [AtomicU64; N_SLOTS] = [const { AtomicU64::new(0) }; N_SLOTS];
 static COUNT_ALLOC: [AtomicU64; N_SLOTS] = [const { AtomicU64::new(0) }; N_SLOTS];
